@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { use, useCallback, useEffect, useMemo, useState } from 'react';
+import { use, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { TeX, RichText } from '../../../components/MathText';
 import VizSandbox from '../../../components/VizSandbox';
@@ -36,7 +36,9 @@ type PipelineStep = {
   call_index: number;
   label: string;
   description: string;
-  state: 'pending' | 'active' | 'done' | 'error';
+  state: 'pending' | 'active' | 'done' | 'error' | 'review';
+  review_status?: string | null;
+  artifact_version?: number;
 };
 type Pipeline = {
   current_stage: string | null;
@@ -46,6 +48,27 @@ type Pipeline = {
   visualizations_generated: boolean;
   error: string | null;
   steps: PipelineStep[];
+};
+type StageReview = {
+  stage: string;
+  review_status: 'pending' | 'confirmed' | 'rejected';
+  artifact_version: number;
+  run_count: number;
+  summary: any;
+  refs: any;
+  review_note: string;
+  reviewed_at: string | null;
+  updated_at: string | null;
+};
+type SolutionSummary = {
+  solution_id: string;
+  ordinal: number;
+  title: string;
+  is_current: boolean;
+  status: string;
+  has_answer: boolean;
+  visualization_count: number;
+  stage_reviews: StageReview[];
 };
 
 const h2Style: React.CSSProperties = { marginTop: 24, borderBottom: '1px solid #eee', paddingBottom: 4 };
@@ -60,14 +83,33 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
   const [running, setRunning] = useState(false);
   const [jobStage, setJobStage] = useState<string | null>(null);
   const [pipeline, setPipeline] = useState<Pipeline | null>(null);
+  const [stageReviews, setStageReviews] = useState<StageReview[]>([]);
+  const [solutions, setSolutions] = useState<SolutionSummary[]>([]);
+  const [currentSolutionId, setCurrentSolutionId] = useState<string | null>(null);
   const [restarting, setRestarting] = useState(false);
+  const [creatingSolution, setCreatingSolution] = useState(false);
+  const [stageActionPending, setStageActionPending] = useState<string | null>(null);
+  const [stageNoteDrafts, setStageNoteDrafts] = useState<Record<string, string>>({});
+
+  const withSolution = useCallback((path: string, solutionId?: string | null) => {
+    if (!solutionId) return path;
+    const sep = path.includes('?') ? '&' : '?';
+    return `${path}${sep}solution_id=${encodeURIComponent(solutionId)}`;
+  }, []);
 
   useEffect(() => {
-    fetch(apiUrl(`/api/questions/${params.id}`)).then((r) => r.json()).then(setInitial).catch(() => {});
-  }, [params.id]);
+    const target = withSolution(`/api/questions/${params.id}`, currentSolutionId);
+    fetch(apiUrl(target)).then((r) => r.json()).then((body) => {
+      setInitial(body);
+      setSolutions(Array.isArray(body?.solutions) ? body.solutions : []);
+      if (typeof body?.current_solution_id === 'string') {
+        setCurrentSolutionId((prev) => prev ?? body.current_solution_id);
+      }
+    }).catch(() => {});
+  }, [currentSolutionId, params.id, withSolution]);
 
   const loadResume = useCallback(async () => {
-    const res = await fetch(apiUrl(`/api/answer/${params.id}/resume`));
+    const res = await fetch(apiUrl(withSolution(`/api/answer/${params.id}/resume`, currentSolutionId)));
     if (!res.ok) return null;
     const body = await res.json();
     const replay = resumeToEvents(body);
@@ -76,8 +118,13 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
     setRunning(Boolean(body?.job?.running) || ['solving', 'visualizing', 'indexing'].includes(body?.status));
     setJobStage(typeof body?.job?.stage === 'string' ? body.job.stage : body?.status ?? null);
     setPipeline(body?.pipeline ?? null);
+    setStageReviews(Array.isArray(body?.stage_reviews) ? body.stage_reviews : []);
+    setSolutions(Array.isArray(body?.solutions) ? body.solutions : []);
+    if (typeof body?.current_solution_id === 'string') {
+      setCurrentSolutionId((prev) => prev ?? body.current_solution_id);
+    }
     return body;
-  }, [params.id]);
+  }, [currentSolutionId, params.id, withSolution]);
 
   useEffect(() => {
     let cancelled = false;
@@ -89,20 +136,21 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
     return () => { cancelled = true; };
   }, [loadResume]);
 
+  const autoStartedRef = useRef(false);
   useEffect(() => {
-    if (!resumeReady || done) return;
+    if (!resumeReady || done || autoStartedRef.current) return;
     let cancelled = false;
-    let intervalId: number | undefined;
 
     (async () => {
       try {
-        await fetch(apiUrl(`/api/answer/${params.id}/start`), { method: 'POST' });
-        if (cancelled) return;
         const first = await loadResume();
         if (cancelled || first?.complete || first?.status === 'error') return;
-        intervalId = window.setInterval(() => {
-          loadResume().catch(() => {});
-        }, 1500);
+        if (hasPendingStageReview(first?.stage_reviews)) return;
+        if (first?.job?.running || ['solving', 'visualizing', 'indexing'].includes(first?.status)) return;
+        autoStartedRef.current = true;
+        await fetch(apiUrl(withSolution(`/api/answer/${params.id}/start`, currentSolutionId)), { method: 'POST' });
+        if (cancelled) return;
+        await loadResume();
       } catch (e) {
         if (!cancelled) {
           setEvents((prev) => [...prev, {
@@ -115,9 +163,21 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
 
     return () => {
       cancelled = true;
-      if (intervalId !== undefined) window.clearInterval(intervalId);
     };
-  }, [done, loadResume, params.id, resumeReady]);
+  }, [currentSolutionId, done, loadResume, params.id, resumeReady, withSolution]);
+
+  useEffect(() => {
+    if (!resumeReady || done || !running) return;
+    let cancelled = false;
+    let timeoutId: ReturnType<typeof setTimeout>;
+    const poll = () => {
+      loadResume().catch(() => {}).finally(() => {
+        if (!cancelled) timeoutId = setTimeout(poll, 1500);
+      });
+    };
+    timeoutId = setTimeout(poll, 1500);
+    return () => { cancelled = true; clearTimeout(timeoutId); };
+  }, [done, loadResume, resumeReady, running]);
 
   const byName = useMemo(() => groupBy(events), [events]);
 
@@ -149,7 +209,7 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
   async function restartAnswer() {
     setRestarting(true);
     try {
-      await fetch(apiUrl(`/api/answer/${params.id}/start`), { method: 'POST' });
+      await fetch(apiUrl(withSolution(`/api/answer/${params.id}/start`, currentSolutionId)), { method: 'POST' });
       setEvents([]);
       setDone(false);
       setRunning(true);
@@ -159,6 +219,71 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
     } finally {
       setRestarting(false);
     }
+  }
+
+  async function createNewSolution() {
+    setCreatingSolution(true);
+    try {
+      const res = await fetch(apiUrl(`/api/questions/${params.id}/solutions`), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const body = await res.json();
+      const sid = typeof body?.solution?.solution_id === 'string' ? body.solution.solution_id : null;
+      if (sid) setCurrentSolutionId(sid);
+      setEvents([]);
+      setDone(false);
+      setPipeline(null);
+      await loadResume();
+    } finally {
+      setCreatingSolution(false);
+    }
+  }
+
+  const pendingReview = useMemo(
+    () => getPendingStageReview(stageReviews),
+    [stageReviews],
+  );
+
+  async function handleStageAction(stage: string, action: 'confirm' | 'rerun') {
+    const key = `${stage}:${action}`;
+    setStageActionPending(key);
+    try {
+      const note = stageNoteDrafts[stage] ?? '';
+      const res = await fetch(
+        apiUrl(
+          withSolution(
+            action === 'confirm'
+              ? `/api/answer/${params.id}/stages/${stage}/confirm`
+              : `/api/answer/${params.id}/stages/${stage}/rerun`,
+            stage === 'parsed' ? null : currentSolutionId,
+          ),
+        ),
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ note }),
+        },
+      );
+      if (!res.ok) {
+        throw new Error(await res.text());
+      }
+      await loadResume();
+    } catch (e) {
+      setEvents((prev) => [...prev, {
+        name: 'error',
+        data: { message: String(e) },
+        ts: Date.now(),
+      }]);
+    } finally {
+      setStageActionPending(null);
+    }
+  }
+
+  async function handleDirectRerun(stage: string) {
+    await handleStageAction(stage, 'rerun');
   }
 
   return (
@@ -186,6 +311,13 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
           进入多轮追问对话 →
         </Link>
       </div>
+      <SolutionSwitcher
+        solutions={solutions}
+        currentSolutionId={currentSolutionId}
+        creating={creatingSolution}
+        onSelect={setCurrentSolutionId}
+        onCreate={createNewSolution}
+      />
       {!done && (
         <p style={mutedStyle}>
           {latestStatus(byName)
@@ -195,6 +327,25 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
         </p>
       )}
       <GeminiProgress pipeline={pipeline} done={done} />
+      <StageRerunBoard
+        currentSolutionId={currentSolutionId}
+        stageReviews={stageReviews}
+        noteDrafts={stageNoteDrafts}
+        onNoteChange={(stage, value) => setStageNoteDrafts((prev) => ({ ...prev, [stage]: value }))}
+        actionPending={stageActionPending}
+        onRerun={handleDirectRerun}
+      />
+      <StageReviewPanel
+        review={pendingReview}
+        parsed={initial?.parsed || null}
+        noteValue={(pendingReview && stageNoteDrafts[pendingReview.stage] !== undefined)
+          ? stageNoteDrafts[pendingReview.stage]
+          : pendingReview?.review_note || ''}
+        onNoteChange={(stage, value) => setStageNoteDrafts((prev) => ({ ...prev, [stage]: value }))}
+        actionPending={stageActionPending}
+        onConfirm={(stage) => handleStageAction(stage, 'confirm')}
+        onRerun={(stage) => handleStageAction(stage, 'rerun')}
+      />
 
       {initial?.parsed && (
         <section style={{ marginBottom: 24 }}>
@@ -288,7 +439,9 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
                 {ev.data.formula && (
                   <p><TeX src={ev.data.formula} block /></p>
                 )}
-                <p style={mutedStyle}>为什么这样做: {ev.data.why_this_step}</p>
+                <p style={mutedStyle}>
+                  为什么这样做: <RichText text={ev.data.why_this_step || ''} />
+                </p>
                 {ev.data.viz_ref && (
                   <p style={mutedStyle}>关联可视化: <code>{ev.data.viz_ref}</code></p>
                 )}
@@ -348,7 +501,7 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
           <h2 id="sec-check" style={h2Style}>自我检查</h2>
           <ul>
             {(byName.self_check[0].data.items || []).map(
-              (p: string, i: number) => (<li key={i}>{p}</li>),
+              (p: string, i: number) => (<li key={i}><RichText text={p} /></li>),
             )}
           </ul>
         </>
@@ -393,6 +546,10 @@ function progressHeadline(pipeline: Pipeline | null): string | null {
   if (active) {
     return `Gemini ${active.call_index}/${pipeline.total_calls} · ${active.label}`;
   }
+  const review = pipeline.steps.find((step) => step.state === 'review');
+  if (review) {
+    return `等待人工确认 · Gemini ${review.call_index}/${pipeline.total_calls} · ${review.label}`;
+  }
   if (pipeline.completed_calls >= pipeline.total_calls) {
     return `Gemini ${pipeline.total_calls}/${pipeline.total_calls} · 全部调用完成`;
   }
@@ -403,10 +560,14 @@ function statusLabel(stage: string | null): string | null {
   if (!stage) return null;
   const labels: Record<string, string> = {
     parsed: '题目已解析，等待开始解答。',
+    review_parse: '题面解析已完成，等待人工确认。',
     queued: '解答任务已排队。',
     solving: '正在生成教学型答案。',
+    review_solve: '解答已生成，等待人工确认。',
     visualizing: '答案已生成，正在补充可视化。',
+    review_viz: '可视化已生成，等待人工确认。',
     indexing: '正在写入知识点、方法模式与检索索引。',
+    review_index: '索引已生成，等待人工确认。',
     answered: '解答完成。',
     error: '解答失败。',
   };
@@ -475,6 +636,8 @@ function GeminiProgress({ pipeline, done }: { pipeline: Pipeline | null; done: b
               ? { bg: '#eef8f0', fg: '#1f7a3d', border: '#cfe8d5' }
               : step.state === 'active'
                 ? { bg: '#eef5ff', fg: '#245ea8', border: '#d5e4fb' }
+                : step.state === 'review'
+                  ? { bg: '#fff8e8', fg: '#9a6700', border: '#f4d9a4' }
                 : step.state === 'error'
                   ? { bg: '#fff1f1', fg: '#b42318', border: '#f4c7c7' }
                   : { bg: '#fff', fg: '#666', border: '#e5e7eb' };
@@ -490,13 +653,308 @@ function GeminiProgress({ pipeline, done }: { pipeline: Pipeline | null; done: b
               }}
             >
               <div style={{ fontWeight: 600 }}>
-                {step.state === 'done' ? '✓ ' : step.state === 'active' ? '● ' : step.state === 'error' ? '⚠ ' : '○ '}
+                {step.state === 'done' ? '✓ ' : step.state === 'active' ? '● ' : step.state === 'review' ? '⌛ ' : step.state === 'error' ? '⚠ ' : '○ '}
                 Gemini {step.call_index}/4 · {step.label}
               </div>
               <div style={{ fontSize: 12, marginTop: 2 }}>{step.description}</div>
+              {step.state === 'review' && (
+                <div style={{ fontSize: 12, marginTop: 4 }}>
+                  当前版本 v{step.artifact_version || 0}，等待人工确认。
+                </div>
+              )}
             </div>
           );
         })}
+      </div>
+    </div>
+  );
+}
+
+function hasPendingStageReview(stageReviews: any): boolean {
+  return getPendingStageReview(Array.isArray(stageReviews) ? stageReviews : []) !== null;
+}
+
+function getPendingStageReview(stageReviews: StageReview[]): StageReview | null {
+  const order = ['parsed', 'solving', 'visualizing', 'indexing'];
+  for (const stage of order) {
+    const row = stageReviews.find((item) => item.stage === stage && item.review_status === 'pending' && item.artifact_version > 0);
+    if (row) return row;
+  }
+  return null;
+}
+
+function stageLabel(stage: string): string {
+  const labels: Record<string, string> = {
+    parsed: '解析题面',
+    solving: '生成解答',
+    visualizing: '生成可视化',
+    indexing: '建立索引',
+  };
+  return labels[stage] ?? stage;
+}
+
+function SolutionSwitcher({
+  solutions,
+  currentSolutionId,
+  creating,
+  onSelect,
+  onCreate,
+}: {
+  solutions: SolutionSummary[];
+  currentSolutionId: string | null;
+  creating: boolean;
+  onSelect: (solutionId: string) => void;
+  onCreate: () => void;
+}) {
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+        <div style={{ fontWeight: 600 }}>解法版本</div>
+        <button className="btn btn-secondary" onClick={onCreate} disabled={creating}>
+          {creating ? '创建中…' : '新建解法'}
+        </button>
+      </div>
+      {!!solutions.length && (
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 8 }}>
+          {solutions.map((solution) => {
+            const active = solution.solution_id === currentSolutionId;
+            return (
+              <button
+                key={solution.solution_id}
+                type="button"
+                onClick={() => onSelect(solution.solution_id)}
+                style={{
+                  border: active ? '1px solid #245ea8' : '1px solid #d9d9d9',
+                  background: active ? '#eef5ff' : '#fff',
+                  color: active ? '#245ea8' : '#666',
+                  borderRadius: 999,
+                  padding: '6px 12px',
+                  fontSize: 12,
+                  cursor: 'pointer',
+                }}
+              >
+                {solution.title}
+                {solution.is_current ? ' · 当前' : ''}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function StageRerunBoard({
+  currentSolutionId,
+  stageReviews,
+  noteDrafts,
+  onNoteChange,
+  actionPending,
+  onRerun,
+}: {
+  currentSolutionId: string | null;
+  stageReviews: StageReview[];
+  noteDrafts: Record<string, string>;
+  onNoteChange: (stage: string, value: string) => void;
+  actionPending: string | null;
+  onRerun: (stage: string) => void;
+}) {
+  const stages = ['parsed', 'solving', 'visualizing', 'indexing'];
+  return (
+    <div style={{
+      marginBottom: 18,
+      padding: 12,
+      border: '1px solid #e5e7eb',
+      borderRadius: 8,
+      background: '#fff',
+    }}>
+      <div style={{ fontWeight: 700, marginBottom: 10 }}>阶段重跑</div>
+      <div style={{ display: 'grid', gap: 10 }}>
+        {stages.map((stage) => {
+          const review = stageReviews.find((item) => item.stage === stage);
+          const disabled = stage !== 'parsed' && !currentSolutionId;
+          const pending = actionPending === `${stage}:rerun`;
+          return (
+            <div key={stage} style={{ border: '1px solid #eee', borderRadius: 8, padding: 10 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
+                <div style={{ fontWeight: 600 }}>{stageLabel(stage)}</div>
+                <div style={mutedStyle}>
+                  {review ? `v${review.artifact_version} · ${review.review_status}` : '尚未生成'}
+                </div>
+              </div>
+              <textarea
+                value={noteDrafts[stage] ?? review?.review_note ?? ''}
+                onChange={(e) => onNoteChange(stage, e.target.value)}
+                placeholder="补充重跑要求，例如：用更适合初中生理解的方式。"
+                style={{
+                  width: '100%',
+                  minHeight: 68,
+                  resize: 'vertical',
+                  marginTop: 8,
+                  padding: '8px 10px',
+                  borderRadius: 8,
+                  border: '1px solid #ddd',
+                  fontSize: 13,
+                  lineHeight: 1.5,
+                }}
+              />
+              <div style={{ marginTop: 8 }}>
+                <button className="btn btn-secondary" onClick={() => onRerun(stage)} disabled={disabled || pending}>
+                  {pending ? '重跑中…' : `重跑${stageLabel(stage)}`}
+                </button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function summarizeReview(review: StageReview): string {
+  const summary = review.summary || {};
+  if (review.stage === 'parsed') {
+    return `题干 ${summary.question_text || ''}`;
+  }
+  if (review.stage === 'solving') {
+    return `方法模式 ${summary.method_pattern || '未识别'} · 步骤 ${summary.solution_step_count || 0} · 知识点 ${summary.knowledge_point_count || 0}`;
+  }
+  if (review.stage === 'visualizing') {
+    return `可视化 ${summary.visualization_count || 0} 个`;
+  }
+  if (review.stage === 'indexing') {
+    return `模式 ${summary.pattern_id || '-'} · 知识点 ${summary.kp_count || 0} · 检索单元 ${summary.retrieval_unit_count || 0}`;
+  }
+  return '';
+}
+
+function StageReviewPanel({
+  review,
+  parsed,
+  noteValue,
+  onNoteChange,
+  actionPending,
+  onConfirm,
+  onRerun,
+}: {
+  review: StageReview | null;
+  parsed: any | null;
+  noteValue: string;
+  onNoteChange: (stage: string, value: string) => void;
+  actionPending: string | null;
+  onConfirm: (stage: string) => void;
+  onRerun: (stage: string) => void;
+}) {
+  if (!review) return null;
+  const confirming = actionPending === `${review.stage}:confirm`;
+  const rerunning = actionPending === `${review.stage}:rerun`;
+  return (
+    <div style={{
+      marginBottom: 18,
+      padding: 12,
+      border: '1px solid #f4d9a4',
+      borderRadius: 8,
+      background: '#fff8e8',
+      color: '#8a5b00',
+    }}>
+      <div style={{ fontWeight: 700 }}>等待人工确认 · {stageLabel(review.stage)}</div>
+      <div style={{ fontSize: 13, marginTop: 4 }}>
+        当前版本 v{review.artifact_version} · 已运行 {review.run_count} 次
+      </div>
+      <div style={{ marginTop: 8, lineHeight: 1.6 }}>
+        {review.stage === 'parsed' && parsed ? (
+          <StageParsedReview parsed={parsed} />
+        ) : (
+          summarizeReview(review)
+        )}
+      </div>
+      <div style={{ marginTop: 12 }}>
+        <div style={{ fontWeight: 600, marginBottom: 6, fontSize: 13 }}>补充要求</div>
+        <textarea
+          value={noteValue}
+          onChange={(e) => onNoteChange(review.stage, e.target.value)}
+          placeholder={
+            review.stage === 'parsed'
+              ? '例如：这是面向初中生的题目，请按初中生能理解的方式解析题面。'
+              : review.stage === 'solving'
+                ? '例如：这是面向初中生的题目，用初中知识和更清晰的分步讲解回答。'
+                : '例如：请减少装饰性内容，优先突出关键教学信息。'
+          }
+          style={{
+            width: '100%',
+            minHeight: 88,
+            resize: 'vertical',
+            padding: '8px 10px',
+            borderRadius: 8,
+            border: '1px solid #e7c97b',
+            background: '#fffdf7',
+            color: '#5f4200',
+            fontSize: 13,
+            lineHeight: 1.5,
+          }}
+        />
+        <div style={{ marginTop: 6, fontSize: 12, color: '#7a5c1d' }}>
+          确认时: 作为下一阶段的生成要求。驳回并重跑时: 作为本阶段重跑要求。
+        </div>
+      </div>
+      <div style={{ marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        <button className="btn btn-secondary" onClick={() => onConfirm(review.stage)} disabled={confirming || rerunning}>
+          {confirming ? '确认中…' : '确认并进入下一阶段'}
+        </button>
+        <button className="btn btn-secondary" onClick={() => onRerun(review.stage)} disabled={confirming || rerunning}>
+          {rerunning ? '重跑中…' : '驳回并重跑本阶段'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function StageParsedReview({ parsed }: { parsed: any }) {
+  return (
+    <div style={{
+      display: 'grid',
+      gap: 10,
+      padding: 10,
+      borderRadius: 8,
+      background: 'rgba(255,255,255,0.55)',
+      color: '#5f4200',
+    }}>
+      <div>
+        <div style={{ fontWeight: 600, marginBottom: 4 }}>题目</div>
+        <div>
+          <RichText text={parsed.question_text || ''} />
+        </div>
+      </div>
+      {!!(parsed.given || []).length && (
+        <div>
+          <div style={{ fontWeight: 600, marginBottom: 4 }}>已知</div>
+          <ul style={{ margin: 0, paddingLeft: 18 }}>
+            {parsed.given.map((item: string, idx: number) => (
+              <li key={idx}><RichText text={item} /></li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {!!(parsed.find || []).length && (
+        <div>
+          <div style={{ fontWeight: 600, marginBottom: 4 }}>求</div>
+          <ul style={{ margin: 0, paddingLeft: 18 }}>
+            {parsed.find.map((item: string, idx: number) => (
+              <li key={idx}><RichText text={item} /></li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {parsed.diagram_description && (
+        <div>
+          <div style={{ fontWeight: 600, marginBottom: 4 }}>图形描述</div>
+          <div>
+            <RichText text={parsed.diagram_description} />
+          </div>
+        </div>
+      )}
+      <div style={{ fontSize: 12, color: '#7a5c1d' }}>
+        学科 {parsed.subject || '-'} · 学段 {parsed.grade_band || '-'} · 难度 {parsed.difficulty ?? '-'}
       </div>
     </div>
   );
@@ -561,6 +1019,7 @@ function ErrorPanel({
   const raw = typeof latest?.raw_message === 'string' ? latest.raw_message : null;
   const failedStage = typeof latest?.failed_stage === 'string' ? latest.failed_stage : null;
   const isTimeout = latest?.kind === 'timeout';
+  const isServiceOverloaded = latest?.kind === 'service_overloaded';
 
   return (
     <div style={{
@@ -572,7 +1031,7 @@ function ErrorPanel({
       color: '#8f1d1d',
     }}>
       <div style={{ fontWeight: 700, marginBottom: 8 }}>
-        {isTimeout ? 'Gemini 调用超时' : '解答失败'}
+        {isTimeout ? 'Gemini 调用超时' : isServiceOverloaded ? 'Gemini 服务繁忙' : '解答失败'}
       </div>
       <div style={{ lineHeight: 1.6 }}>{message}</div>
       {failedStage && (
@@ -603,16 +1062,20 @@ function ErrorPanel({
 function Pattern({ data }: { data: any }) {
   return (
     <div>
-      <p><strong>{data.name_cn}</strong></p>
-      <p style={mutedStyle}>{data.when_to_use}</p>
+      <p><strong><RichText text={data.name_cn || ''} /></strong></p>
+      <p style={mutedStyle}><RichText text={data.when_to_use || ''} /></p>
       <ol>
-        {(data.general_procedure || []).map((p: string, i: number) => (<li key={i}>{p}</li>))}
+        {(data.general_procedure || []).map((p: string, i: number) => (
+          <li key={i}><RichText text={p} /></li>
+        ))}
       </ol>
       {!!(data.pitfalls || []).length && (
         <>
           <p style={{ marginTop: 8 }}><strong>常见陷阱:</strong></p>
           <ul>
-            {data.pitfalls.map((p: string, i: number) => (<li key={i}>{p}</li>))}
+            {data.pitfalls.map((p: string, i: number) => (
+              <li key={i}><RichText text={p} /></li>
+            ))}
           </ul>
         </>
       )}
@@ -628,7 +1091,7 @@ function SimilarList({ items }: { items: any[] }) {
           <div><RichText text={s.statement || ''} /></div>
           <div style={mutedStyle}>
             难度变化 {s.difficulty_delta >= 0 ? `+${s.difficulty_delta}` : s.difficulty_delta} ·
-            答题大纲: {s.answer_outline}
+            答题大纲: <RichText text={s.answer_outline || ''} />
           </div>
         </li>
       ))}
@@ -721,7 +1184,7 @@ function VizPanel({ vizEvents }: { vizEvents: AnyEv[] }) {
       <div style={{ padding: 8, border: '1px solid #eee', borderRadius: 6 }}>
         <div style={{ fontWeight: 600, marginBottom: 4 }}>{active.data.title_cn}</div>
         <div style={{ ...mutedStyle, marginBottom: 6 }}>
-          学习目标: {active.data.learning_goal}
+          学习目标: <RichText text={active.data.learning_goal || ''} />
         </div>
         <VizSandbox
           key={active.data.id}
@@ -732,11 +1195,13 @@ function VizPanel({ vizEvents }: { vizEvents: AnyEv[] }) {
         {(active.data.interactive_hints || []).length > 0 && (
           <ul style={{ ...mutedStyle, marginTop: 6 }}>
             {active.data.interactive_hints.map((h: string, j: number) => (
-              <li key={j}>{h}</li>
+              <li key={j}><RichText text={h} /></li>
             ))}
           </ul>
         )}
-        <div style={{ ...mutedStyle, marginTop: 6 }}>{active.data.caption_cn}</div>
+        <div style={{ ...mutedStyle, marginTop: 6 }}>
+          <RichText text={active.data.caption_cn || ''} />
+        </div>
       </div>
     </div>
   );

@@ -185,3 +185,21 @@ async def test_solver_rerun_is_idempotent(session, tmp_image_dir):
     assert len(steps) == 2
     # Expect exactly 9 section rows (2 + 2 + 5).
     assert len(sections) == 9
+
+
+@pytest.mark.asyncio
+async def test_solver_injects_user_guidance_into_prompt(session, tmp_image_dir):
+    qid = await _seed_question(session)
+    llm = _solver_llm()
+
+    async for _ in generate_answer(
+        session,
+        question_id=qid,
+        llm=llm,
+        user_guidance="这是面向初中生的题目，用初中知识和方式回答。",
+    ):
+        pass
+
+    last_call = llm.transport.calls[-1]
+    assert "messages" in last_call
+    assert "初中生" in last_call["messages"][-1]["content"]

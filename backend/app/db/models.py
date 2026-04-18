@@ -14,6 +14,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
+    Boolean,
     TIMESTAMP,
     CheckConstraint,
     Enum,
@@ -79,6 +80,32 @@ class Question(Base):
     )
 
 
+class QuestionSolution(Base):
+    __tablename__ = "question_solutions"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    question_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("questions.id", ondelete="CASCADE"), nullable=False,
+    )
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    title: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    is_current: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="draft")
+    answer_package_json: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    visualizations_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=list)
+    sediment_json: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    stage_reviews_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint("question_id", "ordinal", name="uq_question_solutions_question_ordinal"),
+        Index("ix_question_solutions_question_current", "question_id", "is_current"),
+    )
+
+
 class AnswerPackageSection(Base):
     """Streamed section storage; enables resume-after-refresh."""
     __tablename__ = "answer_packages"
@@ -96,13 +123,42 @@ class AnswerPackageSection(Base):
     )
 
 
+class QuestionStageReview(Base):
+    __tablename__ = "question_stage_reviews"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    question_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("questions.id", ondelete="CASCADE"), nullable=False,
+    )
+    stage: Mapped[str] = mapped_column(String(16), nullable=False)
+    review_status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    artifact_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    run_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    summary_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    refs_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    review_note: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    reviewed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint("question_id", "stage", name="uq_question_stage_reviews_question_stage"),
+        Index("ix_question_stage_reviews_question_id", "question_id"),
+    )
+
+
 class QuestionRetrievalProfile(Base):
     __tablename__ = "question_retrieval_profiles"
 
     id: Mapped[uuid.UUID] = _uuid_pk()
     question_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("questions.id", ondelete="CASCADE"),
-        nullable=False, unique=True,
+        nullable=False,
+    )
+    solution_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("question_solutions.id", ondelete="CASCADE"), nullable=True, unique=True,
     )
     profile_json: Mapped[dict] = mapped_column(JSONB, nullable=False)
     created_at: Mapped[datetime] = _created_at()
@@ -115,6 +171,9 @@ class RetrievalUnitRow(Base):
     question_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("questions.id", ondelete="CASCADE"), nullable=False,
     )
+    solution_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("question_solutions.id", ondelete="CASCADE"), nullable=True,
+    )
     unit_kind: Mapped[str] = mapped_column(String(64), nullable=False)
     title: Mapped[str] = mapped_column(Text, nullable=False)
     text: Mapped[str] = mapped_column(Text, nullable=False)
@@ -124,7 +183,7 @@ class RetrievalUnitRow(Base):
     created_at: Mapped[datetime] = _created_at()
 
     __table_args__ = (
-        Index("ix_retrieval_units_question_kind", "question_id", "unit_kind"),
+        Index("ix_retrieval_units_question_solution_kind", "question_id", "solution_id", "unit_kind"),
     )
 
 

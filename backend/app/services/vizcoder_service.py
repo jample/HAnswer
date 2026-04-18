@@ -52,6 +52,7 @@ async def generate_visualizations(
     *,
     question_id: uuid.UUID,
     llm: GeminiClient,
+    user_guidance: str | None = None,
 ) -> AsyncIterator[SSEEvent]:
     """Generate + validate + persist viz for a question; emit SSE events.
 
@@ -73,6 +74,17 @@ async def generate_visualizations(
         "parsed_question": q.parsed_json,
         "answer_package": q.answer_package_json,
     }
+    messages_override = None
+    if user_guidance and user_guidance.strip():
+        messages_override = template.build(**kwargs)
+        messages_override.append({
+            "role": "user",
+            "content": (
+                "以下是用户在人工审核阶段给出的额外要求。"
+                "请在不违背题意、教学目标和 JSON Schema 的前提下严格遵守：\n"
+                f"{user_guidance.strip()}"
+            ),
+        })
 
     try:
         result = await llm.call_structured(
@@ -80,6 +92,7 @@ async def generate_visualizations(
             model=settings.gemini.model_vizcoder,
             model_cls=VisualizationList,
             template_kwargs=kwargs,
+            messages_override=messages_override,
             timeout_s=settings.llm.vizcoder_timeout_s,
             stream=settings.llm.stream_vizcoder_json,
         )

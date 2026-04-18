@@ -34,12 +34,14 @@ from app.db.models import (
     KnowledgePoint,
     MethodPatternRow,
     Question,
-    QuestionKPLink,
-    QuestionPatternLink,
+    QuestionRetrievalProfile,
+    QuestionSolution,
     RetrievalUnitRow,
 )
+from app.services.question_solution_service import get_current_solution
 from app.services.embedding import DenseEmbedder
 from app.services.rrf import fuse as rrf_fuse
+from app.services.solution_ref_service import decode_solution_ref, encode_solution_ref
 from app.services.sparse_encoder import SparseEncoder
 from app.services.vector_store import VectorStore
 
@@ -49,6 +51,7 @@ Mode = Literal["auto", "text", "kp", "pattern"]
 @dataclass
 class Hit:
     question_id: str
+    solution_id: str | None
     score: float
     cosine: float
     pattern_match: float       # 0 or 1
@@ -57,6 +60,7 @@ class Hit:
     grade_band: str
     difficulty: int
     question_text: str
+    solution_title: str | None = None
     pattern_name: str | None = None
     shared_kp_names: list[str] | None = None
     rrf_score: float | None = None                  # multi-route only
@@ -70,6 +74,7 @@ class SimilarQuery:
     mode: Mode = "auto"
     query: str | None = None
     question_id: str | None = None
+    solution_id: str | None = None
     kp_id: str | None = None
     pattern_id: str | None = None
     subject: str | None = None
@@ -80,30 +85,68 @@ class SimilarQuery:
     k: int = 10
 
 
-async def _question_context(
-    session: AsyncSession, question_id: uuid.UUID,
-) -> tuple[set[uuid.UUID], set[uuid.UUID]]:
-    """Return (pattern_ids, kp_ids) linked to a question."""
-    pat = (await session.execute(
-        select(QuestionPatternLink.pattern_id).where(
-            QuestionPatternLink.question_id == question_id,
+async def _load_profile(
+    session: AsyncSession,
+    *,
+    question_id: uuid.UUID,
+    solution_id: uuid.UUID | None,
+) -> dict:
+    stmt = select(QuestionRetrievalProfile.profile_json).where(
+        QuestionRetrievalProfile.question_id == question_id
+    )
+    if solution_id is None:
+        stmt = stmt.where(QuestionRetrievalProfile.solution_id.is_(None))
+    else:
+        stmt = stmt.where(QuestionRetrievalProfile.solution_id == solution_id)
+    stmt = stmt.limit(1)
+    row = (await session.execute(stmt)).scalar_one_or_none()
+    return dict(row or {})
+
+
+def _profile_context(profile: dict) -> tuple[set[str], set[str]]:
+    patterns = {
+        str(item).strip()
+        for item in profile.get("method_labels", [])
+        if str(item).strip()
+    }
+    kp_like = {
+        str(item).strip()
+        for group in (
+            profile.get("topic_path", []),
+            profile.get("target_types", []),
+            profile.get("object_entities", []),
+            profile.get("condition_signals", []),
         )
-    )).scalars().all()
-    kps = (await session.execute(
-        select(QuestionKPLink.kp_id).where(QuestionKPLink.question_id == question_id)
-    )).scalars().all()
-    return set(pat), set(kps)
+        for item in group
+        if str(item).strip()
+    }
+    return patterns, kp_like
 
 
-def _filter_question_ids(raw_ids: list[str], excluded: set[uuid.UUID]) -> list[str]:
+def _profile_pattern_name(profile: dict) -> str | None:
+    labels = [str(item).strip() for item in profile.get("method_labels", []) if str(item).strip()]
+    return labels[0] if labels else None
+
+
+async def _question_context(
+    session: AsyncSession,
+    *,
+    question_id: uuid.UUID,
+    solution_id: uuid.UUID | None,
+) -> tuple[set[str], set[str]]:
+    profile = await _load_profile(session, question_id=question_id, solution_id=solution_id)
+    return _profile_context(profile)
+
+
+def _filter_solution_refs(raw_ids: list[str], excluded_questions: set[uuid.UUID]) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
     for ref_id in raw_ids:
-        try:
-            qid = uuid.UUID(ref_id)
-        except ValueError:
+        parsed = decode_solution_ref(ref_id)
+        if parsed is None:
             continue
-        if qid in excluded or ref_id in seen:
+        qid, _sid = parsed
+        if qid in excluded_questions or ref_id in seen:
             continue
         seen.add(ref_id)
         out.append(ref_id)
@@ -147,7 +190,7 @@ async def _collapse_retrieval_unit_hits(
         row = by_id.get(ref_id)
         if row is None:
             continue
-        qid = str(row.question_id)
+        qid = encode_solution_ref(question_id=row.question_id, solution_id=row.solution_id)
         if row.question_id in excluded:
             continue
         bucket = match_map.setdefault(qid, {"kinds": set(), "titles": set()})
@@ -161,6 +204,67 @@ async def _collapse_retrieval_unit_hits(
     return ordered_qids, match_map
 
 
+async def _hydrate_hit(
+    session: AsyncSession,
+    *,
+    ref_id: str,
+    score: float,
+    source_patterns: set[str],
+    source_kps: set[str],
+    query: SimilarQuery,
+    matched_units: dict[str, dict[str, set[str]]] | None = None,
+    route_ranks: dict[str, int] | None = None,
+) -> Hit | None:
+    parsed = decode_solution_ref(ref_id)
+    if parsed is None:
+        return None
+    qid, solution_id = parsed
+    q = await session.get(Question, qid)
+    if q is None:
+        return None
+    if query.difficulty_min is not None and q.difficulty < query.difficulty_min:
+        return None
+    if query.difficulty_max is not None and q.difficulty > query.difficulty_max:
+        return None
+
+    solution = None
+    if solution_id is not None:
+        solution = await session.get(QuestionSolution, solution_id)
+    profile_patterns, profile_kps = await _question_context(
+        session,
+        question_id=qid,
+        solution_id=solution_id,
+    )
+    profile = await _load_profile(session, question_id=qid, solution_id=solution_id)
+    pattern_name = _profile_pattern_name(profile) or next(iter(profile_patterns), None)
+    pattern_match = 1.0 if (source_patterns & profile_patterns) else 0.0
+    kp_overlap = 0.0
+    if source_kps:
+        kp_overlap = len(source_kps & profile_kps) / max(len(source_kps | profile_kps), 1)
+
+    shared_kp_names = sorted(source_kps & profile_kps) or None
+    unit_meta = (matched_units or {}).get(ref_id, {})
+    return Hit(
+        question_id=str(qid),
+        solution_id=str(solution_id) if solution_id else None,
+        score=score,
+        cosine=0.0,
+        pattern_match=pattern_match,
+        kp_overlap=kp_overlap,
+        subject=q.subject,
+        grade_band=q.grade_band,
+        difficulty=q.difficulty,
+        question_text=(q.parsed_json or {}).get("question_text", ""),
+        solution_title=solution.title if solution is not None else None,
+        pattern_name=pattern_name,
+        shared_kp_names=shared_kp_names,
+        rrf_score=score if route_ranks is not None else None,
+        route_ranks=route_ranks,
+        matched_unit_kinds=sorted(unit_meta.get("kinds", set())) or None,
+        matched_unit_titles=sorted(unit_meta.get("titles", set())) or None,
+    )
+
+
 async def similar_questions(
     session: AsyncSession,
     *,
@@ -169,8 +273,8 @@ async def similar_questions(
     vector_store: VectorStore,
 ) -> list[Hit]:
     excluded = {uuid.UUID(x) for x in (query.excluded_ids or [])}
-    source_patterns: set[uuid.UUID] = set()
-    source_kps: set[uuid.UUID] = set()
+    source_patterns: set[str] = set()
+    source_kps: set[str] = set()
 
     # ── Build query vector + context ─────────────────────────────
     text_for_embed: str | None = None
@@ -182,10 +286,18 @@ async def similar_questions(
         q = await session.get(Question, qid)
         if q is None:
             return []
+        sid = uuid.UUID(query.solution_id) if query.solution_id else None
+        if sid is None:
+            current = await get_current_solution(session, question_id=qid)
+            sid = current.id if current is not None else None
         text_for_embed = (q.parsed_json or {}).get("question_text", "")
         subject = query.subject or q.subject
         grade_band = query.grade_band or q.grade_band
-        source_patterns, source_kps = await _question_context(session, qid)
+        source_patterns, source_kps = await _question_context(
+            session,
+            question_id=qid,
+            solution_id=sid,
+        )
     elif query.mode == "text":
         if not query.query:
             return []
@@ -195,23 +307,22 @@ async def similar_questions(
     elif query.mode == "kp":
         if not query.kp_id:
             return []
-        source_kps = {uuid.UUID(query.kp_id)}
-        subject = query.subject
-        grade_band = query.grade_band
-        # Use kp name+path embedding as the search anchor.
         node = await session.get(KnowledgePoint, uuid.UUID(query.kp_id))
         if node is None:
             return []
+        source_kps = {node.name_cn, node.path_cached}
+        subject = query.subject
+        grade_band = query.grade_band
         text_for_embed = f"{node.name_cn}\n{node.path_cached}"
     elif query.mode == "pattern":
         if not query.pattern_id:
             return []
-        source_patterns = {uuid.UUID(query.pattern_id)}
-        subject = query.subject
-        grade_band = query.grade_band
         mp = await session.get(MethodPatternRow, uuid.UUID(query.pattern_id))
         if mp is None:
             return []
+        source_patterns = {mp.name_cn}
+        subject = query.subject
+        grade_band = query.grade_band
         text_for_embed = f"{mp.name_cn}\n{mp.when_to_use}"
     else:  # pragma: no cover - typed literal
         return []
@@ -231,55 +342,32 @@ async def similar_questions(
     # ── Filter & hydrate ────────────────────────────────────────
     results: list[Hit] = []
     for h in raw_hits:
-        try:
-            qid = uuid.UUID(h.ref_id)
-        except ValueError:
+        parsed = decode_solution_ref(h.ref_id)
+        if parsed is None:
             continue
+        qid, solution_id = parsed
         if qid in excluded:
             continue
-        q = await session.get(Question, qid)
-        if q is None:
-            continue
-        if query.difficulty_min is not None and q.difficulty < query.difficulty_min:
-            continue
-        if query.difficulty_max is not None and q.difficulty > query.difficulty_max:
-            continue
-
-        patterns, kps = await _question_context(session, qid)
-        pattern_match = 1.0 if (source_patterns & patterns) else 0.0
-        kp_overlap = 0.0
-        if source_kps:
-            kp_overlap = len(source_kps & kps) / max(len(source_kps | kps), 1)
-
-        # cosine ∈ [-1, 1]; rerank assumes [0, 1].
+        profile_patterns, profile_kps = await _question_context(
+            session,
+            question_id=qid,
+            solution_id=solution_id,
+        )
         cos = max(0.0, min(1.0, (h.score + 1) / 2 if h.score < 0 else h.score))
-        score = 0.5 * cos + 0.3 * pattern_match + 0.2 * kp_overlap
-
-        pattern_name = None
-        if patterns:
-            p_row = await session.get(MethodPatternRow, next(iter(patterns)))
-            if p_row is not None:
-                pattern_name = p_row.name_cn
-
-        shared_kp_names: list[str] = []
-        for kpid in (source_kps & kps):
-            node = await session.get(KnowledgePoint, kpid)
-            if node is not None:
-                shared_kp_names.append(node.name_cn)
-
-        results.append(Hit(
-            question_id=str(qid),
-            score=score,
-            cosine=cos,
-            pattern_match=pattern_match,
-            kp_overlap=kp_overlap,
-            subject=q.subject,
-            grade_band=q.grade_band,
-            difficulty=q.difficulty,
-            question_text=(q.parsed_json or {}).get("question_text", ""),
-            pattern_name=pattern_name,
-            shared_kp_names=shared_kp_names or None,
-        ))
+        pattern_match = 1.0 if (source_patterns & profile_patterns) else 0.0
+        kp_overlap = len(source_kps & profile_kps) / max(len(source_kps | profile_kps), 1) if source_kps else 0.0
+        hit = await _hydrate_hit(
+            session,
+            ref_id=h.ref_id,
+            score=(0.5 * cos + 0.3 * pattern_match + 0.2 * kp_overlap),
+            source_patterns=source_patterns,
+            source_kps=source_kps,
+            query=query,
+        )
+        if hit is None:
+            continue
+        hit.cosine = cos
+        results.append(hit)
 
     results.sort(key=lambda h: h.score, reverse=True)
     return results[: query.k]
@@ -291,51 +379,43 @@ async def similar_questions(
 async def _structural_route(
     session: AsyncSession,
     *,
-    source_patterns: set[uuid.UUID],
-    source_kps: set[uuid.UUID],
+    source_patterns: set[str],
+    source_kps: set[str],
     subject: str | None,
     grade_band: str | None,
     k: int,
     excluded: set[uuid.UUID],
 ) -> list[str]:
-    """Rank candidate questions by shared pattern + KP count (PG only)."""
+    """Rank candidate solutions by shared method labels + profile facets."""
     if not source_patterns and not source_kps:
         return []
-    scores: dict[uuid.UUID, float] = {}
-    if source_patterns:
-        rows = (await session.execute(
-            select(QuestionPatternLink.question_id, QuestionPatternLink.pattern_id)
-            .where(QuestionPatternLink.pattern_id.in_(source_patterns))
-        )).all()
-        for qid, _pid in rows:
-            scores[qid] = scores.get(qid, 0.0) + 3.0   # pattern weight
-    if source_kps:
-        rows = (await session.execute(
-            select(QuestionKPLink.question_id, QuestionKPLink.kp_id,
-                   QuestionKPLink.weight)
-            .where(QuestionKPLink.kp_id.in_(source_kps))
-        )).all()
-        for qid, _kid, weight in rows:
-            scores[qid] = scores.get(qid, 0.0) + float(weight or 1.0)
-    if not scores:
-        return []
-
-    # Optional filter: subject/grade_band must match.
-    if subject or grade_band:
-        ids = list(scores.keys())
-        stmt = select(Question.id, Question.subject, Question.grade_band).where(
-            Question.id.in_(ids)
-        )
-        rows = (await session.execute(stmt)).all()
-        allowed = {
-            qid for qid, s, g in rows
-            if (not subject or s == subject)
-            and (not grade_band or g == grade_band)
-        }
-        scores = {qid: sc for qid, sc in scores.items() if qid in allowed}
-
-    ordered = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
-    return [str(qid) for qid, _ in ordered if qid not in excluded][:k]
+    stmt = (
+        select(QuestionRetrievalProfile, Question, QuestionSolution)
+        .join(Question, Question.id == QuestionRetrievalProfile.question_id)
+        .outerjoin(QuestionSolution, QuestionSolution.id == QuestionRetrievalProfile.solution_id)
+    )
+    if excluded:
+        stmt = stmt.where(Question.id.notin_(list(excluded)))
+    if subject:
+        stmt = stmt.where(Question.subject == subject)
+    if grade_band:
+        stmt = stmt.where(Question.grade_band == grade_band)
+    rows = (await session.execute(stmt)).all()
+    scored: list[tuple[str, float]] = []
+    for profile_row, question_row, solution_row in rows:
+        profile = dict(profile_row.profile_json or {})
+        patterns, kps = _profile_context(profile)
+        pattern_score = 3.0 if (source_patterns & patterns) else 0.0
+        kp_score = float(len(source_kps & kps))
+        total = pattern_score + kp_score
+        if total <= 0.0:
+            continue
+        scored.append((
+            encode_solution_ref(question_id=question_row.id, solution_id=solution_row.id if solution_row is not None else None),
+            total,
+        ))
+    scored.sort(key=lambda item: item[1], reverse=True)
+    return [ref_id for ref_id, _score in scored[:k]]
 
 
 async def similar_questions_multi_route(
@@ -360,8 +440,8 @@ async def similar_questions_multi_route(
     rc = settings.retrieval
     wide_k = max(query.k * rc.wide_k_multiplier, 30)
     excluded = {uuid.UUID(x) for x in (query.excluded_ids or [])}
-    source_patterns: set[uuid.UUID] = set()
-    source_kps: set[uuid.UUID] = set()
+    source_patterns: set[str] = set()
+    source_kps: set[str] = set()
 
     # ── Resolve query text + context (mirrors single-route path) ─
     text_for_embed: str | None = None
@@ -378,7 +458,15 @@ async def similar_questions_multi_route(
         text_for_embed = (q.parsed_json or {}).get("question_text", "")
         subject = subject or q.subject
         grade_band = grade_band or q.grade_band
-        source_patterns, source_kps = await _question_context(session, qid)
+        sid = uuid.UUID(query.solution_id) if query.solution_id else None
+        if sid is None:
+            current = await get_current_solution(session, question_id=qid)
+            sid = current.id if current is not None else None
+        source_patterns, source_kps = await _question_context(
+            session,
+            question_id=qid,
+            solution_id=sid,
+        )
     elif query.mode == "text":
         if not query.query:
             return []
@@ -386,18 +474,18 @@ async def similar_questions_multi_route(
     elif query.mode == "kp":
         if not query.kp_id:
             return []
-        source_kps = {uuid.UUID(query.kp_id)}
         node = await session.get(KnowledgePoint, uuid.UUID(query.kp_id))
         if node is None:
             return []
+        source_kps = {node.name_cn, node.path_cached}
         text_for_embed = f"{node.name_cn}\n{node.path_cached}"
     elif query.mode == "pattern":
         if not query.pattern_id:
             return []
-        source_patterns = {uuid.UUID(query.pattern_id)}
         mp = await session.get(MethodPatternRow, uuid.UUID(query.pattern_id))
         if mp is None:
             return []
+        source_patterns = {mp.name_cn}
         text_for_embed = f"{mp.name_cn}\n{mp.when_to_use}"
     else:
         return []
@@ -438,11 +526,11 @@ async def similar_questions_multi_route(
         _merge_unit_match_maps(matched_units, unit_match_map)
         fused = rrf_fuse(
             routes={
-                "legacy_q": _filter_question_ids([h.ref_id for h in legacy_hits], excluded),
-                "question_full": _filter_question_ids(
+                "legacy_q": _filter_solution_refs([h.ref_id for h in legacy_hits], excluded),
+                "question_full": _filter_solution_refs(
                     [h.ref_id for h in question_full_hits], excluded,
                 ),
-                "answer_full": _filter_question_ids(
+                "answer_full": _filter_solution_refs(
                     [h.ref_id for h in answer_full_hits], excluded,
                 ),
                 "retrieval_unit": unit_qids,
@@ -483,13 +571,13 @@ async def similar_questions_multi_route(
         _merge_unit_match_maps(matched_units, unit_match_map)
         fused = rrf_fuse(
             routes={
-                "legacy_q_sparse": _filter_question_ids(
+                "legacy_q_sparse": _filter_solution_refs(
                     [h.ref_id for h in legacy_hits], excluded,
                 ),
-                "question_full_sparse": _filter_question_ids(
+                "question_full_sparse": _filter_solution_refs(
                     [h.ref_id for h in question_full_hits], excluded,
                 ),
-                "answer_full_sparse": _filter_question_ids(
+                "answer_full_sparse": _filter_solution_refs(
                     [h.ref_id for h in answer_full_hits], excluded,
                 ),
                 "retrieval_unit_sparse": unit_qids,
@@ -526,52 +614,19 @@ async def similar_questions_multi_route(
     # ── Hydrate + apply final PG filters (difficulty, etc.) ──────
     hydrated: list[Hit] = []
     for fh in fused:
-        try:
-            qid = uuid.UUID(fh.ref_id)
-        except ValueError:
-            continue
-        q = await session.get(Question, qid)
-        if q is None:
-            continue
-        if query.difficulty_min is not None and q.difficulty < query.difficulty_min:
-            continue
-        if query.difficulty_max is not None and q.difficulty > query.difficulty_max:
-            continue
-
-        patterns, kps = await _question_context(session, qid)
-        pattern_match = 1.0 if (source_patterns & patterns) else 0.0
-        kp_overlap = 0.0
-        if source_kps:
-            kp_overlap = len(source_kps & kps) / max(len(source_kps | kps), 1)
-
-        pattern_name = None
-        if patterns:
-            p_row = await session.get(MethodPatternRow, next(iter(patterns)))
-            if p_row is not None:
-                pattern_name = p_row.name_cn
-        shared_kp_names: list[str] = []
-        for kpid in (source_kps & kps):
-            node = await session.get(KnowledgePoint, kpid)
-            if node is not None:
-                shared_kp_names.append(node.name_cn)
-
-        hydrated.append(Hit(
-            question_id=str(qid),
-            score=fh.score,                      # RRF score as canonical
-            cosine=0.0,                          # not computed in multi-route
-            pattern_match=pattern_match,
-            kp_overlap=kp_overlap,
-            subject=q.subject,
-            grade_band=q.grade_band,
-            difficulty=q.difficulty,
-            question_text=(q.parsed_json or {}).get("question_text", ""),
-            pattern_name=pattern_name,
-            shared_kp_names=shared_kp_names or None,
-            rrf_score=fh.score,
+        hit = await _hydrate_hit(
+            session,
+            ref_id=fh.ref_id,
+            score=fh.score,
+            source_patterns=source_patterns,
+            source_kps=source_kps,
+            query=query,
+            matched_units=matched_units,
             route_ranks=dict(fh.ranks),
-            matched_unit_kinds=sorted(matched_units.get(str(qid), {}).get("kinds", set())) or None,
-            matched_unit_titles=sorted(matched_units.get(str(qid), {}).get("titles", set())) or None,
-        ))
+        )
+        if hit is None:
+            continue
+        hydrated.append(hit)
         if len(hydrated) >= query.k:
             break
 

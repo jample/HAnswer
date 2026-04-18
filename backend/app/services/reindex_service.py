@@ -14,6 +14,7 @@ from app.db.models import (
     Question,
     QuestionKPLink,
     QuestionPatternLink,
+    QuestionSolution,
 )
 from app.schemas import AnswerPackage, ParsedQuestion
 from app.services.embedding import DenseEmbedder
@@ -66,21 +67,25 @@ async def rebuild_retrieval_indexes(
     question_ids: list[uuid.UUID] | None = None,
 ) -> ReindexStats:
     stats = ReindexStats()
-    stmt = select(Question).where(Question.answer_package_json.is_not(None)).order_by(Question.created_at)
+    stmt = select(QuestionSolution).where(QuestionSolution.answer_package_json.is_not(None)).order_by(QuestionSolution.created_at)
     if question_ids:
-        stmt = stmt.where(Question.id.in_(question_ids))
-    questions = list((await session.execute(stmt)).scalars().all())
+        stmt = stmt.where(QuestionSolution.question_id.in_(question_ids))
+    solutions = list((await session.execute(stmt)).scalars().all())
 
     seen_pattern_ids: set[uuid.UUID] = set()
     seen_kp_ids: set[uuid.UUID] = set()
 
-    for q in questions:
+    for solution in solutions:
+        q = await session.get(Question, solution.question_id)
+        if q is None:
+            continue
         parsed = ParsedQuestion.model_validate(q.parsed_json or {})
-        package = AnswerPackage.model_validate(q.answer_package_json or {})
+        package = AnswerPackage.model_validate(solution.answer_package_json or {})
         index = build_pedagogical_index(parsed=parsed, package=package)
         retrieval_unit_rows = await persist_pedagogical_index(
             session,
             question_id=q.id,
+            solution_id=solution.id,
             profile=index.profile,
             units=index.units,
         )
@@ -92,9 +97,9 @@ async def rebuild_retrieval_indexes(
         answer_full_text = index.profile.query_texts.answer_full_text
 
         embed_plan: list[tuple[str, object, str]] = [
-            ("q_emb", q.id, q_text),
-            ("question_full_emb", q.id, question_full_text),
-            ("answer_full_emb", q.id, answer_full_text),
+            ("q_emb", f"{q.id}::{solution.id}", q_text),
+            ("question_full_emb", f"{q.id}::{solution.id}", question_full_text),
+            ("answer_full_emb", f"{q.id}::{solution.id}", answer_full_text),
         ]
         if pattern_row is not None:
             pattern_summary = "\n".join([
@@ -123,10 +128,8 @@ async def rebuild_retrieval_indexes(
             difficulty = q.difficulty
             unit_kind = ""
             ref_id = ""
-            if collection == "q_emb":
-                ref_id = str(q.id)
-            elif collection in {"question_full_emb", "answer_full_emb"}:
-                ref_id = str(q.id)
+            if collection in {"q_emb", "question_full_emb", "answer_full_emb"}:
+                ref_id = str(row)
             elif collection == "pattern_emb":
                 assert isinstance(row, MethodPatternRow)
                 ref_id = str(row.id)

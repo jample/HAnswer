@@ -16,6 +16,20 @@ type QuestionRow = {
   pattern_name: string | null;
   seen_count: number;
   created_at: string | null;
+  learning_ready: boolean;
+  confirmed_stage_count: number;
+  review_statuses: Record<string, string>;
+  topic_path: string[];
+  method_labels: string[];
+  target_types: string[];
+  novelty_flags: string[];
+  textbook_stage: string;
+};
+type Facets = {
+  methods: string[];
+  topics: string[];
+  target_types: string[];
+  novelty_flags: string[];
 };
 
 type SimilarHit = {
@@ -44,10 +58,17 @@ export default function LibraryPage() {
   const [gradeBand, setGradeBand] = useState('');
   const [difficulty, setDifficulty] = useState('');
   const [textQ, setTextQ] = useState('');
+  const [topic, setTopic] = useState('');
+  const [method, setMethod] = useState('');
+  const [targetType, setTargetType] = useState('');
+  const [noveltyFlag, setNoveltyFlag] = useState('');
+  const [sort, setSort] = useState<'recommended' | 'recent' | 'popular'>('recommended');
+  const [learningReadyOnly, setLearningReadyOnly] = useState(true);
   const [searchMode, setSearchMode] = useState<'list' | 'text'>('list');
   const [textResults, setTextResults] = useState<SimilarHit[]>([]);
   const [strategy, setStrategy] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [facets, setFacets] = useState<Facets>({ methods: [], topics: [], target_types: [], novelty_flags: [] });
 
   const qs = useMemo(() => {
     const p = new URLSearchParams();
@@ -57,15 +78,24 @@ export default function LibraryPage() {
       p.set('difficulty_min', difficulty);
       p.set('difficulty_max', difficulty);
     }
+    if (topic) p.set('topic', topic);
+    if (method) p.set('method', method);
+    if (targetType) p.set('target_type', targetType);
+    if (noveltyFlag) p.set('novelty_flag', noveltyFlag);
+    p.set('learning_ready', String(learningReadyOnly));
+    p.set('sort', sort);
     return p.toString();
-  }, [subject, gradeBand, difficulty]);
+  }, [subject, gradeBand, difficulty, topic, method, targetType, noveltyFlag, learningReadyOnly, sort]);
 
   useEffect(() => {
     if (searchMode !== 'list') return;
     setLoading(true);
     fetch(apiUrl(`/api/questions${qs ? '?' + qs : ''}`))
       .then((r) => r.json())
-      .then((d) => setItems(d.items || []))
+      .then((d) => {
+        setItems(d.items || []);
+        setFacets(d.facets || { methods: [], topics: [], target_types: [], novelty_flags: [] });
+      })
       .finally(() => setLoading(false));
   }, [qs, searchMode]);
 
@@ -128,6 +158,48 @@ export default function LibraryPage() {
             {[1, 2, 3, 4, 5].map((d) => <option key={d} value={d}>{d}</option>)}
           </select>
         </label>
+        <label>排序
+          <select value={sort} onChange={(e) => setSort(e.target.value as any)} style={{ marginLeft: 4 }}>
+            <option value="recommended">推荐</option>
+            <option value="recent">最新</option>
+            <option value="popular">常见</option>
+          </select>
+        </label>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <input
+            type="checkbox"
+            checked={learningReadyOnly}
+            onChange={(e) => setLearningReadyOnly(e.target.checked)}
+          />
+          只看已确认可学习题
+        </label>
+      </div>
+
+      <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'center', marginTop: 12 }}>
+        <label>方法
+          <select value={method} onChange={(e) => setMethod(e.target.value)} style={{ marginLeft: 4, maxWidth: 180 }}>
+            <option value="">全部</option>
+            {facets.methods.map((item) => <option key={item} value={item}>{item}</option>)}
+          </select>
+        </label>
+        <label>主题
+          <select value={topic} onChange={(e) => setTopic(e.target.value)} style={{ marginLeft: 4, maxWidth: 180 }}>
+            <option value="">全部</option>
+            {facets.topics.map((item) => <option key={item} value={item}>{item}</option>)}
+          </select>
+        </label>
+        <label>目标类型
+          <select value={targetType} onChange={(e) => setTargetType(e.target.value)} style={{ marginLeft: 4, maxWidth: 180 }}>
+            <option value="">全部</option>
+            {facets.target_types.map((item) => <option key={item} value={item}>{item}</option>)}
+          </select>
+        </label>
+        <label>题型标签
+          <select value={noveltyFlag} onChange={(e) => setNoveltyFlag(e.target.value)} style={{ marginLeft: 4, maxWidth: 180 }}>
+            <option value="">全部</option>
+            {facets.novelty_flags.map((item) => <option key={item} value={item}>{item}</option>)}
+          </select>
+        </label>
       </div>
 
       <form onSubmit={runTextSearch} style={{ marginTop: 12, display: 'flex', gap: 8 }}>
@@ -161,6 +233,19 @@ export default function LibraryPage() {
                 {it.subject} · {it.grade_band} · 难度 {it.difficulty}
                 {it.pattern_name && <> · 模式 <code>{it.pattern_name}</code></>}
                 {it.seen_count > 1 && <> · 出现 {it.seen_count} 次</>}
+                {it.learning_ready && <> · 已确认入库</>}
+                {!it.learning_ready && <> · 待确认</>}
+              </div>
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 6 }}>
+                {it.topic_path.slice(0, 3).map((item) => (
+                  <span key={item} style={badgeStyle('#eef5ff', '#245ea8')}>{item}</span>
+                ))}
+                {it.target_types.slice(0, 2).map((item) => (
+                  <span key={item} style={badgeStyle('#eef8f0', '#1f7a3d')}>{item}</span>
+                ))}
+                {it.novelty_flags.slice(0, 2).map((item) => (
+                  <span key={item} style={badgeStyle('#fff8e8', '#9a6700')}>{item}</span>
+                ))}
               </div>
             </li>
           ))}
@@ -227,3 +312,15 @@ const rowStyle: React.CSSProperties = {
   padding: '8px 0',
   borderBottom: '1px solid #eee',
 };
+
+function badgeStyle(bg: string, fg: string): React.CSSProperties {
+  return {
+    display: 'inline-flex',
+    alignItems: 'center',
+    padding: '2px 8px',
+    borderRadius: 999,
+    background: bg,
+    color: fg,
+    fontSize: 12,
+  };
+}

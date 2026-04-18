@@ -38,6 +38,7 @@ from app.db.models import (
 from app.schemas import AnswerPackage, KnowledgePointRef, MethodPattern, ParsedQuestion
 from app.services.embedding import DenseEmbedder
 from app.services.indexer_service import build_pedagogical_index, persist_pedagogical_index
+from app.services.solution_ref_service import decode_solution_ref, encode_solution_ref
 from app.services.sparse_encoder import SparseEncoder
 from app.services.vector_store import VectorStore
 
@@ -214,6 +215,7 @@ async def sediment(
     session: AsyncSession,
     *,
     question_id: uuid.UUID,
+    solution_id: uuid.UUID | None = None,
     package: AnswerPackage,
     embedding: DenseEmbedder,
     vector_store: VectorStore,
@@ -251,6 +253,7 @@ async def sediment(
     retrieval_unit_rows = await persist_pedagogical_index(
         session,
         question_id=question_id,
+        solution_id=solution_id,
         profile=index.profile,
         units=index.units,
     )
@@ -291,6 +294,8 @@ async def sediment(
     kp_vecs = vectors[kp_start:kp_end]
     retrieval_unit_vecs = vectors[kp_end:]
 
+    solution_ref = encode_solution_ref(question_id=question_id, solution_id=solution_id)
+
     # 4. Near-dup check before writing q_emb so self-match doesn't trigger.
     near_dup_of: uuid.UUID | None = None
     hits = await vector_store.search(
@@ -301,16 +306,20 @@ async def sediment(
         grade_band=q.grade_band,
     )
     for h in hits:
-        if h.ref_id == str(question_id):
+        parsed_ref = decode_solution_ref(h.ref_id)
+        if parsed_ref is None:
+            continue
+        hit_question_id, _hit_solution_id = parsed_ref
+        if hit_question_id == question_id:
             continue
         if h.score >= NEAR_DUP_THRESHOLD:
-            near_dup_of = uuid.UUID(h.ref_id)
+            near_dup_of = hit_question_id
             break
 
     # 5. Upserts
     await vector_store.upsert(
         "q_emb",
-        ref_id=str(question_id),
+        ref_id=solution_ref,
         vector=q_vec,
         subject=q.subject,
         grade_band=q.grade_band,
@@ -318,7 +327,7 @@ async def sediment(
     )
     await vector_store.upsert(
         "question_full_emb",
-        ref_id=str(question_id),
+        ref_id=solution_ref,
         vector=question_full_vec,
         subject=q.subject,
         grade_band=q.grade_band,
@@ -326,7 +335,7 @@ async def sediment(
     )
     await vector_store.upsert(
         "answer_full_emb",
-        ref_id=str(question_id),
+        ref_id=solution_ref,
         vector=answer_full_vec,
         subject=q.subject,
         grade_band=q.grade_band,
@@ -372,17 +381,17 @@ async def sediment(
         sp_kps = sparse_vecs[kp_start:kp_end]
         sp_units = sparse_vecs[kp_end:]
         await vector_store.upsert_sparse(
-            "q_emb", ref_id=str(question_id), sparse=sp_q,
+            "q_emb", ref_id=solution_ref, sparse=sp_q,
             subject=q.subject, grade_band=q.grade_band,
             difficulty=q.difficulty,
         )
         await vector_store.upsert_sparse(
-            "question_full_emb", ref_id=str(question_id), sparse=sp_question_full,
+            "question_full_emb", ref_id=solution_ref, sparse=sp_question_full,
             subject=q.subject, grade_band=q.grade_band,
             difficulty=q.difficulty,
         )
         await vector_store.upsert_sparse(
-            "answer_full_emb", ref_id=str(question_id), sparse=sp_answer_full,
+            "answer_full_emb", ref_id=solution_ref, sparse=sp_answer_full,
             subject=q.subject, grade_band=q.grade_band,
             difficulty=q.difficulty,
         )

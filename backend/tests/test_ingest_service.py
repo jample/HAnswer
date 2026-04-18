@@ -15,7 +15,7 @@ import pytest
 
 from app.config import settings
 from app.schemas import ParsedQuestion
-from app.services.ingest_service import edit_parsed, ingest_image
+from app.services.ingest_service import edit_parsed, ingest_image, rescan_question
 from app.services.llm_client import FakeTransport, GeminiClient
 
 
@@ -101,3 +101,23 @@ def test_parsed_question_pydantic_roundtrip():
     pq = ParsedQuestion.model_validate(_VALID_PARSED)
     assert pq.subject == "math"
     assert pq.find[0].startswith("B")
+
+
+@pytest.mark.asyncio
+async def test_rescan_injects_user_guidance(session, tmp_image_dir):
+    llm = _llm_with(_VALID_PARSED)
+    result = await ingest_image(
+        session, data=b"rescan-guidance-bytes", mime="image/jpeg", llm=llm,
+    )
+
+    llm.transport.calls.clear()
+    await rescan_question(
+        session,
+        question_id=result.question.id,
+        llm=llm,
+        user_guidance="这是面向初中生的题目，请更谨慎地区分已知和所求。",
+    )
+
+    assert llm.transport.calls
+    assert "messages" in llm.transport.calls[-1]
+    assert "初中生" in llm.transport.calls[-1]["messages"][-1]["content"]

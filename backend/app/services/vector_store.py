@@ -78,6 +78,8 @@ class VectorStore(Protocol):
         grade_band: str | None = None,
     ) -> list[Hit]: ...
 
+    async def delete(self, collection: str, *, ref_id: str) -> None: ...
+
 
 def _norm(v: list[float]) -> float:
     return math.sqrt(sum(x * x for x in v)) or 1.0
@@ -226,6 +228,10 @@ class InMemoryVectorStore:
         hits.sort(key=lambda h: h.score, reverse=True)
         return hits[:k]
 
+    async def delete(self, collection: str, *, ref_id: str) -> None:
+        self._rows.get(collection, {}).pop(ref_id, None)
+        self._sparse.get(collection, {}).pop(ref_id, None)
+
 
 class MilvusVectorStore:
     """Production backend — pymilvus client (lazy-initialized)."""
@@ -280,6 +286,27 @@ class MilvusVectorStore:
             client.insert,
             collection_name=collection_name,
             data=[row],
+        )
+        await asyncio.to_thread(
+            client.flush,
+            collection_name=collection_name,
+        )
+
+    async def _delete_row(
+        self,
+        *,
+        collection_name: str,
+        ref_field: str,
+        ref_id: str,
+    ) -> None:
+        client = self._get_client()
+        expr = f'{ref_field} == "{self._escape_string(ref_id)}"'
+        import asyncio
+
+        await asyncio.to_thread(
+            client.delete,
+            collection_name=collection_name,
+            filter=expr,
         )
         await asyncio.to_thread(
             client.flush,
@@ -432,6 +459,18 @@ class MilvusVectorStore:
                 difficulty=int(entity.get("difficulty", 0) or 0),
             ))
         return hits
+
+    async def delete(self, collection: str, *, ref_id: str) -> None:
+        await self._delete_row(
+            collection_name=collection,
+            ref_field=self._id_field(collection),
+            ref_id=ref_id,
+        )
+        await self._delete_row(
+            collection_name=collection + self._SPARSE_SUFFIX,
+            ref_field=self._id_field(collection),
+            ref_id=ref_id,
+        )
 
 
 # ── Dependency-injection singleton ───────────────────────────────────

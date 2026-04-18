@@ -110,6 +110,7 @@ async def generate_answer(
     llm: GeminiClient,
     existing_patterns: list[dict] | None = None,
     existing_kps: list[dict] | None = None,
+    user_guidance: str | None = None,
 ) -> AsyncIterator[SSEEvent]:
     """Run Solver, persist, and stream SSE events.
 
@@ -128,6 +129,17 @@ async def generate_answer(
         "existing_patterns": existing_patterns or [],
         "existing_kps": existing_kps or [],
     }
+    messages_override = None
+    if user_guidance and user_guidance.strip():
+        messages_override = solver.build(**kwargs)
+        messages_override.append({
+            "role": "user",
+            "content": (
+                "以下是用户在人工审核阶段给出的额外要求。"
+                "请在不违背题意和 JSON Schema 的前提下严格遵守：\n"
+                f"{user_guidance.strip()}"
+            ),
+        })
 
     try:
         pkg = await llm.call_structured(
@@ -135,6 +147,7 @@ async def generate_answer(
             model=settings.gemini.model_solver,
             model_cls=AnswerPackage,
             template_kwargs=kwargs,
+            messages_override=messages_override,
             timeout_s=settings.llm.solver_timeout_s,
             stream=settings.llm.stream_solver_json,
         )

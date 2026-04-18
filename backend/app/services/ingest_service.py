@@ -17,6 +17,7 @@ from app.db.models import IngestImage, Question
 from app.prompts import PromptRegistry
 from app.schemas import ParsedQuestion
 from app.services.llm_client import GeminiClient
+from app.services.stage_review_service import ensure_parsed_stage_review
 
 MIME_EXT = {
     "image/jpeg": "jpg",
@@ -51,6 +52,7 @@ async def ingest_image(
     mime: str,
     llm: GeminiClient,
     subject_hint: str | None = None,
+    user_guidance: str | None = None,
 ) -> IngestResult:
     """End-to-end ingest: blob → parser → persistence.
 
@@ -80,6 +82,15 @@ async def ingest_image(
     parser = PromptRegistry.get("parser")
     kwargs = {"subject_hint": subject_hint} if subject_hint else {}
     messages = parser.build_multimodal(data, mime, **kwargs)
+    if user_guidance and user_guidance.strip():
+        messages.append({
+            "role": "user",
+            "content": (
+                "以下是用户在人工审核阶段给出的额外解析要求。"
+                "请在不违背图片内容和 JSON Schema 的前提下遵守：\n"
+                f"{user_guidance.strip()}"
+            ),
+        })
 
     parsed = await llm.call_structured(
         template=parser,
@@ -96,6 +107,7 @@ async def ingest_image(
         parsed=parsed,
         dedup_hash=sha,
     )
+    await ensure_parsed_stage_review(session, question=question, review_note=user_guidance)
     return IngestResult(question, image_row, parsed, deduped=False)
 
 
@@ -111,6 +123,7 @@ async def rescan_question(
     question_id: uuid.UUID,
     llm: GeminiClient,
     subject_hint: str | None = None,
+    user_guidance: str | None = None,
 ) -> IngestResult:
     q = await repo.get_question(session, question_id)
     if q is None:
@@ -128,6 +141,15 @@ async def rescan_question(
     parser = PromptRegistry.get("parser")
     kwargs = {"subject_hint": subject_hint} if subject_hint else {}
     messages = parser.build_multimodal(data, image_row.mime, **kwargs)
+    if user_guidance and user_guidance.strip():
+        messages.append({
+            "role": "user",
+            "content": (
+                "以下是用户在人工审核阶段给出的额外解析要求。"
+                "请在不违背图片内容和 JSON Schema 的前提下遵守：\n"
+                f"{user_guidance.strip()}"
+            ),
+        })
 
     parsed = await llm.call_structured(
         template=parser,
@@ -140,6 +162,7 @@ async def rescan_question(
 
     await repo.clear_generated_content(session, question_id=question_id)
     question = await repo.replace_parsed(session, question_id=question_id, parsed=parsed)
+    await ensure_parsed_stage_review(session, question=question, review_note=user_guidance)
     return IngestResult(question, image_row, parsed, deduped=False)
 
 
@@ -151,6 +174,7 @@ async def replace_question_image(
     mime: str,
     llm: GeminiClient,
     subject_hint: str | None = None,
+    user_guidance: str | None = None,
 ) -> IngestResult:
     if mime not in MIME_EXT:
         raise ValueError(f"unsupported mime: {mime}")
@@ -168,6 +192,15 @@ async def replace_question_image(
     parser = PromptRegistry.get("parser")
     kwargs = {"subject_hint": subject_hint} if subject_hint else {}
     messages = parser.build_multimodal(data, mime, **kwargs)
+    if user_guidance and user_guidance.strip():
+        messages.append({
+            "role": "user",
+            "content": (
+                "以下是用户在人工审核阶段给出的额外解析要求。"
+                "请在不违背图片内容和 JSON Schema 的前提下遵守：\n"
+                f"{user_guidance.strip()}"
+            ),
+        })
     parsed = await llm.call_structured(
         template=parser,
         model=settings.gemini.model_parser,
@@ -185,4 +218,5 @@ async def replace_question_image(
         dedup_hash=sha,
     )
     question = await repo.replace_parsed(session, question_id=question_id, parsed=parsed)
+    await ensure_parsed_stage_review(session, question=question, review_note=user_guidance)
     return IngestResult(question, image_row, parsed, deduped=False)

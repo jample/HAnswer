@@ -18,7 +18,13 @@ from dataclasses import dataclass
 from typing import Any, Protocol, TypeVar
 
 from pydantic import BaseModel, ValidationError
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import (
+    before_sleep_log,
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from app.config import settings
 from app.prompts.base import PromptTemplate
@@ -129,7 +135,9 @@ class FakeTransport:
 _COST_PER_1K: dict[str, tuple[float, float]] = {
     # model: (input_usd_per_1k, output_usd_per_1k)
     "gemini-2.0-flash": (0.000075, 0.00030),
+    "gemini-3.1-pro-preview": (0.00125, 0.0050),
     "text-embedding-004": (0.0000125, 0.0),
+    "gemini-embedding-001": (0.0000125, 0.0),
 }
 
 
@@ -151,9 +159,10 @@ class GeminiClient:
         self.ledger = ledger or NoopLedger()
 
     @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=0.5, min=0.5, max=8),
+        stop=stop_after_attempt(settings.llm.max_retries),
+        wait=wait_exponential(multiplier=1, min=1, max=12),
         retry=retry_if_exception_type(TransientLLMError),
+        before_sleep=before_sleep_log(log, logging.WARNING, exc_info=True),
         reraise=True,
     )
     async def _raw_call(

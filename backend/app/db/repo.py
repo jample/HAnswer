@@ -20,6 +20,10 @@ from app.db.models import (
     Question,
     QuestionKPLink,
     QuestionPatternLink,
+    QuestionRetrievalProfile,
+    QuestionSolution,
+    QuestionStageReview,
+    RetrievalUnitRow,
     SolutionStepRow,
     VisualizationRow,
 )
@@ -182,8 +186,20 @@ async def clear_generated_content(
         delete(VisualizationRow).where(VisualizationRow.question_id == question_id),
     )
     await session.execute(
+        delete(RetrievalUnitRow).where(RetrievalUnitRow.question_id == question_id),
+    )
+    await session.execute(
+        delete(QuestionRetrievalProfile).where(QuestionRetrievalProfile.question_id == question_id),
+    )
+    await session.execute(
         delete(QuestionKPLink).where(QuestionKPLink.question_id == question_id),
     )
     await session.execute(
         delete(QuestionPatternLink).where(QuestionPatternLink.question_id == question_id),
+    )
+    await session.execute(
+        delete(QuestionStageReview).where(QuestionStageReview.question_id == question_id),
+    )
+    await session.execute(
+        delete(QuestionSolution).where(QuestionSolution.question_id == question_id),
     )

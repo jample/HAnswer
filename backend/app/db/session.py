@@ -37,4 +37,9 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
 async def get_session() -> AsyncIterator[AsyncSession]:
     """FastAPI dependency."""
     async with SessionLocal() as s:
-        yield s
+        try:
+            yield s
+            await s.commit()
+        except Exception:
+            await s.rollback()
+            raise

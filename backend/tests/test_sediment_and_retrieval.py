@@ -21,6 +21,7 @@ from app.schemas import AnswerPackage
 from app.services.embedding import EmbeddingService
 from app.services.ingest_service import ingest_image
 from app.services.llm_client import FakeTransport, GeminiClient
+from app.services.question_solution_service import create_solution
 from app.services.retrieval_service import SimilarQuery, similar_questions
 from app.services.sediment_service import NEAR_DUP_THRESHOLD, sediment
 from app.services.solver_service import generate_answer
@@ -363,3 +364,55 @@ async def test_retrieval_filters_by_subject(session, tmp_image_dir):
     ids = {h.question_id for h in hits}
     assert str(qid_a) in ids or str(qid_b) not in ids
     assert str(qid_b) not in ids  # physics filtered out
+
+
+@pytest.mark.asyncio
+async def test_retrieval_returns_solution_id_for_solution_scoped_index(session, tmp_image_dir):
+    qid_a = await _seed_question(session, _PARSED_A, marker=b"ret-sol-a")
+    qid_b = await _seed_question(session, _PARSED_B, marker=b"ret-sol-b")
+
+    solver_llm = GeminiClient(FakeTransport(
+        json_by_model={settings.gemini.model_solver: json.dumps(_ANSWER_PACKAGE_A)}
+    ))
+    pkg_a = await _run_solver(session, qid_a, solver_llm)
+    pkg_b = await _run_solver(session, qid_b, solver_llm)
+
+    sol_a = await create_solution(session, question_id=qid_a, make_current=True)
+    sol_b = await create_solution(session, question_id=qid_b, make_current=True)
+
+    vs = InMemoryVectorStore()
+    embed_llm = GeminiClient(_CannedEmbedTransport(vectors={
+        _PARSED_A["question_text"]: _pad([1.0, 0.0]),
+        _PARSED_B["question_text"]: _pad([0.8, 0.2]),
+    }))
+    es = EmbeddingService(llm=embed_llm)
+    await sediment(
+        session,
+        question_id=qid_a,
+        solution_id=sol_a.id,
+        package=pkg_a,
+        embedding=es,
+        vector_store=vs,
+    )
+    await sediment(
+        session,
+        question_id=qid_b,
+        solution_id=sol_b.id,
+        package=pkg_b,
+        embedding=es,
+        vector_store=vs,
+    )
+
+    hits = await similar_questions(
+        session,
+        query=SimilarQuery(
+            mode="auto",
+            question_id=str(qid_a),
+            solution_id=str(sol_a.id),
+            k=5,
+        ),
+        embedding=es,
+        vector_store=vs,
+    )
+    target = next(h for h in hits if h.question_id == str(qid_b))
+    assert target.solution_id == str(sol_b.id)

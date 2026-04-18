@@ -316,18 +316,24 @@ async def persist_pedagogical_index(
     session: AsyncSession,
     *,
     question_id: uuid.UUID,
+    solution_id: uuid.UUID | None = None,
     profile: PedagogicalIndexProfile,
     units: list[RetrievalUnit],
 ) -> list[RetrievalUnitRow]:
     await session.execute(
-        delete(RetrievalUnitRow).where(RetrievalUnitRow.question_id == question_id)
+        delete(RetrievalUnitRow)
+        .where(RetrievalUnitRow.question_id == question_id)
+        .where(RetrievalUnitRow.solution_id == solution_id)
     )
     await session.execute(
-        delete(QuestionRetrievalProfile).where(QuestionRetrievalProfile.question_id == question_id)
+        delete(QuestionRetrievalProfile)
+        .where(QuestionRetrievalProfile.question_id == question_id)
+        .where(QuestionRetrievalProfile.solution_id == solution_id)
     )
 
     session.add(QuestionRetrievalProfile(
         question_id=question_id,
+        solution_id=solution_id,
         profile_json=profile.model_dump(mode="json"),
     ))
     await session.flush()
@@ -336,6 +342,7 @@ async def persist_pedagogical_index(
     for unit in units:
         row = RetrievalUnitRow(
             question_id=question_id,
+            solution_id=solution_id,
             unit_kind=unit.unit_kind,
             title=unit.title,
             text=unit.text,
@@ -350,10 +357,11 @@ async def persist_pedagogical_index(
 
 
 async def load_retrieval_units(
-    session: AsyncSession, *, question_id: uuid.UUID,
+    session: AsyncSession, *, question_id: uuid.UUID, solution_id: uuid.UUID | None = None,
 ) -> list[RetrievalUnitRow]:
     return list((await session.execute(
         select(RetrievalUnitRow)
         .where(RetrievalUnitRow.question_id == question_id)
+        .where(RetrievalUnitRow.solution_id == solution_id)
         .order_by(RetrievalUnitRow.created_at, RetrievalUnitRow.title)
     )).scalars().all())

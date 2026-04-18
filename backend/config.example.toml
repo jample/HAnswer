@@ -41,7 +41,7 @@ image_dir = "./data/images"
 
 [llm]
 # Retry & repair loop knobs (§4 non-functional requirements).
-max_retries = 3
+max_retries = 2
 max_repair_attempts = 2
 request_timeout_s = 60
 parser_timeout_s = 60

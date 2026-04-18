@@ -60,7 +60,7 @@ class StorageSettings(BaseModel):
 
 
 class LLMSettings(BaseModel):
-    max_retries: int = 3
+    max_retries: int = 2
     max_repair_attempts: int = 2
     request_timeout_s: int = 60
     parser_timeout_s: int = 60

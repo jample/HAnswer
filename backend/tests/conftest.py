@@ -5,6 +5,11 @@ Each test gets an `AsyncSession` bound to a SAVEPOINT that is rolled
 back at teardown, so the DB stays clean while still exercising the
 Postgres dialect (JSONB, UUID, CHECK constraints).
 
+NOTE: Services that create their own ``session_scope()`` sessions
+(``dialog_service``, ``answer_job_service``, ``cost_ledger``) bypass
+the SAVEPOINT sandbox. Tests for those services should either inject
+the test session or account for cross-connection visibility.
+
 Assumes `alembic upgrade head` has been run once against the configured DSN.
 """
 

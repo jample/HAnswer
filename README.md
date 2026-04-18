@@ -133,7 +133,7 @@ cors_origins = ["http://localhost:3333"]
 image_dir = "./data/images"            # original uploads
 
 [llm]
-max_retries         = 3                 # transport-level retries
+max_retries         = 2                 # transport-level retries
 max_repair_attempts = 2                 # schema-repair loop (§3 reliability)
 request_timeout_s   = 60                # generic fallback
 parser_timeout_s    = 60
