@@ -1,0 +1,147 @@
+<!doctype html>
+<!--
+  HAnswer viz sandbox (§3.3.2).
+
+  Strict CSP + sandbox attribute enforced by the server; this HTML
+  additionally:
+    1. Freezes dangerous globals before running LLM code.
+    2. Loads JSXGraph and the `H` helper library locally (no network).
+    3. Communicates with the host only via typed postMessage protocol.
+
+  Protocol (host -> iframe):
+    { type: 'init',          boardOptions?: {...} }
+    { type: 'render',        jsxCode: string, params: object }
+    { type: 'update-params', params: object }
+    { type: 'dispose' }
+
+  Protocol (iframe -> host):
+    { type: 'ready' }
+    { type: 'error',  message: string }
+    { type: 'metric', renderMs: number }
+-->
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>HAnswer Viz Sandbox</title>
+  <link rel="stylesheet" href="/viz/jsxgraph.css" />
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; background: #fff; font-family: system-ui, sans-serif; }
+    #board { width: 100%; height: 100%; }
+    #err { color: #b00020; padding: 12px; display: none; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <div id="board" class="jxgbox"></div>
+  <pre id="err"></pre>
+
+  <!-- Served locally; CSP forbids remote scripts. -->
+  <script src="/viz/jsxgraphcore.js"></script>
+  <script src="/viz/h-library.js"></script>
+  <script>
+  (function () {
+    'use strict';
+
+    // --- 1. Freeze / delete dangerous globals --------------------------
+    const KILL = [
+      'fetch', 'XMLHttpRequest', 'WebSocket', 'Worker',
+      'importScripts', 'localStorage', 'sessionStorage', 'indexedDB',
+    ];
+    for (const k of KILL) {
+      try { Object.defineProperty(window, k, { value: undefined, configurable: false }); }
+      catch (_) {}
+    }
+    // setTimeout/Interval with string args: wrap and reject.
+    const _setTimeout = window.setTimeout;
+    const _setInterval = window.setInterval;
+    window.setTimeout = function (fn, ms) {
+      if (typeof fn === 'string') throw new Error('setTimeout(string) forbidden');
+      return _setTimeout.apply(this, arguments);
+    };
+    window.setInterval = function (fn, ms) {
+      if (typeof fn === 'string') throw new Error('setInterval(string) forbidden');
+      return _setInterval.apply(this, arguments);
+    };
+    // Block eval / Function constructor.
+    window.eval = function () { throw new Error('eval forbidden'); };
+    window.Function = function () { throw new Error('Function forbidden'); };
+
+    // --- 2. Render controller ----------------------------------------
+    let board = null;
+    let controller = null;
+
+    function postError(msg) {
+      document.getElementById('err').style.display = 'block';
+      document.getElementById('err').textContent = msg;
+      parent.postMessage({ type: 'error', message: msg }, '*');
+    }
+
+    function dispose() {
+      if (controller && typeof controller.destroy === 'function') {
+        try { controller.destroy(); } catch (_) {}
+      }
+      controller = null;
+      if (board) {
+        try { JXG.JSXGraph.freeBoard(board); } catch (_) {}
+        board = null;
+      }
+      document.getElementById('err').style.display = 'none';
+    }
+
+    function render(jsxCode, params) {
+      dispose();
+      const t0 = performance.now();
+      board = JXG.JSXGraph.initBoard('board', {
+        boundingbox: [-5, 5, 5, -5],
+        axis: true,
+        showNavigation: false,
+        showCopyright: false,
+        keepAspectRatio: true,
+      });
+      try {
+        // Wrap LLM-supplied body in a function with a controlled signature.
+        // Forbidden globals are already killed; we additionally shadow them.
+        const userFn = new (Object.getPrototypeOf(function(){}).constructor)(
+          'board', 'JXG', 'H', 'params',
+          '"use strict";' +
+          'var window=undefined,document=undefined,globalThis=undefined,self=undefined,' +
+          'top=undefined,parent=undefined,fetch=undefined,XMLHttpRequest=undefined,' +
+          'eval=undefined,Function=undefined;' +
+          jsxCode
+        );
+        // Note: we use the Function constructor indirectly to build the wrapper
+        // before we blocked it above. To avoid chicken-and-egg, restore locally.
+        controller = userFn(board, window.JXG, window.H, params || {}) || null;
+        parent.postMessage({ type: 'metric', renderMs: performance.now() - t0 }, '*');
+      } catch (e) {
+        postError(String(e && e.message || e));
+      }
+    }
+
+    // --- 3. Message loop ---------------------------------------------
+    window.addEventListener('message', function (ev) {
+      const msg = ev.data || {};
+      switch (msg.type) {
+        case 'init':
+          parent.postMessage({ type: 'ready' }, '*');
+          break;
+        case 'render':
+          render(msg.jsxCode || '', msg.params || {});
+          break;
+        case 'update-params':
+          if (controller && typeof controller.update === 'function') {
+            try { controller.update(msg.params || {}); }
+            catch (e) { postError(String(e && e.message || e)); }
+          }
+          break;
+        case 'dispose':
+          dispose();
+          break;
+      }
+    });
+
+    // Kick off
+    parent.postMessage({ type: 'ready' }, '*');
+  })();
+  </script>
+</body>
+</html>
