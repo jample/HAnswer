@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from app.config import settings
+from app.services.bge_m3_runtime import get_bge_m3_model
 from app.services.llm_client import GeminiClient
 
 
@@ -33,13 +34,21 @@ class EmbeddingService:
     llm: GeminiClient
 
     async def embed_one(self, text: str) -> list[float]:
-        (vec,) = await self.llm.embed([text], model=settings.gemini.model_embed)
+        (vec,) = await self.llm.embed(
+            [text],
+            model=settings.gemini.model_embed,
+            task_type="RETRIEVAL_QUERY",
+        )
         return list(vec)
 
     async def embed_many(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
-        vecs = await self.llm.embed(texts, model=settings.gemini.model_embed)
+        vecs = await self.llm.embed(
+            texts,
+            model=settings.gemini.model_embed,
+            task_type="RETRIEVAL_DOCUMENT",
+        )
         return [list(v) for v in vecs]
 
     @property
@@ -50,26 +59,12 @@ class EmbeddingService:
 class BGEM3DenseEmbedder:
     """Local BAAI/bge-m3 dense embedder — lazy-imports FlagEmbedding."""
 
-    DIM: int = 1024
-
     def __init__(self, model=None) -> None:  # type: ignore[no-untyped-def]
         self._model = model
 
     def _get_model(self):  # type: ignore[no-untyped-def]
         if self._model is None:
-            try:
-                from FlagEmbedding import BGEM3FlagModel  # lazy
-            except ImportError as e:  # pragma: no cover - optional dep
-                raise RuntimeError(
-                    "BGE-M3 is not installed. Run "
-                    "`pip install -e .[retrieval]` or switch "
-                    "retrieval.embedder to 'gemini'."
-                ) from e
-            self._model = BGEM3FlagModel(
-                settings.retrieval.bge_m3_model,
-                use_fp16=False,
-                device=settings.retrieval.bge_m3_device,
-            )
+            self._model = get_bge_m3_model()
         return self._model
 
     async def embed_one(self, text: str) -> list[float]:
@@ -93,7 +88,7 @@ class BGEM3DenseEmbedder:
 
     @property
     def dim(self) -> int:
-        return self.DIM
+        return settings.retrieval.bge_m3_dense_dim
 
 
 def build_dense_embedder(llm: GeminiClient) -> DenseEmbedder:
@@ -101,4 +96,3 @@ def build_dense_embedder(llm: GeminiClient) -> DenseEmbedder:
     if settings.retrieval.embedder == "bge-m3":
         return BGEM3DenseEmbedder()
     return EmbeddingService(llm=llm)
-

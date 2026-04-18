@@ -5,10 +5,14 @@
 # API key is read from the $GEMINI_API_KEY environment variable.
 # Do NOT put the key here — set it in your shell or CI secrets instead.
 # Model per task. Override as needed when new Gemini versions ship.
-model_parser   = "gemini-3.1-pro"        # multimodal, image -> ParsedQuestion
-model_solver   = "gemini-3.1-pro"        # text, ParsedQuestion -> AnswerPackage
-model_vizcoder = "gemini-3.1-pro"        # text, AnswerPackage -> visualizations[]
-model_embed    = "text-embedding-004"    # embeddings
+model_parser   = "gemini-3.1-pro-preview" # multimodal, image -> ParsedQuestion
+model_solver   = "gemini-3.1-pro-preview" # text, ParsedQuestion -> AnswerPackage
+model_vizcoder = "gemini-3.1-pro-preview" # text, AnswerPackage -> visualizations[]
+# Gemini dense-embedding model.
+# Supported in this repo:
+#   - "text-embedding-004"    via legacy google-generativeai path
+#   - "gemini-embedding-001"  via google-genai path
+model_embed    = "text-embedding-004"
 embed_dim      = 768
 
 [postgres]
@@ -21,6 +25,10 @@ database = "default"
 # Auto-create the dense + sparse collections on FastAPI startup if
 # missing. Set to false if you provision Milvus schemas out-of-band.
 auto_bootstrap = true
+# Leave false in normal operation. Turn on only if you intentionally
+# want startup to drop+recreate dense collections after an embedder
+# dim change (for example Gemini 768 -> bge-m3 1024).
+recreate_dense_on_dim_mismatch = false
 
 [server]
 host = "127.0.0.1"
@@ -36,11 +44,20 @@ image_dir = "./data/images"
 max_retries = 3
 max_repair_attempts = 2
 request_timeout_s = 60
+parser_timeout_s = 60
+solver_timeout_s = 180
+vizcoder_timeout_s = 120
+dialog_timeout_s = 90
+embed_timeout_s = 60
+stream_solver_json = true
+stream_vizcoder_json = true
 
 [retrieval]
 # M5 multi-route retrieval with RRF fusion (§3.4).
-# Default (gemini + bm25 + multi_route) works with zero extra dependencies.
-# For best Chinese math recall switch embedder + sparse_encoder to "bge-m3"
+# Fast remote mode:
+#   embedder="gemini" + model_embed="text-embedding-004" + sparse_encoder="bm25"
+# Strongest local mixed-language recall:
+#   embedder="bge-m3" + sparse_encoder="bge-m3"
 # and install the optional extra: `pip install -e .[retrieval]`.
 embedder                  = "gemini"        # "gemini" | "bge-m3"
 sparse_encoder            = "bm25"          # "bm25" | "bge-m3"
@@ -51,4 +68,14 @@ route_weights_sparse      = 1.0
 route_weights_structural  = 1.0
 bge_m3_model              = "BAAI/bge-m3"
 bge_m3_device             = "cpu"
+bge_m3_dense_dim          = 1024
 wide_k_multiplier         = 3
+
+[dialog]
+# Multi-turn tutoring memory (§3.7).
+model_chat                = "gemini-3.1-pro-preview"
+recent_messages           = 10
+max_question_context_chars = 12000
+max_summary_chars         = 3000
+max_key_facts             = 12
+max_open_questions        = 8

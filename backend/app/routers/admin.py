@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
@@ -19,6 +19,9 @@ router = APIRouter(prefix="/api/admin", tags=["admin"])
 async def _session() -> AsyncSession:  # type: ignore[override]
     async with session_scope() as s:
         yield s
+
+
+SESSION_DEP = Depends(_session)
 
 
 def _mask(secret: str) -> str:
@@ -56,9 +59,14 @@ async def read_config() -> dict:
             "port": settings.milvus.port,
             "database": settings.milvus.database,
             "auto_bootstrap": settings.milvus.auto_bootstrap,
+            "recreate_dense_on_dim_mismatch": settings.milvus.recreate_dense_on_dim_mismatch,
         },
-        "retrieval": settings.retrieval.model_dump(),
+        "retrieval": {
+            **settings.retrieval.model_dump(),
+            "active_dense_dim": settings.retrieval_dense_dim,
+        },
         "llm": settings.llm.model_dump(),
+        "dialog": settings.dialog.model_dump(),
         "server": {
             "host": settings.server.host,
             "port": settings.server.port,
@@ -92,7 +100,7 @@ def _strip_dsn_password(dsn: str) -> str:
 @router.get("/llm-cost")
 async def llm_cost(
     days: int = Query(7, ge=1, le=90),
-    session: AsyncSession = Depends(_session),
+    session: AsyncSession = SESSION_DEP,
 ) -> dict:
     """Aggregate LLM cost + latency from `llm_calls` over the last N days.
 
@@ -104,9 +112,7 @@ async def llm_cost(
                          prompt_tokens, completion_tokens, avg_latency_ms}]
         - `by_day`:    [{date, cost_usd, calls}]
     """
-    since = datetime.now(tz=timezone.utc) - timedelta(days=days)
-
-    base = select(LLMCall).where(LLMCall.created_at >= since)
+    since = datetime.now(tz=UTC) - timedelta(days=days)
 
     # Totals
     totals_q = select(
@@ -189,7 +195,7 @@ async def explain_prompt(name: str) -> dict:
     try:
         t = PromptRegistry.get(name)
     except KeyError as e:
-        raise HTTPException(404, str(e))
+        raise HTTPException(404, str(e)) from e
     return {
         "name": t.name,
         "version": str(t.version),
@@ -214,8 +220,8 @@ async def preview_prompt(name: str, kwargs: dict) -> dict:
     try:
         t = PromptRegistry.get(name)
     except KeyError as e:
-        raise HTTPException(404, str(e))
+        raise HTTPException(404, str(e)) from e
     try:
         return {"preview": t.preview(**kwargs), "version": str(t.version)}
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(400, f"preview failed: {e}")
+        raise HTTPException(400, f"preview failed: {e}") from e

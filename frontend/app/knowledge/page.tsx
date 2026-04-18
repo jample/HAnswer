@@ -3,6 +3,8 @@
 import Link from 'next/link';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
+import { apiUrl } from '../../lib/api';
+
 type KPNode = {
   id: string;
   parent_id: string | null;
@@ -18,7 +20,7 @@ type PendingPayload = {
   kps: KPNode[];
   patterns: {
     id: string; name_cn: string; subject: string; grade_band: string;
-    when_to_use: string; seen_count: number;
+    when_to_use: string; status?: 'live' | 'pending'; seen_count: number;
   }[];
 };
 
@@ -55,52 +57,90 @@ export default function KnowledgePage() {
   const [gradeBand, setGradeBand] = useState('');
   const [nodes, setNodes] = useState<KPNode[]>([]);
   const [pending, setPending] = useState<PendingPayload>({ kps: [], patterns: [] });
+  const [liveKps, setLiveKps] = useState<KPNode[]>([]);
+  const [livePatterns, setLivePatterns] = useState<PendingPayload['patterns']>([]);
   const [prompts, setPrompts] = useState<any[]>([]);
   const [selectedKpId, setSelectedKpId] = useState<string | null>(null);
   const [kpDetail, setKpDetail] = useState<KpDetail | null>(null);
+  const [mergeChoice, setMergeChoice] = useState<Record<string, string>>({});
 
   const reloadTree = useCallback(() => {
     const p = new URLSearchParams();
     if (subject) p.set('subject', subject);
     if (gradeBand) p.set('grade_band', gradeBand);
-    fetch(`/api/knowledge/tree${p.toString() ? '?' + p : ''}`)
+    fetch(apiUrl(`/api/knowledge/tree${p.toString() ? '?' + p : ''}`))
       .then((r) => r.json())
       .then((d) => setNodes(d.nodes || []));
   }, [subject, gradeBand]);
 
   const reloadPending = useCallback(() => {
-    fetch('/api/knowledge/pending').then((r) => r.json()).then(setPending);
+    Promise.all([
+      fetch(apiUrl('/api/knowledge/pending')).then((r) => r.json()),
+      fetch(apiUrl('/api/knowledge/tree?status=live')).then((r) => r.json()),
+      fetch(apiUrl('/api/knowledge/patterns?status=live')).then((r) => r.json()),
+    ]).then(([pendingBody, treeBody, patternBody]) => {
+      setPending(pendingBody);
+      setLiveKps(treeBody.nodes || []);
+      setLivePatterns(patternBody.patterns || []);
+    });
   }, []);
 
   useEffect(() => {
     if (tab === 'tree') reloadTree();
     if (tab === 'pending') reloadPending();
     if (tab === 'prompts') {
-      fetch('/api/admin/prompts').then((r) => r.json()).then((d) => setPrompts(d.prompts || []));
+      fetch(apiUrl('/api/admin/prompts')).then((r) => r.json()).then((d) => setPrompts(d.prompts || []));
     }
   }, [tab, reloadTree, reloadPending]);
 
   useEffect(() => {
     if (!selectedKpId) { setKpDetail(null); return; }
-    fetch(`/api/knowledge/kp/${selectedKpId}/detail`)
+    fetch(apiUrl(`/api/knowledge/kp/${selectedKpId}/detail`))
       .then((r) => r.json())
       .then((d) => setKpDetail(d.kp ? d as KpDetail : null))
       .catch(() => setKpDetail(null));
   }, [selectedKpId]);
 
   async function act(kind: 'kp' | 'pattern', id: string, action: 'promote' | 'reject') {
-    const res = await fetch(`/api/knowledge/${action}`, {
+    const res = await fetch(apiUrl(`/api/knowledge/${action}`), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ kind, id }),
     });
-    if (res.ok) reloadPending();
+    if (res.ok) {
+      setMergeChoice((prev) => {
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+      reloadPending();
+      reloadTree();
+    }
+  }
+
+  async function merge(kind: 'kp' | 'pattern', fromId: string) {
+    const intoId = mergeChoice[fromId];
+    if (!intoId) return;
+    const res = await fetch(apiUrl('/api/knowledge/merge'), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ kind, from_id: fromId, into_id: intoId }),
+    });
+    if (res.ok) {
+      setMergeChoice((prev) => {
+        const next = { ...prev };
+        delete next[fromId];
+        return next;
+      });
+      reloadPending();
+      reloadTree();
+    }
   }
 
   const grouped = useMemo(() => groupByParent(nodes), [nodes]);
 
   return (
-    <section>
+    <section className="page-section">
       <h1>知识库</h1>
       <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
         <TabButton active={tab === 'tree'} onClick={() => setTab('tree')}>知识点树</TabButton>
@@ -128,11 +168,8 @@ export default function KnowledgePage() {
               </select>
             </label>
           </div>
-          <div style={{
-            display: 'grid', gap: 16,
-            gridTemplateColumns: 'minmax(260px, 1fr) minmax(260px, 2fr)',
-          }}>
-            <div style={{ borderRight: '1px solid #eee', paddingRight: 12 }}>
+          <div className="kp-tree-grid">
+            <div className="kp-tree-pane">
               <TreeView
                 nodes={nodes} grouped={grouped}
                 selectedId={selectedKpId}
@@ -159,6 +196,30 @@ export default function KnowledgePage() {
                     <button onClick={() => act('kp', k.id, 'promote')}>提升为 live</button>
                     <button onClick={() => act('kp', k.id, 'reject')}>拒绝</button>
                   </div>
+                  <div style={{ marginTop: 6, display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                    <select
+                      value={mergeChoice[k.id] || ''}
+                      onChange={(e) => setMergeChoice({ ...mergeChoice, [k.id]: e.target.value })}
+                    >
+                      <option value="">合并到现有 live 知识点</option>
+                      {liveKps
+                        .filter((target) =>
+                          target.id !== k.id
+                          && target.subject === k.subject
+                          && target.grade_band === k.grade_band)
+                        .map((target) => (
+                          <option key={target.id} value={target.id}>
+                            {target.path_cached}
+                          </option>
+                        ))}
+                    </select>
+                    <button
+                      onClick={() => merge('kp', k.id)}
+                      disabled={!mergeChoice[k.id]}
+                    >
+                      合并
+                    </button>
+                  </div>
                 </li>
               ))}
             </ul>
@@ -174,6 +235,30 @@ export default function KnowledgePage() {
                   <div style={{ marginTop: 6, display: 'flex', gap: 6 }}>
                     <button onClick={() => act('pattern', p.id, 'promote')}>提升为 live</button>
                     <button onClick={() => act('pattern', p.id, 'reject')}>拒绝</button>
+                  </div>
+                  <div style={{ marginTop: 6, display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                    <select
+                      value={mergeChoice[p.id] || ''}
+                      onChange={(e) => setMergeChoice({ ...mergeChoice, [p.id]: e.target.value })}
+                    >
+                      <option value="">合并到现有 live 方法模式</option>
+                      {livePatterns
+                        .filter((target) =>
+                          target.id !== p.id
+                          && target.subject === p.subject
+                          && target.grade_band === p.grade_band)
+                        .map((target) => (
+                          <option key={target.id} value={target.id}>
+                            {target.name_cn}
+                          </option>
+                        ))}
+                    </select>
+                    <button
+                      onClick={() => merge('pattern', p.id)}
+                      disabled={!mergeChoice[p.id]}
+                    >
+                      合并
+                    </button>
                   </div>
                 </li>
               ))}

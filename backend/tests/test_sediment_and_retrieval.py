@@ -17,7 +17,7 @@ from sqlalchemy import select
 
 from app.config import settings
 from app.db import models, repo
-from app.schemas import AnswerPackage, ParsedQuestion
+from app.schemas import AnswerPackage
 from app.services.embedding import EmbeddingService
 from app.services.ingest_service import ingest_image
 from app.services.llm_client import FakeTransport, GeminiClient
@@ -25,7 +25,6 @@ from app.services.retrieval_service import SimilarQuery, similar_questions
 from app.services.sediment_service import NEAR_DUP_THRESHOLD, sediment
 from app.services.solver_service import generate_answer
 from app.services.vector_store import InMemoryVectorStore
-
 
 # ── Fake embedding transport ────────────────────────────────────────
 
@@ -42,7 +41,7 @@ class _CannedEmbedTransport(FakeTransport):
         self.vectors = vectors
         self._fallback_counter = 0
 
-    async def embed(self, *, model, texts):
+    async def embed(self, *, model, texts, task_type=None):
         out = []
         dim = settings.gemini.embed_dim
         for t in texts:
@@ -189,6 +188,25 @@ async def test_sediment_creates_pattern_and_kp_rows(session, tmp_image_dir):
     )).scalars().all()
     assert len(kp_links) == 2
 
+    profile = (await session.execute(
+        select(models.QuestionRetrievalProfile).where(
+            models.QuestionRetrievalProfile.question_id == qid
+        )
+    )).scalar_one_or_none()
+    assert profile is not None
+    retrieval_units = (await session.execute(
+        select(models.RetrievalUnitRow).where(models.RetrievalUnitRow.question_id == qid)
+    )).scalars().all()
+    assert len(retrieval_units) >= 5
+    unit_kinds = {row.unit_kind for row in retrieval_units}
+    assert {"question_focus", "answer_focus", "method", "keyword_profile"} <= unit_kinds
+
+    assert str(qid) in vs._rows["q_emb"]
+    assert str(qid) in vs._rows["question_full_emb"]
+    assert str(qid) in vs._rows["answer_full_emb"]
+    for row in retrieval_units:
+        assert str(row.id) in vs._rows["retrieval_unit_emb"]
+
 
 @pytest.mark.asyncio
 async def test_sediment_idempotent(session, tmp_image_dir):
@@ -222,6 +240,17 @@ async def test_sediment_idempotent(session, tmp_image_dir):
         )
     )).scalars().all()
     assert len(p_links) == 1
+
+    profiles = (await session.execute(
+        select(models.QuestionRetrievalProfile).where(
+            models.QuestionRetrievalProfile.question_id == qid
+        )
+    )).scalars().all()
+    assert len(profiles) == 1
+    retrieval_units = (await session.execute(
+        select(models.RetrievalUnitRow).where(models.RetrievalUnitRow.question_id == qid)
+    )).scalars().all()
+    assert retrieval_units
 
 
 @pytest.mark.asyncio
@@ -257,7 +286,7 @@ async def test_sediment_detects_near_duplicate(session, tmp_image_dir):
     assert res_b.near_dup_of is not None
     assert res_b.near_dup_of == qid_a
     # Cosine must have actually been above threshold for this scenario.
-    cos = sum(x * y for x, y in zip(vec_a, vec_b))
+    cos = sum(x * y for x, y in zip(vec_a, vec_b, strict=False))
     assert cos >= NEAR_DUP_THRESHOLD
 
 

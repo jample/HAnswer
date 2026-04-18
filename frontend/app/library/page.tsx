@@ -3,6 +3,9 @@
 import Link from 'next/link';
 import { useEffect, useMemo, useState } from 'react';
 
+import { RichText } from '../../components/MathText';
+import { apiUrl } from '../../lib/api';
+
 type QuestionRow = {
   question_id: string;
   subject: string;
@@ -21,6 +24,10 @@ type SimilarHit = {
   cosine: number;
   pattern_match: number;
   kp_overlap: number;
+  rrf_score?: number | null;
+  route_ranks?: Record<string, number> | null;
+  matched_unit_kinds?: string[] | null;
+  matched_unit_titles?: string[] | null;
   subject: string;
   grade_band: string;
   difficulty: number;
@@ -39,6 +46,7 @@ export default function LibraryPage() {
   const [textQ, setTextQ] = useState('');
   const [searchMode, setSearchMode] = useState<'list' | 'text'>('list');
   const [textResults, setTextResults] = useState<SimilarHit[]>([]);
+  const [strategy, setStrategy] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
   const qs = useMemo(() => {
@@ -55,7 +63,7 @@ export default function LibraryPage() {
   useEffect(() => {
     if (searchMode !== 'list') return;
     setLoading(true);
-    fetch(`/api/questions${qs ? '?' + qs : ''}`)
+    fetch(apiUrl(`/api/questions${qs ? '?' + qs : ''}`))
       .then((r) => r.json())
       .then((d) => setItems(d.items || []))
       .finally(() => setLoading(false));
@@ -67,7 +75,7 @@ export default function LibraryPage() {
     setLoading(true);
     setSearchMode('text');
     try {
-      const res = await fetch('/api/retrieve/similar', {
+      const res = await fetch(apiUrl('/api/retrieve/similar'), {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -82,6 +90,7 @@ export default function LibraryPage() {
       });
       const d = await res.json();
       setTextResults(d.hits || []);
+      setStrategy(d.strategy || null);
     } finally {
       setLoading(false);
     }
@@ -91,10 +100,11 @@ export default function LibraryPage() {
     setSearchMode('list');
     setTextQ('');
     setTextResults([]);
+    setStrategy(null);
   }
 
   return (
-    <section>
+    <section className="page-section">
       <h1>题库</h1>
 
       <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'center' }}>
@@ -123,7 +133,7 @@ export default function LibraryPage() {
       <form onSubmit={runTextSearch} style={{ marginTop: 12, display: 'flex', gap: 8 }}>
         <input
           type="text"
-          placeholder="文本 / 方法描述检索 (会调用向量库)"
+          placeholder="文本 / 方法 / 关键点 / 扩展思路检索"
           value={textQ}
           onChange={(e) => setTextQ(e.target.value)}
           style={{ flex: 1, padding: '6px 8px', border: '1px solid #ccc', borderRadius: 4 }}
@@ -143,8 +153,9 @@ export default function LibraryPage() {
               <Link href={`/q/${it.question_id}`} style={{ color: '#0366d6', textDecoration: 'none' }}>
                 <strong>#{it.question_id.slice(0, 8)}</strong>
                 {' · '}
-                {it.question_text.slice(0, 80) || '(无文本)'}
-                {it.question_text.length > 80 && '…'}
+                <div className="q-text-preview">
+                  <RichText text={it.question_text || '(无文本)'} />
+                </div>
               </Link>
               <div style={muted}>
                 {it.subject} · {it.grade_band} · 难度 {it.difficulty}
@@ -160,11 +171,19 @@ export default function LibraryPage() {
       )}
 
       {searchMode === 'text' && (
+        <div style={{ marginTop: 16 }}>
+          {strategy && (
+            <p style={muted}>
+              检索策略: <code>{strategy}</code>
+            </p>
+          )}
         <ol style={{ paddingLeft: 20, marginTop: 16 }}>
           {textResults.map((h) => (
             <li key={h.question_id} style={{ marginBottom: 8 }}>
               <Link href={`/q/${h.question_id}`} style={{ color: '#0366d6', textDecoration: 'none' }}>
-                {h.question_text.slice(0, 100) || '(无文本)'}
+                <div className="q-text-preview">
+                  <RichText text={h.question_text || '(无文本)'} />
+                </div>
               </Link>
               <div style={muted}>
                 得分 {h.score.toFixed(2)} (cos {h.cosine.toFixed(2)}
@@ -172,12 +191,33 @@ export default function LibraryPage() {
                 {h.kp_overlap > 0 ? ` · kp重合 ${h.kp_overlap.toFixed(2)}` : ''})
                 {h.pattern_name && <> · <code>{h.pattern_name}</code></>}
               </div>
+              {h.route_ranks && Object.keys(h.route_ranks).length > 0 && (
+                <div style={muted}>
+                  路由排名:
+                  {' '}
+                  {Object.entries(h.route_ranks)
+                    .map(([name, rank]) => `${name}#${rank}`)
+                    .join(' · ')}
+                  {typeof h.rrf_score === 'number' && ` · RRF ${h.rrf_score.toFixed(3)}`}
+                </div>
+              )}
+              {h.matched_unit_kinds && h.matched_unit_kinds.length > 0 && (
+                <div style={muted}>
+                  命中语义单元:
+                  {' '}
+                  {h.matched_unit_kinds.join(' · ')}
+                  {h.matched_unit_titles && h.matched_unit_titles.length > 0
+                    ? ` · ${h.matched_unit_titles.join(' / ')}`
+                    : ''}
+                </div>
+              )}
             </li>
           ))}
           {textResults.length === 0 && !loading && (
             <li style={muted}>无匹配结果。</li>
           )}
         </ol>
+        </div>
       )}
     </section>
   );

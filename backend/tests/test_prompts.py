@@ -19,18 +19,18 @@ import json
 import pytest
 
 from app.prompts import PromptRegistry
+from app.prompts.solver_prompt import _load_fewshot_examples
 from app.schemas import ParsedQuestion
 from app.services.llm_client import FakeTransport, GeminiClient, LLMError
 
-
 # ---- registry-wide invariants -----------------------------------------
 
-def test_registry_has_three_core_prompts():
+def test_registry_has_core_prompts():
     names = PromptRegistry.names()
-    assert {"parser", "solver", "vizcoder"}.issubset(set(names))
+    assert {"dialog", "parser", "solver", "vizcoder"}.issubset(set(names))
 
 
-@pytest.mark.parametrize("name", ["parser", "solver", "vizcoder"])
+@pytest.mark.parametrize("name", ["dialog", "parser", "solver", "vizcoder"])
 def test_prompt_has_design_decisions(name: str):
     t = PromptRegistry.get(name)
     assert len(t.design_decisions) >= 3, "must document ≥3 design decisions"
@@ -38,7 +38,7 @@ def test_prompt_has_design_decisions(name: str):
         assert d.title and d.rationale, "each decision needs title + rationale"
 
 
-@pytest.mark.parametrize("name", ["parser", "solver", "vizcoder"])
+@pytest.mark.parametrize("name", ["dialog", "parser", "solver", "vizcoder"])
 def test_explain_is_stable(name: str):
     t = PromptRegistry.get(name)
     text = t.explain()
@@ -52,6 +52,21 @@ def test_explain_is_stable(name: str):
 # ---- preview / build --------------------------------------------------
 
 SAMPLE_KWARGS: dict[str, dict] = {
+    "dialog": {
+        "session_title": "二次函数追问",
+        "question_context": {
+            "question_id": "q-1",
+            "parsed_question": {"question_text": "求抛物线顶点", "given": [], "find": []},
+        },
+        "summary": "用户已经理解配方法, 但不确定顶点坐标怎么读。",
+        "key_facts": ["题目围绕二次函数顶点式展开"],
+        "open_questions": ["顶点坐标与对称轴如何快速读取"],
+        "recent_messages": [
+            {"role": "user", "content": "为什么要配方?"},
+            {"role": "assistant", "content": "因为这样能把式子转成顶点式。"},
+        ],
+        "user_message": "那顶点坐标怎么从式子里直接看出来?",
+    },
     "parser": {"raw_ocr": "已知 a=3, b=4, 求斜边长。"},
     "solver": {
         "parsed_question": {
@@ -77,7 +92,7 @@ SAMPLE_KWARGS: dict[str, dict] = {
 }
 
 
-@pytest.mark.parametrize("name", ["parser", "solver", "vizcoder"])
+@pytest.mark.parametrize("name", ["dialog", "parser", "solver", "vizcoder"])
 def test_preview_renders(name: str):
     t = PromptRegistry.get(name)
     out = t.preview(**SAMPLE_KWARGS[name])
@@ -86,7 +101,7 @@ def test_preview_renders(name: str):
     assert "OUTPUT SCHEMA" in out
 
 
-@pytest.mark.parametrize("name", ["parser", "solver", "vizcoder"])
+@pytest.mark.parametrize("name", ["dialog", "parser", "solver", "vizcoder"])
 def test_build_has_system_and_user(name: str):
     t = PromptRegistry.get(name)
     msgs = t.build(**SAMPLE_KWARGS[name])
@@ -95,7 +110,32 @@ def test_build_has_system_and_user(name: str):
     assert roles[-1] == "user"
 
 
-@pytest.mark.parametrize("name", ["parser", "solver", "vizcoder"])
+def test_solver_loads_curated_fewshot_examples():
+    examples = _load_fewshot_examples(subject="math", grade_band="senior")
+    assert examples, "expected curated few-shot examples on disk"
+    assert any(ex.get("topic_prefix") == ["代数", "一元二次方程"] for ex in examples)
+
+
+def test_solver_selects_topic_matched_fewshot_examples():
+    t = PromptRegistry.get("solver")
+    msgs = t.fewshot_examples(parsed_question={
+        "subject": "math",
+        "grade_band": "senior",
+        "topic_path": ["代数", "一元二次方程", "因式分解"],
+        "question_text": "解 $x^2-5x+6=0$",
+        "given": [],
+        "find": [],
+        "diagram_description": "",
+        "difficulty": 2,
+        "tags": [],
+        "confidence": 0.9,
+    })
+    assert len(msgs) >= 2
+    assert msgs[0]["role"] == "user"
+    assert "因式分解法" in msgs[1]["content"]
+
+
+@pytest.mark.parametrize("name", ["dialog", "parser", "solver", "vizcoder"])
 def test_trace_tag(name: str):
     t = PromptRegistry.get(name)
     tag = t.trace_tag()
@@ -144,6 +184,26 @@ def test_call_structured_happy_path():
     assert isinstance(result, ParsedQuestion)
     assert result.find == ["c"]
     assert len(transport.calls) == 1  # no repair needed
+
+
+def test_call_structured_happy_path_streaming():
+    transport = FakeTransport(json_by_model={"gemini-2.0-flash": json.dumps(_VALID_PARSED)})
+    client = GeminiClient(transport)
+    parser = PromptRegistry.get("parser")
+    result = asyncio.run(
+        client.call_structured(
+            template=parser,
+            model="gemini-2.0-flash",
+            model_cls=ParsedQuestion,
+            template_kwargs={"raw_ocr": "已知 a=3, b=4, 求斜边长。"},
+            stream=True,
+            timeout_s=91,
+        )
+    )
+    assert isinstance(result, ParsedQuestion)
+    assert result.find == ["c"]
+    assert len(transport.calls) == 1
+    assert transport.calls[0]["stream"] is True
 
 
 class _RepairTransport(FakeTransport):

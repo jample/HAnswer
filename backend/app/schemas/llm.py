@@ -96,6 +96,26 @@ class AnswerPackage(BaseModel):
     self_check: list[str]
 
 
+# ── Multi-turn dialog memory ─────────────────────────────────────────
+
+
+class ConversationMemory(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str
+    key_facts: list[str] = Field(default_factory=list)
+    open_questions: list[str] = Field(default_factory=list)
+
+
+class ConversationTurnResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title_suggested: str = ""
+    assistant_reply: str
+    follow_up_suggestions: list[str] = Field(default_factory=list)
+    memory: ConversationMemory
+
+
 # ── Visualization ───────────────────────────────────────────────────
 
 
@@ -160,3 +180,47 @@ class VariantList(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     variants: list[VariantQuestion]
+
+
+# ── Pedagogical retrieval index (deterministic stage-1 implementation) ──
+
+
+class RetrievalQueryTexts(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    question_full_text: str
+    answer_full_text: str
+    method_text: str
+    step_texts: list[str] = Field(default_factory=list)
+    extension_text: str = ""
+
+
+class PedagogicalIndexProfile(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    subject: Subject
+    grade_band: GradeBand
+    textbook_stage: str = ""
+    topic_path: list[str] = Field(default_factory=list)
+    novelty_flags: list[str] = Field(default_factory=list)
+    object_entities: list[str] = Field(default_factory=list)
+    target_types: list[str] = Field(default_factory=list)
+    condition_signals: list[str] = Field(default_factory=list)
+    question_focus: list[str] = Field(default_factory=list)
+    answer_focus: list[str] = Field(default_factory=list)
+    method_labels: list[str] = Field(default_factory=list)
+    extension_ideas: list[str] = Field(default_factory=list)
+    pitfalls: list[str] = Field(default_factory=list)
+    lexical_aliases: list[str] = Field(default_factory=list)
+    query_texts: RetrievalQueryTexts
+
+
+class RetrievalUnit(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    unit_kind: str
+    title: str
+    text: str
+    keywords: list[str] = Field(default_factory=list)
+    weight: float = Field(default=1.0, ge=0.0, le=1.0)
+    source_section: str = ""

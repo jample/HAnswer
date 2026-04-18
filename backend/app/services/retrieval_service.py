@@ -36,6 +36,7 @@ from app.db.models import (
     Question,
     QuestionKPLink,
     QuestionPatternLink,
+    RetrievalUnitRow,
 )
 from app.services.embedding import DenseEmbedder
 from app.services.rrf import fuse as rrf_fuse
@@ -60,6 +61,8 @@ class Hit:
     shared_kp_names: list[str] | None = None
     rrf_score: float | None = None                  # multi-route only
     route_ranks: dict[str, int] | None = None       # multi-route only
+    matched_unit_kinds: list[str] | None = None     # pedagogical-facet routes
+    matched_unit_titles: list[str] | None = None
 
 
 @dataclass
@@ -90,6 +93,72 @@ async def _question_context(
         select(QuestionKPLink.kp_id).where(QuestionKPLink.question_id == question_id)
     )).scalars().all()
     return set(pat), set(kps)
+
+
+def _filter_question_ids(raw_ids: list[str], excluded: set[uuid.UUID]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for ref_id in raw_ids:
+        try:
+            qid = uuid.UUID(ref_id)
+        except ValueError:
+            continue
+        if qid in excluded or ref_id in seen:
+            continue
+        seen.add(ref_id)
+        out.append(ref_id)
+    return out
+
+
+def _merge_unit_match_maps(
+    target: dict[str, dict[str, set[str]]],
+    source: dict[str, dict[str, set[str]]],
+) -> None:
+    for qid, meta in source.items():
+        bucket = target.setdefault(qid, {"kinds": set(), "titles": set()})
+        bucket["kinds"].update(meta["kinds"])
+        bucket["titles"].update(meta["titles"])
+
+
+async def _collapse_retrieval_unit_hits(
+    session: AsyncSession,
+    *,
+    unit_ids: list[str],
+    excluded: set[uuid.UUID],
+) -> tuple[list[str], dict[str, dict[str, set[str]]]]:
+    if not unit_ids:
+        return [], {}
+    parsed_ids: list[uuid.UUID] = []
+    for ref_id in unit_ids:
+        try:
+            parsed_ids.append(uuid.UUID(ref_id))
+        except ValueError:
+            continue
+    if not parsed_ids:
+        return [], {}
+    rows = (await session.execute(
+        select(RetrievalUnitRow).where(RetrievalUnitRow.id.in_(parsed_ids))
+    )).scalars().all()
+    by_id = {str(row.id): row for row in rows}
+    ordered_qids: list[str] = []
+    seen_qids: set[str] = set()
+    match_map: dict[str, dict[str, set[str]]] = {}
+    for ref_id in unit_ids:
+        row = by_id.get(ref_id)
+        if row is None:
+            continue
+        qid = str(row.question_id)
+        if row.question_id in excluded:
+            continue
+        bucket = match_map.setdefault(qid, {"kinds": set(), "titles": set()})
+        bucket["kinds"].add(row.unit_kind)
+        if row.title:
+            bucket["titles"].add(row.title)
+        if qid in seen_qids:
+            continue
+        seen_qids.add(qid)
+        ordered_qids.append(qid)
+    return ordered_qids, match_map
 
 
 async def similar_questions(
@@ -337,15 +406,50 @@ async def similar_questions_multi_route(
         return []
 
     # ── Run three routes in parallel ─────────────────────────────
+    matched_units: dict[str, dict[str, set[str]]] = {}
+
     async def _dense() -> list[str]:
         if not text_for_embed:
             return []
         vec = await embedding.embed_one(text_for_embed)
-        hits = await vector_store.search(
-            "q_emb", vector=vec, k=wide_k,
-            subject=subject, grade_band=grade_band,
+        legacy_hits, question_full_hits, answer_full_hits, unit_hits = await asyncio.gather(
+            vector_store.search(
+                "q_emb", vector=vec, k=wide_k,
+                subject=subject, grade_band=grade_band,
+            ),
+            vector_store.search(
+                "question_full_emb", vector=vec, k=wide_k,
+                subject=subject, grade_band=grade_band,
+            ),
+            vector_store.search(
+                "answer_full_emb", vector=vec, k=wide_k,
+                subject=subject, grade_band=grade_band,
+            ),
+            vector_store.search(
+                "retrieval_unit_emb", vector=vec, k=wide_k,
+                subject=subject, grade_band=grade_band,
+            ),
         )
-        return [h.ref_id for h in hits if uuid.UUID(h.ref_id) not in excluded]
+        unit_qids, unit_match_map = await _collapse_retrieval_unit_hits(
+            session,
+            unit_ids=[h.ref_id for h in unit_hits],
+            excluded=excluded,
+        )
+        _merge_unit_match_maps(matched_units, unit_match_map)
+        fused = rrf_fuse(
+            routes={
+                "legacy_q": _filter_question_ids([h.ref_id for h in legacy_hits], excluded),
+                "question_full": _filter_question_ids(
+                    [h.ref_id for h in question_full_hits], excluded,
+                ),
+                "answer_full": _filter_question_ids(
+                    [h.ref_id for h in answer_full_hits], excluded,
+                ),
+                "retrieval_unit": unit_qids,
+            },
+            k=rc.rrf_k,
+        )
+        return [h.ref_id for h in fused]
 
     async def _sparse() -> list[str]:
         if not text_for_embed or not vector_store.supports_sparse:
@@ -353,11 +457,46 @@ async def similar_questions_multi_route(
         sv = await sparse.encode_one(text_for_embed)
         if not sv:
             return []
-        hits = await vector_store.search_sparse(
-            "q_emb", sparse=sv, k=wide_k,
-            subject=subject, grade_band=grade_band,
+        legacy_hits, question_full_hits, answer_full_hits, unit_hits = await asyncio.gather(
+            vector_store.search_sparse(
+                "q_emb", sparse=sv, k=wide_k,
+                subject=subject, grade_band=grade_band,
+            ),
+            vector_store.search_sparse(
+                "question_full_emb", sparse=sv, k=wide_k,
+                subject=subject, grade_band=grade_band,
+            ),
+            vector_store.search_sparse(
+                "answer_full_emb", sparse=sv, k=wide_k,
+                subject=subject, grade_band=grade_band,
+            ),
+            vector_store.search_sparse(
+                "retrieval_unit_emb", sparse=sv, k=wide_k,
+                subject=subject, grade_band=grade_band,
+            ),
         )
-        return [h.ref_id for h in hits if uuid.UUID(h.ref_id) not in excluded]
+        unit_qids, unit_match_map = await _collapse_retrieval_unit_hits(
+            session,
+            unit_ids=[h.ref_id for h in unit_hits],
+            excluded=excluded,
+        )
+        _merge_unit_match_maps(matched_units, unit_match_map)
+        fused = rrf_fuse(
+            routes={
+                "legacy_q_sparse": _filter_question_ids(
+                    [h.ref_id for h in legacy_hits], excluded,
+                ),
+                "question_full_sparse": _filter_question_ids(
+                    [h.ref_id for h in question_full_hits], excluded,
+                ),
+                "answer_full_sparse": _filter_question_ids(
+                    [h.ref_id for h in answer_full_hits], excluded,
+                ),
+                "retrieval_unit_sparse": unit_qids,
+            },
+            k=rc.rrf_k,
+        )
+        return [h.ref_id for h in fused]
 
     async def _structural() -> list[str]:
         return await _structural_route(
@@ -430,6 +569,8 @@ async def similar_questions_multi_route(
             shared_kp_names=shared_kp_names or None,
             rrf_score=fh.score,
             route_ranks=dict(fh.ranks),
+            matched_unit_kinds=sorted(matched_units.get(str(qid), {}).get("kinds", set())) or None,
+            matched_unit_titles=sorted(matched_units.get(str(qid), {}).get("titles", set())) or None,
         ))
         if len(hydrated) >= query.k:
             break

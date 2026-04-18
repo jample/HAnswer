@@ -21,6 +21,7 @@ Usage:
 """
 
 from app.prompts.base import DesignDecision, PromptTemplate, PromptVersion
+from app.prompts.dialog_prompt import DialogPrompt
 from app.prompts.parser_prompt import ParserPrompt
 from app.prompts.registry import PromptRegistry
 from app.prompts.solver_prompt import SolverPrompt
@@ -29,6 +30,7 @@ from app.prompts.vizcoder_prompt import VizCoderPrompt
 
 __all__ = [
     "DesignDecision",
+    "DialogPrompt",
     "ParserPrompt",
     "PromptRegistry",
     "PromptTemplate",

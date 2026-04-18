@@ -20,9 +20,12 @@ class GeminiSettings(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
     api_key: str = ""
-    model_parser: str = "gemini-3.1-pro"
-    model_solver: str = "gemini-3.1-pro"
-    model_vizcoder: str = "gemini-3.1-pro"
+    model_parser: str = "gemini-3.1-pro-preview"
+    model_solver: str = "gemini-3.1-pro-preview"
+    model_vizcoder: str = "gemini-3.1-pro-preview"
+    # Supported in this repo:
+    #   - text-embedding-004 (legacy google-generativeai path)
+    #   - gemini-embedding-001 (google-genai path)
     model_embed: str = "text-embedding-004"
     embed_dim: int = 768
 
@@ -40,6 +43,10 @@ class MilvusSettings(BaseModel):
     # collections already exist; logs a warning and continues when
     # Milvus itself is unreachable.
     auto_bootstrap: bool = True
+    # Dense collections must be recreated if the active embedder's
+    # vector dim changes (for example Gemini 768 -> bge-m3 1024).
+    # Keep this off by default because it drops Milvus data.
+    recreate_dense_on_dim_mismatch: bool = False
 
 
 class ServerSettings(BaseModel):
@@ -56,15 +63,23 @@ class LLMSettings(BaseModel):
     max_retries: int = 3
     max_repair_attempts: int = 2
     request_timeout_s: int = 60
+    parser_timeout_s: int = 60
+    solver_timeout_s: int = 180
+    vizcoder_timeout_s: int = 120
+    dialog_timeout_s: int = 90
+    embed_timeout_s: int = 60
+    stream_solver_json: bool = True
+    stream_vizcoder_json: bool = True
 
 
 class RetrievalSettings(BaseModel):
     """M5 hybrid retrieval knobs (§3.4).
 
     `embedder`  — dense-vector provider. "gemini" (default) uses the
-                  Gemini embedding model already configured. "bge-m3"
-                  loads a local BAAI/bge-m3 model via FlagEmbedding
-                  (optional dependency, lazy-imported).
+                  configured Gemini embedding model (`text-embedding-004`
+                  or `gemini-embedding-001`). "bge-m3" loads a local
+                  BAAI/bge-m3 model via FlagEmbedding (optional
+                  dependency, lazy-imported).
     `multi_route` — when True, similar-question retrieval runs three
                   routes in parallel (dense, sparse, structural) and
                   fuses their ranks with Reciprocal-Rank Fusion.
@@ -83,7 +98,21 @@ class RetrievalSettings(BaseModel):
     route_weights_structural: float = 1.0
     bge_m3_model: str = "BAAI/bge-m3"      # HF repo id
     bge_m3_device: str = "cpu"             # "cpu" | "cuda" | "mps"
+    bge_m3_dense_dim: int = 1024
     wide_k_multiplier: int = 3             # per-route top-K = k * multiplier
+
+
+class DialogSettings(BaseModel):
+    """Multi-turn dialog + memory controls."""
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    model_chat: str = "gemini-3.1-pro-preview"
+    recent_messages: int = 10
+    max_question_context_chars: int = 12000
+    max_summary_chars: int = 3000
+    max_key_facts: int = 12
+    max_open_questions: int = 8
 
 
 class Settings(BaseModel):
@@ -94,6 +123,13 @@ class Settings(BaseModel):
     storage: StorageSettings = Field(default_factory=StorageSettings)
     llm: LLMSettings = Field(default_factory=LLMSettings)
     retrieval: RetrievalSettings = Field(default_factory=RetrievalSettings)
+    dialog: DialogSettings = Field(default_factory=DialogSettings)
+
+    @property
+    def retrieval_dense_dim(self) -> int:
+        if self.retrieval.embedder == "bge-m3":
+            return self.retrieval.bge_m3_dense_dim
+        return self.gemini.embed_dim
 
 
 def _candidate_paths() -> list[Path]:

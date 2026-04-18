@@ -17,7 +17,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
-from app.routers import admin, answer, ingest, knowledge, practice, retrieve
+from app.routers import admin, answer, dialog, ingest, knowledge, practice, retrieve
 from app.services.milvus_setup import ensure_collections_async
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s - %(message)s")
@@ -57,6 +57,7 @@ def create_app() -> FastAPI:
     app.include_router(ingest.router)
     app.include_router(answer.router)
     app.include_router(answer.questions_router)
+    app.include_router(dialog.router)
     app.include_router(retrieve.router)
     app.include_router(retrieve.questions_list_router)
     app.include_router(practice.router)

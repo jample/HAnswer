@@ -14,6 +14,8 @@ OPTIMIZATION
 from __future__ import annotations
 
 import json
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 from app.prompts.base import DesignDecision, PromptTemplate, PromptVersion
@@ -187,7 +189,81 @@ class SolverPrompt(PromptTemplate):
         Lookup path: backend/app/prompts/fewshot/<subject>/<grade_band>/
         Selects up to 3 examples whose `topic_prefix` matches the
         parsed_question.topic_path prefix (coarsest first).
-
-        TODO(M2+): implement file loader. For now returns [].
         """
-        return []
+        parsed_question: dict = kwargs.get("parsed_question") or {}
+        subject = parsed_question.get("subject")
+        grade_band = parsed_question.get("grade_band")
+        if not subject or not grade_band:
+            return []
+
+        examples = _load_fewshot_examples(subject=subject, grade_band=grade_band)
+        if not examples:
+            return []
+
+        topic_path = [
+            str(seg).strip()
+            for seg in parsed_question.get("topic_path", [])
+            if str(seg).strip()
+        ]
+        ranked = sorted(
+            (
+                (_prefix_match_len(topic_path, ex.get("topic_prefix", [])), idx, ex)
+                for idx, ex in enumerate(examples)
+            ),
+            key=lambda item: (item[0], -item[1]),
+            reverse=True,
+        )
+
+        selected = [ex for score, _, ex in ranked if score > 0][:3]
+        if not selected:
+            selected = [ranked[0][2]]
+
+        messages: list[dict] = []
+        for ex in selected:
+            ex_parsed = ex.get("parsed_question")
+            ex_answer = ex.get("answer_package")
+            if not isinstance(ex_parsed, dict) or not isinstance(ex_answer, dict):
+                continue
+            messages.append({
+                "role": "user",
+                "content": self.user_message(
+                    parsed_question=ex_parsed,
+                    existing_patterns=[],
+                    existing_kps=[],
+                ),
+            })
+            messages.append({
+                "role": "assistant",
+                "content": json.dumps(ex_answer, ensure_ascii=False, indent=2),
+            })
+        return messages
+
+
+_FEWSHOT_ROOT = Path(__file__).resolve().parent / "fewshot"
+
+
+def _prefix_match_len(topic_path: list[str], topic_prefix: list[str]) -> int:
+    topic_prefix = [str(seg).strip() for seg in topic_prefix if str(seg).strip()]
+    if not topic_prefix:
+        return 0
+    if len(topic_prefix) > len(topic_path):
+        return 0
+    for left, right in zip(topic_path, topic_prefix):
+        if left != right:
+            return 0
+    return len(topic_prefix)
+
+
+@lru_cache(maxsize=16)
+def _load_fewshot_examples(*, subject: str, grade_band: str) -> tuple[dict, ...]:
+    folder = _FEWSHOT_ROOT / subject / grade_band
+    if not folder.is_dir():
+        return ()
+
+    loaded: list[dict] = []
+    for path in sorted(folder.glob("*.json")):
+        with path.open("r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+        payload["_source_file"] = path.name
+        loaded.append(payload)
+    return tuple(loaded)

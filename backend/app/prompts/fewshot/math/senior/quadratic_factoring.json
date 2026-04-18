@@ -1,0 +1,97 @@
+{
+  "topic_prefix": ["代数", "一元二次方程"],
+  "parsed_question": {
+    "subject": "math",
+    "grade_band": "senior",
+    "topic_path": ["代数", "一元二次方程"],
+    "question_text": "解方程 $x^2-5x+6=0$。",
+    "given": ["方程 $x^2-5x+6=0$"],
+    "find": ["$x$ 的解"],
+    "diagram_description": "",
+    "difficulty": 2,
+    "tags": ["二次方程", "因式分解"],
+    "confidence": 0.98
+  },
+  "answer_package": {
+    "question_understanding": {
+      "restated_question": "求一元二次方程 $x^2-5x+6=0$ 的实数解。",
+      "givens": ["方程的二次项系数为 $1$", "常数项为 $6$"],
+      "unknowns": ["方程的两个根"],
+      "implicit_conditions": ["若能分解为两个一次因式, 可用积为零求根"]
+    },
+    "key_points_of_question": [
+      "先判断能否整式因式分解",
+      "常数项和一次项系数共同决定两个因子"
+    ],
+    "solution_steps": [
+      {
+        "step_index": 1,
+        "statement": "将二次式分解因式",
+        "rationale": "因为 $-2$ 与 $-3$ 的和为 $-5$, 积为 $6$, 所以 $x^2-5x+6=(x-2)(x-3)$。",
+        "formula": "$x^2-5x+6=(x-2)(x-3)$",
+        "why_this_step": "能直接分解时, 这是比公式法更快也更能看出结构的做法。",
+        "viz_ref": ""
+      },
+      {
+        "step_index": 2,
+        "statement": "利用积为零求根",
+        "rationale": "若 $(x-2)(x-3)=0$, 则至少有一个因子为零。",
+        "formula": "$x=2$ 或 $x=3$",
+        "why_this_step": "因式分解后的标准收尾就是分别令每个因子为零。",
+        "viz_ref": ""
+      }
+    ],
+    "key_points_of_answer": [
+      "因式分解法适用于结构明显的一元二次方程",
+      "分解后一定要回到'积为零'这条基本原理"
+    ],
+    "method_pattern": {
+      "pattern_id_suggested": "new:代数>一元二次方程>因式分解法",
+      "name_cn": "因式分解法",
+      "when_to_use": "当二次三项式能较自然地写成两个一次因式乘积时使用。",
+      "general_procedure": [
+        "观察一次项与常数项, 判断是否容易拆项",
+        "把原方程改写成两个一次因式相乘等于零",
+        "分别令每个因子为零并检验结果"
+      ],
+      "pitfalls": [
+        "只分解不求根",
+        "忽略正负号导致拆项错误"
+      ]
+    },
+    "similar_questions": [
+      {
+        "statement": "解方程 $x^2-7x+12=0$。",
+        "answer_outline": "分解为 $(x-3)(x-4)=0$, 得 $x=3,4$。",
+        "same_pattern": true,
+        "difficulty_delta": -1
+      },
+      {
+        "statement": "解方程 $x^2+x-6=0$。",
+        "answer_outline": "分解为 $(x+3)(x-2)=0$, 得 $x=-3,2$。",
+        "same_pattern": true,
+        "difficulty_delta": 0
+      },
+      {
+        "statement": "解方程 $2x^2-5x+2=0$。",
+        "answer_outline": "分解为 $(2x-1)(x-2)=0$, 得 $x=\\frac12,2$。",
+        "same_pattern": true,
+        "difficulty_delta": 1
+      }
+    ],
+    "knowledge_points": [
+      {
+        "node_ref": "new:代数>一元二次方程",
+        "weight": 0.9
+      },
+      {
+        "node_ref": "new:代数>因式分解",
+        "weight": 0.7
+      }
+    ],
+    "self_check": [
+      "把两个根分别代回原方程验证",
+      "检查分解时一次项系数与常数项是否对应正确"
+    ]
+  }
+}

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import AsyncIterator
+from collections.abc import AsyncIterator
 
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -80,6 +80,8 @@ async def generate_visualizations(
             model=settings.gemini.model_vizcoder,
             model_cls=VisualizationList,
             template_kwargs=kwargs,
+            timeout_s=settings.llm.vizcoder_timeout_s,
+            stream=settings.llm.stream_vizcoder_json,
         )
     except LLMError as e:
         log.exception("vizcoder LLM failed")

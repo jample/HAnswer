@@ -12,8 +12,6 @@ Defers real network calls behind a thin adapter so tests can mock it.
 
 from __future__ import annotations
 
-import asyncio
-import json
 import logging
 import time
 from dataclasses import dataclass
@@ -80,7 +78,24 @@ class GeminiTransport(Protocol):
         """Return (raw_text, prompt_tokens, completion_tokens)."""
         ...
 
-    async def embed(self, *, model: str, texts: list[str]) -> list[list[float]]: ...
+    async def generate_json_stream(
+        self,
+        *,
+        model: str,
+        messages: list[dict],
+        response_schema: dict,
+        timeout_s: int,
+    ) -> tuple[str, int, int]:
+        """Return streamed partial JSON concatenated into one final JSON string."""
+        ...
+
+    async def embed(
+        self,
+        *,
+        model: str,
+        texts: list[str],
+        task_type: str | None = None,
+    ) -> list[list[float]]: ...
 
 
 class FakeTransport:
@@ -97,7 +112,14 @@ class FakeTransport:
         raw = self.json_by_model.get(model, "{}")
         return raw, 0, 0
 
-    async def embed(self, *, model, texts) -> list[list[float]]:
+    async def generate_json_stream(
+        self, *, model, messages, response_schema, timeout_s,
+    ) -> tuple[str, int, int]:
+        self.calls.append({"model": model, "messages": messages, "stream": True})
+        raw = self.json_by_model.get(model, "{}")
+        return raw, 0, 0
+
+    async def embed(self, *, model, texts, task_type=None) -> list[list[float]]:
         return [[0.0] * settings.gemini.embed_dim for _ in texts]
 
 
@@ -140,16 +162,25 @@ class GeminiClient:
         model: str,
         messages: list[dict],
         response_schema: dict,
+        timeout_s: int,
+        stream: bool,
     ) -> tuple[str, int, int]:
         try:
+            if stream:
+                return await self.transport.generate_json_stream(
+                    model=model,
+                    messages=messages,
+                    response_schema=response_schema,
+                    timeout_s=timeout_s,
+                )
             return await self.transport.generate_json(
                 model=model,
                 messages=messages,
                 response_schema=response_schema,
-                timeout_s=settings.llm.request_timeout_s,
+                timeout_s=timeout_s,
             )
-        except asyncio.TimeoutError as e:
-            raise TransientLLMError(f"timeout: {e}") from e
+        except TimeoutError as e:
+            raise TransientLLMError(f"timeout after {timeout_s}s: {e}") from e
 
     async def call_structured(
         self,
@@ -159,6 +190,8 @@ class GeminiClient:
         model_cls: type[T],
         template_kwargs: dict[str, Any] | None = None,
         messages_override: list[dict] | None = None,
+        timeout_s: int | None = None,
+        stream: bool = False,
     ) -> T:
         """Call the LLM and validate output against a pydantic model.
 
@@ -168,6 +201,7 @@ class GeminiClient:
         tk = template_kwargs or {}
         messages = messages_override or template.build(**tk)
         trace = template.trace_tag()
+        resolved_timeout_s = timeout_s or settings.llm.request_timeout_s
 
         attempt = 0
         last_err: str | None = None
@@ -180,6 +214,8 @@ class GeminiClient:
                 model=model,
                 messages=messages,
                 response_schema=template.schema,
+                timeout_s=resolved_timeout_s,
+                stream=stream,
             )
             try:
                 parsed = model_cls.model_validate_json(raw_json)
@@ -238,6 +274,12 @@ class GeminiClient:
             f"{settings.llm.max_repair_attempts} repair attempts: {last_err}"
         )
 
-    async def embed(self, texts: list[str], *, model: str | None = None) -> list[list[float]]:
+    async def embed(
+        self,
+        texts: list[str],
+        *,
+        model: str | None = None,
+        task_type: str | None = None,
+    ) -> list[list[float]]:
         m = model or settings.gemini.model_embed
-        return await self.transport.embed(model=m, texts=texts)
+        return await self.transport.embed(model=m, texts=texts, task_type=task_type)

@@ -22,11 +22,12 @@ from __future__ import annotations
 import math
 import re
 import threading
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Iterable, Protocol
+from typing import Protocol
 
 from app.config import settings
-
+from app.services.bge_m3_runtime import get_bge_m3_model
 
 # ── Tokenizer ────────────────────────────────────────────────────────
 
@@ -168,19 +169,7 @@ class BGEM3SparseEncoder:
 
     def _get_model(self):  # type: ignore[no-untyped-def]
         if self._model is None:
-            try:
-                from FlagEmbedding import BGEM3FlagModel  # lazy
-            except ImportError as e:  # pragma: no cover - optional dep
-                raise RuntimeError(
-                    "BGE-M3 is not installed. Run "
-                    "`pip install -e .[retrieval]` or switch "
-                    "retrieval.sparse_encoder to 'bm25'."
-                ) from e
-            self._model = BGEM3FlagModel(
-                settings.retrieval.bge_m3_model,
-                use_fp16=False,
-                device=settings.retrieval.bge_m3_device,
-            )
+            self._model = get_bge_m3_model()
         return self._model
 
     async def encode(self, texts: list[str]) -> list[dict[int, float]]:

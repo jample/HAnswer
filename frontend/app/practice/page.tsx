@@ -3,6 +3,9 @@
 import Link from 'next/link';
 import { useEffect, useMemo, useState } from 'react';
 
+import { RichText } from '../../components/MathText';
+import { apiUrl } from '../../lib/api';
+
 type ExamItem = {
   id: string;
   position: number;
@@ -83,7 +86,7 @@ export default function PracticePage() {
     setExam(null);
     setRevealed({});
     try {
-      const res = await fetch('/api/practice/exam', {
+      const res = await fetch(apiUrl('/api/practice/exam'), {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -111,7 +114,7 @@ export default function PracticePage() {
   }
 
   return (
-    <section>
+    <section className="page-section">
       <h1>练习</h1>
       <p style={muted}>
         把题目加入练习篮后生成同类练习卷; 题库不足时 LLM 会合成同模式变体。
@@ -202,7 +205,9 @@ export default function PracticePage() {
               return (
                 <li key={it.id} style={{ marginBottom: 16 }}>
                   <div>
-                    {it.statement || '(题面缺失)'}
+                    {it.statement
+                      ? <RichText text={it.statement} />
+                      : '(题面缺失)'}
                     {it.synthesized && (
                       <span style={{ ...muted, marginLeft: 8 }}>· LLM 合成变体</span>
                     )}
@@ -237,12 +242,12 @@ export default function PracticePage() {
                     <div style={{
                       marginTop: 4, padding: 8,
                       background: '#f8f8f8', borderLeft: '3px solid #0366d6',
-                      whiteSpace: 'pre-wrap', fontSize: 14,
+                      fontSize: 14,
                     }}>
                       <strong>大纲</strong>
-                      <div>{it.answer_outline || '(无)'}</div>
+                      <div>{it.answer_outline ? <RichText text={it.answer_outline} /> : '(无)'}</div>
                       <strong style={{ display: 'block', marginTop: 8 }}>评分提示</strong>
-                      <div>{it.rubric || '(无)'}</div>
+                      <div>{it.rubric ? <RichText text={it.rubric} /> : '(无)'}</div>
                     </div>
                   )}
                 </li>

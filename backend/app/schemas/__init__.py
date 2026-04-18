@@ -1,10 +1,15 @@
 """Pydantic schemas for LLM I/O and API contracts."""
+
 from app.schemas.llm import (
     AnswerPackage,
+    ConversationMemory,
+    ConversationTurnResult,
     KnowledgePointRef,
     MethodPattern,
     ParsedQuestion,
+    PedagogicalIndexProfile,
     QuestionUnderstanding,
+    RetrievalUnit,
     SimilarQuestion,
     SolutionStep,
     VariantList,
@@ -17,10 +22,14 @@ from app.schemas.llm import (
 
 __all__ = [
     "AnswerPackage",
+    "ConversationMemory",
+    "ConversationTurnResult",
     "KnowledgePointRef",
     "MethodPattern",
+    "PedagogicalIndexProfile",
     "ParsedQuestion",
     "QuestionUnderstanding",
+    "RetrievalUnit",
     "SimilarQuestion",
     "SolutionStep",
     "VariantList",

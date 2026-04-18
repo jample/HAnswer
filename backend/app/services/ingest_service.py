@@ -87,6 +87,7 @@ async def ingest_image(
         model_cls=ParsedQuestion,
         template_kwargs=kwargs,
         messages_override=messages,
+        timeout_s=settings.llm.parser_timeout_s,
     )
 
     question = await repo.create_question_from_parsed(
@@ -102,3 +103,86 @@ async def edit_parsed(
     session: AsyncSession, *, question_id: uuid.UUID, patch: dict,
 ) -> Question:
     return await repo.update_parsed(session, question_id=question_id, patch=patch)
+
+
+async def rescan_question(
+    session: AsyncSession,
+    *,
+    question_id: uuid.UUID,
+    llm: GeminiClient,
+    subject_hint: str | None = None,
+) -> IngestResult:
+    q = await repo.get_question(session, question_id)
+    if q is None:
+        raise KeyError(f"question {question_id} not found")
+
+    image_row = await repo.get_image_for_question(session, question_id)
+    if image_row is None:
+        raise FileNotFoundError(f"question {question_id} has no stored source image")
+
+    image_path = Path(image_row.path)
+    if not image_path.exists():
+        raise FileNotFoundError(f"source image missing on disk: {image_row.path}")
+
+    data = image_path.read_bytes()
+    parser = PromptRegistry.get("parser")
+    kwargs = {"subject_hint": subject_hint} if subject_hint else {}
+    messages = parser.build_multimodal(data, image_row.mime, **kwargs)
+
+    parsed = await llm.call_structured(
+        template=parser,
+        model=settings.gemini.model_parser,
+        model_cls=ParsedQuestion,
+        template_kwargs=kwargs,
+        messages_override=messages,
+        timeout_s=settings.llm.parser_timeout_s,
+    )
+
+    await repo.clear_generated_content(session, question_id=question_id)
+    question = await repo.replace_parsed(session, question_id=question_id, parsed=parsed)
+    return IngestResult(question, image_row, parsed, deduped=False)
+
+
+async def replace_question_image(
+    session: AsyncSession,
+    *,
+    question_id: uuid.UUID,
+    data: bytes,
+    mime: str,
+    llm: GeminiClient,
+    subject_hint: str | None = None,
+) -> IngestResult:
+    if mime not in MIME_EXT:
+        raise ValueError(f"unsupported mime: {mime}")
+
+    q = await repo.get_question(session, question_id)
+    if q is None:
+        raise KeyError(f"question {question_id} not found")
+
+    sha = repo.sha256_bytes(data)
+    path = _persist_blob(data, mime, sha)
+    image_row = await repo.save_image_blob(
+        session, path=path, mime=mime, size=len(data), sha=sha,
+    )
+
+    parser = PromptRegistry.get("parser")
+    kwargs = {"subject_hint": subject_hint} if subject_hint else {}
+    messages = parser.build_multimodal(data, mime, **kwargs)
+    parsed = await llm.call_structured(
+        template=parser,
+        model=settings.gemini.model_parser,
+        model_cls=ParsedQuestion,
+        template_kwargs=kwargs,
+        messages_override=messages,
+        timeout_s=settings.llm.parser_timeout_s,
+    )
+
+    await repo.clear_generated_content(session, question_id=question_id)
+    await repo.set_question_image(
+        session,
+        question_id=question_id,
+        image_id=image_row.id,
+        dedup_hash=sha,
+    )
+    question = await repo.replace_parsed(session, question_id=question_id, parsed=parsed)
+    return IngestResult(question, image_row, parsed, deduped=False)

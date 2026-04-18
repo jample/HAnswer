@@ -4,12 +4,20 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.db import repo
 from app.db.session import session_scope
 from app.schemas import ParsedQuestion
-from app.services.ingest_service import MIME_EXT, edit_parsed, ingest_image
+from app.services.ingest_service import (
+    MIME_EXT,
+    edit_parsed,
+    ingest_image,
+    replace_question_image,
+    rescan_question,
+)
 from app.services.llm_client import LLMError
 from app.services.llm_deps import get_llm_client
 
@@ -74,3 +82,89 @@ async def edit_parsed_endpoint(
     except ValueError as e:
         raise HTTPException(422, f"invalid patch: {e}")
     return {"question_id": str(q.id), "parsed": q.parsed_json, "status": q.status}
+
+
+@router.get("/{question_id}/image")
+async def get_question_image_endpoint(
+    question_id: UUID,
+    session: AsyncSession = Depends(_session),
+) -> FileResponse:
+    image = await repo.get_image_for_question(session, question_id)
+    if image is None:
+        raise HTTPException(404, "image not found")
+    return FileResponse(path=image.path, media_type=image.mime)
+
+
+@router.post("/{question_id}/rescan")
+async def rescan_question_endpoint(
+    question_id: UUID,
+    payload: dict | None = Body(default=None),
+    session: AsyncSession = Depends(_session),
+    llm=Depends(get_llm_client),
+) -> dict:
+    subject_hint = None if payload is None else payload.get("subject_hint")
+    if subject_hint not in (None, "math", "physics"):
+        raise HTTPException(400, "subject_hint must be 'math', 'physics', or omitted")
+
+    try:
+        result = await rescan_question(
+            session,
+            question_id=question_id,
+            llm=llm,
+            subject_hint=subject_hint,
+        )
+    except KeyError:
+        raise HTTPException(404, "question not found")
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except LLMError as e:
+        raise HTTPException(502, f"parser LLM failed: {e}")
+
+    return {
+        "question_id": str(result.question.id),
+        "parsed": result.parsed.model_dump(mode="json"),
+        "image_sha256": result.image.sha256,
+        "deduped": result.deduped,
+        "status": result.question.status,
+    }
+
+
+@router.post("/{question_id}/replace-image")
+async def replace_question_image_endpoint(
+    question_id: UUID,
+    file: UploadFile = File(...),
+    subject_hint: str | None = Form(None),
+    session: AsyncSession = Depends(_session),
+    llm=Depends(get_llm_client),
+) -> dict:
+    if file.content_type not in MIME_EXT:
+        raise HTTPException(415, f"Unsupported MIME: {file.content_type}")
+    data = await file.read()
+    if len(data) > MAX_IMAGE_BYTES:
+        raise HTTPException(413, "Image exceeds 8 MB")
+    if subject_hint not in (None, "math", "physics"):
+        raise HTTPException(400, "subject_hint must be 'math', 'physics', or omitted")
+
+    try:
+        result = await replace_question_image(
+            session,
+            question_id=question_id,
+            data=data,
+            mime=file.content_type,
+            llm=llm,
+            subject_hint=subject_hint,
+        )
+    except KeyError:
+        raise HTTPException(404, "question not found")
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    except LLMError as e:
+        raise HTTPException(502, f"parser LLM failed: {e}")
+
+    return {
+        "question_id": str(result.question.id),
+        "parsed": result.parsed.model_dump(mode="json"),
+        "image_sha256": result.image.sha256,
+        "deduped": result.deduped,
+        "status": result.question.status,
+    }

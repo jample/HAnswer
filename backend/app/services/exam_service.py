@@ -185,6 +185,7 @@ async def _synthesize_variants(
             "count": count,
             "difficulty_target": difficulty_target,
         },
+        timeout_s=settings.llm.solver_timeout_s,
     )
     # Keep only same_pattern=true items — hard constraint.
     return [v for v in result.variants if v.same_pattern]

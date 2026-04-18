@@ -1,0 +1,93 @@
+{
+  "topic_prefix": ["电学", "欧姆定律"],
+  "parsed_question": {
+    "subject": "physics",
+    "grade_band": "junior",
+    "topic_path": ["电学", "欧姆定律"],
+    "question_text": "某导体两端电压为 $6\\,\\text{V}$, 通过它的电流为 $2\\,\\text{A}$。求该导体的电阻。",
+    "given": ["$U=6\\,\\text{V}$", "$I=2\\,\\text{A}$"],
+    "find": ["电阻 $R$"],
+    "diagram_description": "无图。",
+    "difficulty": 1,
+    "tags": ["欧姆定律"],
+    "confidence": 0.99
+  },
+  "answer_package": {
+    "question_understanding": {
+      "restated_question": "已知电压和电流, 用欧姆定律求电阻。",
+      "givens": ["$U=6\\,\\text{V}$", "$I=2\\,\\text{A}$"],
+      "unknowns": ["$R$"],
+      "implicit_conditions": ["欧姆定律: $U=IR$"]
+    },
+    "key_points_of_question": [
+      "先判断该题属于欧姆定律直接应用",
+      "注意单位已经是标准单位, 无需换算"
+    ],
+    "solution_steps": [
+      {
+        "step_index": 1,
+        "statement": "写出欧姆定律变形式",
+        "rationale": "由 $U=IR$ 可得 $R=\\frac{U}{I}$。",
+        "formula": "$R=\\frac{U}{I}$",
+        "why_this_step": "目标量是电阻, 先把公式整理成以 $R$ 为主元最清楚。",
+        "viz_ref": ""
+      },
+      {
+        "step_index": 2,
+        "statement": "代入数据计算",
+        "rationale": "把 $U=6\\,\\text{V}$, $I=2\\,\\text{A}$ 代入。",
+        "formula": "$R=\\frac{6}{2}=3\\,\\Omega$",
+        "why_this_step": "这是欧姆定律的直接代值应用。",
+        "viz_ref": ""
+      }
+    ],
+    "key_points_of_answer": [
+      "欧姆定律三量之间可以灵活变形",
+      "结果单位要写成欧姆"
+    ],
+    "method_pattern": {
+      "pattern_id_suggested": "new:电学>欧姆定律直接代值",
+      "name_cn": "欧姆定律直接代值",
+      "when_to_use": "已知电压、电流、电阻三者中的两个, 求第三个时使用。",
+      "general_procedure": [
+        "辨认已知量与目标量",
+        "把欧姆定律变形为目标量公式",
+        "代入数值并写出正确单位"
+      ],
+      "pitfalls": [
+        "公式变形错误",
+        "漏写单位"
+      ]
+    },
+    "similar_questions": [
+      {
+        "statement": "已知 $U=12\\,\\text{V}$, $I=3\\,\\text{A}$, 求 $R$。",
+        "answer_outline": "用 $R=\\frac{U}{I}$ 得 $R=4\\,\\Omega$。",
+        "same_pattern": true,
+        "difficulty_delta": -1
+      },
+      {
+        "statement": "已知 $R=5\\,\\Omega$, $I=0.4\\,\\text{A}$, 求 $U$。",
+        "answer_outline": "用 $U=IR$ 得 $U=2\\,\\text{V}$。",
+        "same_pattern": true,
+        "difficulty_delta": 0
+      },
+      {
+        "statement": "串联电路中已知总电压和总电流, 求等效电阻。",
+        "answer_outline": "仍用欧姆定律, 但先确认对象是整个电路。",
+        "same_pattern": true,
+        "difficulty_delta": 1
+      }
+    ],
+    "knowledge_points": [
+      {
+        "node_ref": "new:电学>欧姆定律",
+        "weight": 0.95
+      }
+    ],
+    "self_check": [
+      "把结果代回 $U=IR$ 检查是否仍等于 $6\\,\\text{V}$",
+      "确认单位写成 $\\Omega$ 而不是伏特或安培"
+    ]
+  }
+}

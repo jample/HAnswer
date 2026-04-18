@@ -165,6 +165,50 @@ ANSWER_PACKAGE_SCHEMA: dict = {
     "additionalProperties": False,
 }
 
+# ── Multi-turn dialog memory ────────────────────────────────────────
+
+CONVERSATION_TURN_RESULT_SCHEMA: dict = {
+    "type": "object",
+    "required": ["assistant_reply", "follow_up_suggestions", "memory"],
+    "properties": {
+        "title_suggested": {
+            "type": "string",
+            "description": "为当前会话建议的简短标题; 若不需要更新则返回空字符串",
+        },
+        "assistant_reply": {
+            "type": "string",
+            "description": "给用户的最终回答, 使用简体中文, 可包含 Markdown 和 LaTeX",
+        },
+        "follow_up_suggestions": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "建议用户继续追问的 0-3 个方向",
+        },
+        "memory": {
+            "type": "object",
+            "required": ["summary", "key_facts", "open_questions"],
+            "properties": {
+                "summary": {
+                    "type": "string",
+                    "description": "当前对话的滚动摘要, 用于下一轮上下文压缩",
+                },
+                "key_facts": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "应跨轮保留的稳定事实、结论、用户偏好或约束",
+                },
+                "open_questions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "仍待澄清或后续要继续回答的问题",
+                },
+            },
+            "additionalProperties": False,
+        },
+    },
+    "additionalProperties": False,
+}
+
 # ── Visualization ───────────────────────────────────────────────────
 
 VISUALIZATION_SCHEMA: dict = {

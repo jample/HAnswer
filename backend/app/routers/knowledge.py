@@ -97,6 +97,39 @@ async def pending(session: AsyncSession = Depends(_session)) -> dict:
     }
 
 
+@router.get("/patterns")
+async def list_patterns(
+    subject: str | None = None,
+    grade_band: str | None = None,
+    status: Literal["all", "live", "pending"] = "all",
+    session: AsyncSession = Depends(_session),
+) -> dict:
+    stmt = select(models.MethodPatternRow)
+    if subject:
+        stmt = stmt.where(models.MethodPatternRow.subject == subject)
+    if grade_band:
+        stmt = stmt.where(models.MethodPatternRow.grade_band == grade_band)
+    if status != "all":
+        stmt = stmt.where(models.MethodPatternRow.status == status)
+    stmt = stmt.order_by(models.MethodPatternRow.name_cn.asc())
+    rows = (await session.execute(stmt)).scalars().all()
+    return {
+        "patterns": [
+            {
+                "id": str(p.id),
+                "name_cn": p.name_cn,
+                "subject": p.subject,
+                "grade_band": p.grade_band,
+                "when_to_use": p.when_to_use,
+                "status": p.status,
+                "seen_count": p.seen_count,
+            }
+            for p in rows
+        ],
+        "count": len(rows),
+    }
+
+
 # ── Node detail (§9.5 right panel) ─────────────────────────────────
 
 

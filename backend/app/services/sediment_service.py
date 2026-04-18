@@ -35,8 +35,9 @@ from app.db.models import (
     QuestionKPLink,
     QuestionPatternLink,
 )
-from app.schemas import AnswerPackage, KnowledgePointRef, MethodPattern
+from app.schemas import AnswerPackage, KnowledgePointRef, MethodPattern, ParsedQuestion
 from app.services.embedding import DenseEmbedder
+from app.services.indexer_service import build_pedagogical_index, persist_pedagogical_index
 from app.services.sparse_encoder import SparseEncoder
 from app.services.vector_store import VectorStore
 
@@ -245,8 +246,19 @@ async def sediment(
         kp_ids.append(kp_row.id)
         await _upsert_kp_link(session, question_id, kp_row.id, weight=ref.weight)
 
+    parsed = ParsedQuestion.model_validate(q.parsed_json or {})
+    index = build_pedagogical_index(parsed=parsed, package=package)
+    retrieval_unit_rows = await persist_pedagogical_index(
+        session,
+        question_id=question_id,
+        profile=index.profile,
+        units=index.units,
+    )
+
     # 3. Embeddings — batched single call to save tokens.
     q_text = q.parsed_json.get("question_text", "") if q.parsed_json else ""
+    question_full_text = index.profile.query_texts.question_full_text
+    answer_full_text = index.profile.query_texts.answer_full_text
     pattern_summary = "\n".join([
         package.method_pattern.name_cn,
         package.method_pattern.when_to_use,
@@ -259,10 +271,25 @@ async def sediment(
             kp_rows.append(node)
     kp_texts = [f"{r.name_cn}\n{r.path_cached}" for r in kp_rows]
 
-    texts_to_embed = [q_text, pattern_summary, *kp_texts]
+    retrieval_unit_texts = [row.text for row in retrieval_unit_rows]
+
+    texts_to_embed = [
+        q_text,
+        question_full_text,
+        answer_full_text,
+        pattern_summary,
+        *kp_texts,
+        *retrieval_unit_texts,
+    ]
     vectors = await embedding.embed_many(texts_to_embed)
-    q_vec, pattern_vec = vectors[0], vectors[1]
-    kp_vecs = vectors[2:]
+    q_vec = vectors[0]
+    question_full_vec = vectors[1]
+    answer_full_vec = vectors[2]
+    pattern_vec = vectors[3]
+    kp_start = 4
+    kp_end = kp_start + len(kp_texts)
+    kp_vecs = vectors[kp_start:kp_end]
+    retrieval_unit_vecs = vectors[kp_end:]
 
     # 4. Near-dup check before writing q_emb so self-match doesn't trigger.
     near_dup_of: uuid.UUID | None = None
@@ -290,6 +317,22 @@ async def sediment(
         difficulty=q.difficulty,
     )
     await vector_store.upsert(
+        "question_full_emb",
+        ref_id=str(question_id),
+        vector=question_full_vec,
+        subject=q.subject,
+        grade_band=q.grade_band,
+        difficulty=q.difficulty,
+    )
+    await vector_store.upsert(
+        "answer_full_emb",
+        ref_id=str(question_id),
+        vector=answer_full_vec,
+        subject=q.subject,
+        grade_band=q.grade_band,
+        difficulty=q.difficulty,
+    )
+    await vector_store.upsert(
         "pattern_emb",
         ref_id=str(pattern_row.id),
         vector=pattern_vec,
@@ -306,16 +349,40 @@ async def sediment(
         )
         row.embedding_ref = str(row.id)
     pattern_row.embedding_ref = str(pattern_row.id)
+    for row, vec in zip(retrieval_unit_rows, retrieval_unit_vecs):
+        await vector_store.upsert(
+            "retrieval_unit_emb",
+            ref_id=str(row.id),
+            vector=vec,
+            subject=q.subject,
+            grade_band=q.grade_band,
+            difficulty=q.difficulty,
+            unit_kind=row.unit_kind,
+        )
 
     # 5b. Sparse lexical upserts (M5 multi-route). The sparse encoder
     # accumulates corpus statistics here so future queries get real
     # IDF weighting.
     if sparse_encoder is not None and getattr(vector_store, "supports_sparse", False):
         sparse_vecs = await sparse_encoder.encode(texts_to_embed)
-        sp_q, sp_pat = sparse_vecs[0], sparse_vecs[1]
-        sp_kps = sparse_vecs[2:]
+        sp_q = sparse_vecs[0]
+        sp_question_full = sparse_vecs[1]
+        sp_answer_full = sparse_vecs[2]
+        sp_pat = sparse_vecs[3]
+        sp_kps = sparse_vecs[kp_start:kp_end]
+        sp_units = sparse_vecs[kp_end:]
         await vector_store.upsert_sparse(
             "q_emb", ref_id=str(question_id), sparse=sp_q,
+            subject=q.subject, grade_band=q.grade_band,
+            difficulty=q.difficulty,
+        )
+        await vector_store.upsert_sparse(
+            "question_full_emb", ref_id=str(question_id), sparse=sp_question_full,
+            subject=q.subject, grade_band=q.grade_band,
+            difficulty=q.difficulty,
+        )
+        await vector_store.upsert_sparse(
+            "answer_full_emb", ref_id=str(question_id), sparse=sp_answer_full,
             subject=q.subject, grade_band=q.grade_band,
             difficulty=q.difficulty,
         )
@@ -327,6 +394,16 @@ async def sediment(
             await vector_store.upsert_sparse(
                 "kp_emb", ref_id=str(row.id), sparse=sp,
                 subject=row.subject, grade_band=row.grade_band,
+            )
+        for row, sp in zip(retrieval_unit_rows, sp_units):
+            await vector_store.upsert_sparse(
+                "retrieval_unit_emb",
+                ref_id=str(row.id),
+                sparse=sp,
+                subject=q.subject,
+                grade_band=q.grade_band,
+                difficulty=q.difficulty,
+                unit_kind=row.unit_kind,
             )
 
     # 6. Near-dup: bump evidence on the canonical question.

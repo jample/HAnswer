@@ -1,37 +1,63 @@
 import type { ReactNode } from 'react';
 import Link from 'next/link';
+import Script from 'next/script';
+import './globals.css';
 
 export const metadata = {
   title: 'HAnswer · 学习伙伴',
   description: '数学 & 物理题目讲解与练习',
 };
 
-const navLink = { padding: '4px 8px', color: '#0366d6', textDecoration: 'none' } as const;
-
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html lang="zh-CN">
-      <body style={{ margin: 0, fontFamily: 'system-ui, -apple-system, sans-serif' }}>
-        <header
-          style={{
-            padding: '12px 20px',
-            borderBottom: '1px solid #eee',
-            display: 'flex',
-            gap: 12,
-            alignItems: 'baseline',
-          }}
-        >
-          <strong style={{ fontSize: 18 }}>HAnswer</strong>
-          <span style={{ color: '#888' }}>· 学习伙伴</span>
-          <nav style={{ marginLeft: 'auto', display: 'flex', gap: 4 }}>
-            <Link href="/" style={navLink}>提问</Link>
-            <Link href="/library" style={navLink}>题库</Link>
-            <Link href="/practice" style={navLink}>练习</Link>
-            <Link href="/knowledge" style={navLink}>知识</Link>
-            <Link href="/settings" style={navLink}>设置</Link>
+      <body>
+        <header className="app-header">
+          <Link href="/" className="app-logo">HAnswer</Link>
+          <span className="app-logo-sub">学习伙伴</span>
+          <nav className="app-nav">
+            <Link href="/" className="nav-link">提问</Link>
+            <Link href="/dialog" className="nav-link">对话</Link>
+            <Link href="/library" className="nav-link">题库</Link>
+            <Link href="/practice" className="nav-link">练习</Link>
+            <Link href="/knowledge" className="nav-link">知识</Link>
+            <Link href="/settings" className="nav-link">设置</Link>
           </nav>
         </header>
-        <main style={{ padding: 20 }}>{children}</main>
+        <main className="app-main">{children}</main>
+
+        {/* MathJax 3 — config must be set before the script loads */}
+        <Script
+          id="mathjax-config"
+          strategy="beforeInteractive"
+          dangerouslySetInnerHTML={{
+            __html: `
+              window.MathJax = {
+                tex: {
+                  inlineMath: [['$', '$']],
+                  displayMath: [['$$', '$$']],
+                  processEscapes: true,
+                  tags: 'none',
+                },
+                options: {
+                  skipHtmlTags: ['script','noscript','style','textarea','pre','code'],
+                  ignoreHtmlClass: 'tex2jax_ignore',
+                },
+                startup: {
+                  typeset: false,
+                  ready() {
+                    MathJax.startup.defaultReady();
+                    document.dispatchEvent(new Event('mathjax-ready'));
+                  },
+                },
+              };
+            `,
+          }}
+        />
+        <Script
+          src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"
+          strategy="afterInteractive"
+        />
       </body>
     </html>
   );

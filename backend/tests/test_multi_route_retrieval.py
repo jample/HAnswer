@@ -183,3 +183,36 @@ async def test_multi_route_structural_route_alone(session, tmp_image_dir):
     assert b_hit.route_ranks is not None
     # Structural route must have contributed — A and B share the pattern.
     assert "structural" in b_hit.route_ranks
+
+
+@pytest.mark.asyncio
+async def test_multi_route_can_query_answer_and_pedagogical_facets(session, tmp_image_dir):
+    qid = await _seed_question(session, _PARSED_A, marker=b"mr-answer")
+
+    solver_llm = GeminiClient(FakeTransport(
+        json_by_model={settings.gemini.model_solver: json.dumps(_ANSWER_PACKAGE_A)}
+    ))
+    pkg = await _run_solver(session, qid, solver_llm)
+
+    vs = InMemoryVectorStore()
+    embed_llm = GeminiClient(_CannedEmbedTransport(vectors={
+        _PARSED_A["question_text"]: _pad([1.0, 0.0]),
+    }))
+    es = EmbeddingService(llm=embed_llm)
+    sp = BM25SparseEncoder()
+
+    await sediment(session, question_id=qid, package=pkg,
+                   embedding=es, vector_store=vs, sparse_encoder=sp)
+
+    hits = await similar_questions_multi_route(
+        session,
+        query=SimilarQuery(mode="text", query="代回验证", k=5),
+        embedding=es, sparse=sp, vector_store=vs,
+    )
+    assert hits
+    top = hits[0]
+    assert top.question_id == str(qid)
+    assert top.route_ranks is not None
+    assert "sparse" in top.route_ranks or "dense" in top.route_ranks
+    assert top.matched_unit_kinds is not None
+    assert "answer_focus" in top.matched_unit_kinds or "keyword_profile" in top.matched_unit_kinds

@@ -2,6 +2,8 @@
 
 import { useEffect, useState } from 'react';
 
+import { apiUrl } from '../../lib/api';
+
 type ByPrompt = {
   task: string;
   prompt_version: string;
@@ -49,8 +51,16 @@ type ConfigView = {
   milvus: { host: string; port: number; database: string; auto_bootstrap: boolean };
   retrieval: Record<string, unknown>;
   llm: Record<string, unknown>;
+  dialog: Record<string, unknown>;
   server: { host: string; port: number; cors_origins: string[] };
   note: string;
+};
+
+type DialogStats = {
+  sessions: number;
+  question_linked_sessions: number;
+  messages: number;
+  memory_snapshots: number;
 };
 
 const muted = { color: '#888', fontSize: 12 } as const;
@@ -61,28 +71,33 @@ export default function SettingsPage() {
   const [cost, setCost] = useState<CostSummary | null>(null);
   const [prompts, setPrompts] = useState<PromptMeta[]>([]);
   const [cfg, setCfg] = useState<ConfigView | null>(null);
+  const [dialogStats, setDialogStats] = useState<DialogStats | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
-    fetch(`/api/admin/llm-cost?days=${days}`)
+    fetch(apiUrl(`/api/admin/llm-cost?days=${days}`))
       .then((r) => r.json())
       .then((d) => setCost(d))
       .catch((e) => setErr(String(e)));
   }, [days]);
 
   useEffect(() => {
-    fetch('/api/admin/prompts')
+    fetch(apiUrl('/api/admin/prompts'))
       .then((r) => r.json())
       .then((d) => setPrompts(d.prompts || []))
       .catch(() => {});
-    fetch('/api/admin/config')
+    fetch(apiUrl('/api/admin/config'))
       .then((r) => r.json())
       .then(setCfg)
+      .catch(() => {});
+    fetch(apiUrl('/api/dialog/stats'))
+      .then((r) => r.json())
+      .then(setDialogStats)
       .catch(() => {});
   }, []);
 
   return (
-    <section>
+    <section className="page-section">
       <h1>设置</h1>
       <p style={muted}>本地优先部署 · 修改配置请编辑 <code>backend/config.toml</code> 后重启 <code>uvicorn</code>。</p>
 
@@ -117,11 +132,28 @@ export default function SettingsPage() {
               <Row key={k} k={k} v={<code>{String(v)}</code>} />
             ))}
           </Card>
+          <Card title="Dialog Memory">
+            {Object.entries(cfg.dialog).map(([k, v]) => (
+              <Row key={k} k={k} v={<code>{String(v)}</code>} />
+            ))}
+          </Card>
         </div>
       ) : (
         <p style={muted}>加载中…</p>
       )}
       {cfg && <p style={{ ...muted, marginTop: 8 }}>{cfg.note}</p>}
+
+      <h2 style={h2Style}>对话分析</h2>
+      {dialogStats ? (
+        <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
+          <Stat label="会话数" value={dialogStats.sessions} />
+          <Stat label="绑定题目会话" value={dialogStats.question_linked_sessions} />
+          <Stat label="消息数" value={dialogStats.messages} />
+          <Stat label="记忆快照" value={dialogStats.memory_snapshots} />
+        </div>
+      ) : (
+        <p style={muted}>加载中…</p>
+      )}
 
       <h2 style={h2Style}>成本账本</h2>
       <label>
@@ -150,7 +182,7 @@ export default function SettingsPage() {
           {cost.by_prompt.length === 0 ? (
             <p style={muted}>窗口内无调用记录。</p>
           ) : (
-            <table style={tableStyle}>
+            <div className="table-scroll"><table style={tableStyle}>
               <thead>
                 <tr>
                   <th>Prompt</th><th>版本</th><th>调用</th>
@@ -170,14 +202,14 @@ export default function SettingsPage() {
                   </tr>
                 ))}
               </tbody>
-            </table>
+            </table></div>
           )}
 
           <h3 style={{ marginTop: 16 }}>按天</h3>
           {cost.by_day.length === 0 ? (
             <p style={muted}>无数据。</p>
           ) : (
-            <table style={tableStyle}>
+            <div className="table-scroll"><table style={tableStyle}>
               <thead><tr><th>日期</th><th>成本 (USD)</th><th>调用</th></tr></thead>
               <tbody>
                 {cost.by_day.map((d, i) => (
@@ -186,7 +218,7 @@ export default function SettingsPage() {
                   </tr>
                 ))}
               </tbody>
-            </table>
+            </table></div>
           )}
         </>
       ) : (

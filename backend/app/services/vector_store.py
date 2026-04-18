@@ -12,8 +12,9 @@ backend.
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable, Protocol
+from typing import Protocol
 
 from app.config import settings
 
@@ -37,6 +38,7 @@ class VectorStore(Protocol):
         subject: str,
         grade_band: str,
         difficulty: int = 0,
+        unit_kind: str = "",
     ) -> None: ...
 
     async def search(
@@ -63,6 +65,7 @@ class VectorStore(Protocol):
         subject: str,
         grade_band: str,
         difficulty: int = 0,
+        unit_kind: str = "",
     ) -> None: ...
 
     async def search_sparse(
@@ -83,7 +86,7 @@ def _norm(v: list[float]) -> float:
 def _cosine(a: list[float], b: list[float]) -> float:
     if not a or not b or len(a) != len(b):
         return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
+    dot = sum(x * y for x, y in zip(a, b, strict=False))
     return dot / (_norm(a) * _norm(b))
 
 
@@ -114,11 +117,17 @@ class InMemoryVectorStore:
     def __init__(self) -> None:
         self._rows: dict[str, dict[str, dict]] = {
             "q_emb": {},
+            "question_full_emb": {},
+            "answer_full_emb": {},
+            "retrieval_unit_emb": {},
             "pattern_emb": {},
             "kp_emb": {},
         }
         self._sparse: dict[str, dict[str, dict]] = {
             "q_emb": {},
+            "question_full_emb": {},
+            "answer_full_emb": {},
+            "retrieval_unit_emb": {},
             "pattern_emb": {},
             "kp_emb": {},
         }
@@ -132,6 +141,7 @@ class InMemoryVectorStore:
         subject: str,
         grade_band: str,
         difficulty: int = 0,
+        unit_kind: str = "",
     ) -> None:
         bucket = self._rows.setdefault(collection, {})
         bucket[ref_id] = {
@@ -139,6 +149,7 @@ class InMemoryVectorStore:
             "subject": subject,
             "grade_band": grade_band,
             "difficulty": difficulty,
+            "unit_kind": unit_kind,
         }
 
     async def search(
@@ -177,6 +188,7 @@ class InMemoryVectorStore:
         subject: str,
         grade_band: str,
         difficulty: int = 0,
+        unit_kind: str = "",
     ) -> None:
         bucket = self._sparse.setdefault(collection, {})
         bucket[ref_id] = {
@@ -184,6 +196,7 @@ class InMemoryVectorStore:
             "subject": subject,
             "grade_band": grade_band,
             "difficulty": difficulty,
+            "unit_kind": unit_kind,
         }
 
     async def search_sparse(
@@ -219,6 +232,9 @@ class MilvusVectorStore:
 
     _RAW_FIELDS = {
         "q_emb": ("ref_pg_id",),
+        "question_full_emb": ("question_id",),
+        "answer_full_emb": ("question_id",),
+        "retrieval_unit_emb": ("retrieval_unit_id",),
         "pattern_emb": ("pattern_id",),
         "kp_emb": ("kp_id",),
     }
@@ -239,6 +255,37 @@ class MilvusVectorStore:
     def _id_field(collection: str) -> str:
         return MilvusVectorStore._RAW_FIELDS[collection][0]
 
+    @staticmethod
+    def _escape_string(value: str) -> str:
+        return value.replace("\\", "\\\\").replace('"', '\\"')
+
+    async def _replace_row(
+        self,
+        *,
+        collection_name: str,
+        ref_field: str,
+        ref_id: str,
+        row: dict,
+    ) -> None:
+        client = self._get_client()
+        expr = f'{ref_field} == "{self._escape_string(ref_id)}"'
+        import asyncio
+
+        await asyncio.to_thread(
+            client.delete,
+            collection_name=collection_name,
+            filter=expr,
+        )
+        await asyncio.to_thread(
+            client.insert,
+            collection_name=collection_name,
+            data=[row],
+        )
+        await asyncio.to_thread(
+            client.flush,
+            collection_name=collection_name,
+        )
+
     async def upsert(
         self,
         collection: str,
@@ -248,20 +295,24 @@ class MilvusVectorStore:
         subject: str,
         grade_band: str,
         difficulty: int = 0,
+        unit_kind: str = "",
     ) -> None:
-        client = self._get_client()
         row = {
             self._id_field(collection): ref_id,
             "subject": subject,
             "grade_band": grade_band,
             "vector": vector,
         }
-        if collection == "q_emb":
+        if collection in {"q_emb", "question_full_emb", "answer_full_emb", "retrieval_unit_emb"}:
             row["difficulty"] = difficulty
-        # pymilvus MilvusClient.upsert is synchronous; run in thread so
-        # async callers don't stall the event loop.
-        import asyncio
-        await asyncio.to_thread(client.upsert, collection_name=collection, data=[row])
+        if collection == "retrieval_unit_emb":
+            row["unit_kind"] = unit_kind
+        await self._replace_row(
+            collection_name=collection,
+            ref_field=self._id_field(collection),
+            ref_id=ref_id,
+            row=row,
+        )
 
     async def search(
         self,
@@ -289,7 +340,11 @@ class MilvusVectorStore:
             filter=expr,
             output_fields=list(self._RAW_FIELDS[collection]) + [
                 "subject", "grade_band",
-            ] + (["difficulty"] if collection == "q_emb" else []),
+            ] + (
+                ["difficulty"]
+                if collection in {"q_emb", "question_full_emb", "answer_full_emb", "retrieval_unit_emb"}
+                else []
+            ) + (["unit_kind"] if collection == "retrieval_unit_emb" else []),
         )
         hits: list[Hit] = []
         for row in (result[0] if result else []):
@@ -314,21 +369,23 @@ class MilvusVectorStore:
         subject: str,
         grade_band: str,
         difficulty: int = 0,
+        unit_kind: str = "",
     ) -> None:
-        client = self._get_client()
         row = {
             self._id_field(collection): ref_id,
             "subject": subject,
             "grade_band": grade_band,
             "sparse_vector": sparse,
         }
-        if collection == "q_emb":
+        if collection in {"q_emb", "question_full_emb", "answer_full_emb", "retrieval_unit_emb"}:
             row["difficulty"] = difficulty
-        import asyncio
-        await asyncio.to_thread(
-            client.upsert,
+        if collection == "retrieval_unit_emb":
+            row["unit_kind"] = unit_kind
+        await self._replace_row(
             collection_name=collection + self._SPARSE_SUFFIX,
-            data=[row],
+            ref_field=self._id_field(collection),
+            ref_id=ref_id,
+            row=row,
         )
 
     async def search_sparse(
@@ -358,7 +415,11 @@ class MilvusVectorStore:
             anns_field="sparse_vector",
             output_fields=list(self._RAW_FIELDS[collection]) + [
                 "subject", "grade_band",
-            ] + (["difficulty"] if collection == "q_emb" else []),
+            ] + (
+                ["difficulty"]
+                if collection in {"q_emb", "question_full_emb", "answer_full_emb", "retrieval_unit_emb"}
+                else []
+            ) + (["unit_kind"] if collection == "retrieval_unit_emb" else []),
         )
         hits: list[Hit] = []
         for row in (result[0] if result else []):

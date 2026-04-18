@@ -16,8 +16,8 @@ frontend (this milestone) does not have to change later.
 from __future__ import annotations
 
 import uuid
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import AsyncIterator
 
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -135,6 +135,8 @@ async def generate_answer(
             model=settings.gemini.model_solver,
             model_cls=AnswerPackage,
             template_kwargs=kwargs,
+            timeout_s=settings.llm.solver_timeout_s,
+            stream=settings.llm.stream_solver_json,
         )
     except LLMError:
         raise

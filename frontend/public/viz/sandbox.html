@@ -53,6 +53,7 @@
     // setTimeout/Interval with string args: wrap and reject.
     const _setTimeout = window.setTimeout;
     const _setInterval = window.setInterval;
+    const _raf = window.requestAnimationFrame.bind(window);
     window.setTimeout = function (fn, ms) {
       if (typeof fn === 'string') throw new Error('setTimeout(string) forbidden');
       return _setTimeout.apply(this, arguments);
@@ -61,6 +62,26 @@
       if (typeof fn === 'string') throw new Error('setInterval(string) forbidden');
       return _setInterval.apply(this, arguments);
     };
+    let frameOverruns = 0;
+    let vizDisabled = false;
+    window.requestAnimationFrame = function (cb) {
+      return _raf(function (ts) {
+        if (vizDisabled) return;
+        const t0 = performance.now();
+        cb(ts);
+        const elapsed = performance.now() - t0;
+        if (elapsed > 16) {
+          frameOverruns += 1;
+          if (frameOverruns >= 3) {
+            vizDisabled = true;
+            postError('animation frame budget exceeded (16ms)');
+            dispose();
+          }
+        } else {
+          frameOverruns = 0;
+        }
+      });
+    };
     // Block eval / Function constructor.
     window.eval = function () { throw new Error('eval forbidden'); };
     window.Function = function () { throw new Error('Function forbidden'); };
@@ -68,6 +89,10 @@
     // --- 2. Render controller ----------------------------------------
     let board = null;
     let controller = null;
+
+    function escapeForInlineFunctionBody(src) {
+      return String(src || '').replace(/<\/script/gi, '<\\/script');
+    }
 
     function postError(msg) {
       document.getElementById('err').style.display = 'block';
@@ -80,6 +105,11 @@
         try { controller.destroy(); } catch (_) {}
       }
       controller = null;
+      frameOverruns = 0;
+      vizDisabled = false;
+      if (window.H && typeof window.H._setBoard === 'function') {
+        try { window.H._setBoard(null); } catch (_) {}
+      }
       if (board) {
         try { JXG.JSXGraph.freeBoard(board); } catch (_) {}
         board = null;
@@ -97,21 +127,51 @@
         showCopyright: false,
         keepAspectRatio: true,
       });
+      if (window.H && typeof window.H._setBoard === 'function') {
+        window.H._setBoard(board);
+      }
       try {
-        // Wrap LLM-supplied body in a function with a controlled signature.
-        // Forbidden globals are already killed; we additionally shadow them.
-        const userFn = new (Object.getPrototypeOf(function(){}).constructor)(
-          'board', 'JXG', 'H', 'params',
-          '"use strict";' +
-          'var window=undefined,document=undefined,globalThis=undefined,self=undefined,' +
-          'top=undefined,parent=undefined,fetch=undefined,XMLHttpRequest=undefined,' +
-          'eval=undefined,Function=undefined;' +
-          jsxCode
-        );
-        // Note: we use the Function constructor indirectly to build the wrapper
-        // before we blocked it above. To avoid chicken-and-egg, restore locally.
-        controller = userFn(board, window.JXG, window.H, params || {}) || null;
-        parent.postMessage({ type: 'metric', renderMs: performance.now() - t0 }, '*');
+        const runtimeKey = '__hanswerRuntime_' + Math.random().toString(36).slice(2);
+        const runtime = { board, JXG: window.JXG, H: window.H, params: params || {}, result: null, error: null };
+        window[runtimeKey] = runtime;
+        try {
+          const script = document.createElement('script');
+          script.textContent = `
+            (function() {
+              const __runtime = window[${JSON.stringify(runtimeKey)}];
+              const __done = function(value) { __runtime.result = value; };
+              const __fail = function(message) { __runtime.error = message; };
+              try {
+                const __result = (function(board, JXG, H, params) {
+                  "use strict";
+                  var window=undefined,document=undefined,globalThis=undefined,self=undefined,
+                      top=undefined,parent=undefined,fetch=undefined,XMLHttpRequest=undefined,
+                      eval=undefined,Function=undefined;
+                  ${escapeForInlineFunctionBody(jsxCode)}
+                })(__runtime.board, __runtime.JXG, __runtime.H, __runtime.params);
+                __done(__result || null);
+              } catch (e) {
+                __fail(String(e && e.message || e));
+              }
+            })();
+          `;
+          document.body.appendChild(script);
+          script.remove();
+        } finally {
+          if (runtime.error) {
+            delete window[runtimeKey];
+            throw new Error(runtime.error);
+          }
+          controller = runtime.result || null;
+          delete window[runtimeKey];
+        }
+        const renderMs = performance.now() - t0;
+        parent.postMessage({ type: 'metric', renderMs }, '*');
+        if (renderMs > 200) {
+          vizDisabled = true;
+          postError('initial render budget exceeded (200ms)');
+          dispose();
+        }
       } catch (e) {
         postError(String(e && e.message || e));
       }

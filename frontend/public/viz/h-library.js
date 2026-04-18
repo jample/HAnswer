@@ -40,8 +40,23 @@
         return H._currentBoard.create('curve',
           [spec.x, spec.y, tRange[0], tRange[1]], attrs || {});
       },
-      vectorField() {
-        throw new Error('H.plot.vectorField: not yet implemented');
+      vectorField(fn, grid, attrs) {
+        const cfg = Object.assign({
+          xMin: -4, xMax: 4, yMin: -4, yMax: 4, step: 1, scale: 0.35,
+        }, grid || {});
+        const arrows = [];
+        for (let x = cfg.xMin; x <= cfg.xMax; x += cfg.step) {
+          for (let y = cfg.yMin; y <= cfg.yMax; y += cfg.step) {
+            const out = fn(x, y);
+            const vx = Array.isArray(out) ? out[0] : out.x;
+            const vy = Array.isArray(out) ? out[1] : out.y;
+            arrows.push(H._currentBoard.create('arrow', [
+              [x, y],
+              [x + vx * cfg.scale, y + vy * cfg.scale],
+            ], attrs || {}));
+          }
+        }
+        return arrows;
       },
     },
     phys: {
@@ -56,7 +71,17 @@
           0, tMax,
         ], attrs || {});
       },
-      springMass() { throw new Error('H.phys.springMass: not yet implemented'); },
+      springMass(opts, attrs) {
+        const { k, m, x0 } = opts;
+        const omega = Math.sqrt(Math.max(k, 0.0001) / Math.max(m, 0.0001));
+        const amp = x0 == null ? 1 : x0;
+        return H._currentBoard.create('curve', [
+          (t) => t,
+          (t) => amp * Math.cos(omega * t),
+          0,
+          Math.PI * 4,
+        ], attrs || {});
+      },
     },
     anim: {
       animate(paramName, from, to, durationMs, onUpdate) {

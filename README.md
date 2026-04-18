@@ -7,6 +7,23 @@
 
 See [HAnswerR.md](HAnswerR.md) for the full stage-1 specification.
 
+See [Unfinished.md](Unfinished.md) for the current requirement-audit log,
+the remaining Stage-1 gaps, and the README updates recorded from that audit.
+
+---
+
+## Audit Status
+
+Last audited against `HAnswerR.md`: `2026-04-18`.
+
+- Fixed in this audit: solver few-shot example loading, persisted answer
+  replay on `/q/[id]`, viz helper board wiring plus runtime budgets, Knowledge
+  merge UI, Library route-rank visibility for multi-route retrieval, and a
+  persistent multi-turn dialog system with rolling memory.
+- Still not fully complete: true incremental section streaming, several
+  Stage-1 UX surfaces, and some spec-listed filters/admin affordances. Those
+  are tracked in [Unfinished.md](Unfinished.md).
+
 ---
 
 ## What the app does
@@ -14,12 +31,13 @@ See [HAnswerR.md](HAnswerR.md) for the full stage-1 specification.
 | You do | HAnswer does |
 |---|---|
 | Drop a photo of a math/physics problem on `/` | Gemini multimodal → structured `ParsedQuestion` you can edit before answering |
-| Hit **开始解答** | Streams an `AnswerPackage` (§6) via SSE — 题目理解 → 关键点 → 分步解答 → 方法模式 → 同类题 → 知识点 → 自我检查 |
+| Hit **开始解答** | Starts a background 4-call Gemini pipeline. The UI shows `1/4 解析题面 → 2/4 生成解答 → 3/4 生成可视化 → 4/4 建立索引`, and `/q/[id]` polls persisted progress/sections so long solves survive refreshes while results continue to appear. The repeated `/resume` calls are frontend polling only; they do not mean extra Gemini solver calls |
+| Open `/dialog` or click **进入多轮追问对话** on `/q/[id]` | Starts a persistent study conversation. Each turn sends `题目上下文 + 滚动摘要 + 关键事实 + 最近消息` so Gemini keeps continuity without replaying the whole transcript; transcripts and memory snapshots are stored in PostgreSQL for later analysis |
 | Watch the right panel | Sandboxed JSXGraph visualizations (AST-validated) with sliders/toggles |
-| Browse `/library` | Filter bank; semantic search with RRF fusion over **dense + sparse + structural** routes |
-| Click a node on `/knowledge` | See related questions (weighted), co-occurring method patterns, promote pending KPs/patterns |
+| Browse `/library` | Filter bank; semantic search with RRF fusion over **whole-question + whole-answer + pedagogical-facet** dense/sparse routes plus structural links, including per-route rank traces |
+| Click a node on `/knowledge` | See related questions (weighted), co-occurring method patterns, and promote / merge / reject pending KPs or patterns |
 | Build a set on `/practice` | Add questions to a basket, configure count + difficulty distribution, get an exam (LLM synthesizes pattern-preserving variants when the bank is short), self-check with ✓/✗/? |
-| Open `/settings` | See masked Gemini key, models per task, retrieval knobs, LLM cost ledger (totals / by prompt·version / by day) |
+| Open `/settings` | See masked Gemini key, models per task, retrieval/dialog memory knobs, LLM cost ledger (totals / by prompt·version / by day), and dialog analytics counts |
 
 ### Key design principles
 
@@ -32,9 +50,14 @@ See [HAnswerR.md](HAnswerR.md) for the full stage-1 specification.
   AST-validated against an allow-list, then executed in a CSP-locked,
   cross-origin `<iframe sandbox>` communicating via typed postMessage.
 - **Knowledge sediment.** Every solved question writes a dedup'd row,
-  resolves/creates `KnowledgePoint` + `MethodPattern` rows, upserts
-  embeddings into Milvus (dense + sparse), and promotes pending nodes
-  only on explicit user review.
+  resolves/creates `KnowledgePoint` + `MethodPattern` rows, stores a
+  `question_retrieval_profile` plus `retrieval_units`, upserts whole-question,
+  whole-answer, and pedagogical-facet embeddings into Milvus (dense + sparse),
+  and promotes pending nodes only on explicit user review.
+- **Conversation memory, not transcript replay.** Multi-turn dialog stores full
+  messages, but Gemini receives a compressed context package: optional
+  question anchor, rolling summary, cached key facts, open questions, and the
+  latest raw turns. Each assistant turn refreshes that memory in one call.
 - **Local-first.** Everything runs on your machine: Postgres, Milvus,
   Next.js, FastAPI. The only outbound network call is to Gemini.
 
@@ -48,16 +71,16 @@ See [HAnswerR.md](HAnswerR.md) for the full stage-1 specification.
 | M2 | `POST /api/ingest/image` · Parser prompt · `/` Ask page with editable parse | ✅ |
 | M3 | `POST /api/answer/{id}` SSE · Solver prompt · `/q/[id]` KaTeX incremental render | ✅ |
 | M4 | VizCoder prompt · Node/acorn AST validator · iframe sandbox · `<VizSandbox/>` host | ✅ |
-| M5 | Pluggable embedder (Gemini / **bge-m3**) · BM25 or bge-m3 sparse · Milvus dense+sparse · **multi-route + RRF** · `/library` | ✅ |
-| M6 | Sediment (resolve/create patterns + KPs) · near-dup (τ=0.96) · `/api/knowledge/*` · taxonomy seed · `/knowledge` | ✅ |
+| M5 | Pluggable embedder (Gemini / **bge-m3**) · BM25 or bge-m3 sparse · Milvus dense+sparse · **multi-route + RRF** · `/library` | ◐ |
+| M6 | Sediment (resolve/create patterns + KPs) · near-dup (τ=0.96) · `/api/knowledge/*` · taxonomy seed · `/knowledge` | ◐ |
 | M7 | `ExamConfig` filter · `VariantSynthPrompt` · `/api/practice/exam` · `/practice` basket + runner | ✅ |
-| M8 | PG `CostLedger` · `/api/admin/{llm-cost,config,prompts}` · `/api/answer/{id}/resume` · `/settings` | ✅ |
+| M8 | PG `CostLedger` · `/api/admin/{llm-cost,config,prompts}` · `/api/answer/{id}/resume` · `/settings` | ◐ |
+| M9 | Persistent multi-turn dialog · rolling memory snapshots · `/api/dialog/*` · `/dialog` | ✅ |
 
-**Tests:** 86 passing. Exercises real local Postgres (SAVEPOINT rollback
-per test, no SQLite fallback per Appendix B), FakeTransport-driven LLM
-round-trips, AST validator adversarial suite (30+ snippets), multi-route
-retrieval, RRF fusion, BM25 encoder, knowledge router, exam service,
-PG cost ledger, admin endpoints, answer resume.
+**Verification status:** prompt-framework tests pass locally (`22 passed`
+without requiring PostgreSQL). DB-backed backend tests still require a real
+local PostgreSQL instance with sandbox access; run `cd backend && pytest`
+in your local environment to verify the full suite end-to-end.
 
 ---
 
@@ -85,10 +108,10 @@ export GEMINI_API_KEY="your_key_here"   # never put the key in config.toml
 ```toml
 [gemini]
 # API key is read from $GEMINI_API_KEY — do not put it in this file.
-model_parser   = "gemini-3.1-pro"      # image → ParsedQuestion
-model_solver   = "gemini-3.1-pro"      # ParsedQuestion → AnswerPackage
-model_vizcoder = "gemini-3.1-pro"      # AnswerPackage → visualizations[]
-model_embed    = "text-embedding-004"
+model_parser   = "gemini-3.1-pro-preview" # image → ParsedQuestion
+model_solver   = "gemini-3.1-pro-preview" # ParsedQuestion → AnswerPackage
+model_vizcoder = "gemini-3.1-pro-preview" # AnswerPackage → visualizations[]
+model_embed    = "text-embedding-004"  # or "gemini-embedding-001"
 embed_dim      = 768
 
 [postgres]
@@ -99,6 +122,7 @@ host     = "localhost"
 port     = 19530
 database = "default"
 auto_bootstrap = true                   # create collections on FastAPI startup
+recreate_dense_on_dim_mismatch = false  # safety valve; don't auto-drop by default
 
 [server]
 host         = "127.0.0.1"
@@ -111,7 +135,14 @@ image_dir = "./data/images"            # original uploads
 [llm]
 max_retries         = 3                 # transport-level retries
 max_repair_attempts = 2                 # schema-repair loop (§3 reliability)
-request_timeout_s   = 60
+request_timeout_s   = 60                # generic fallback
+parser_timeout_s    = 60
+solver_timeout_s    = 180               # long teaching answers can exceed 60s
+vizcoder_timeout_s  = 120
+dialog_timeout_s    = 90
+embed_timeout_s     = 60
+stream_solver_json  = true              # Gemini structured-output streaming
+stream_vizcoder_json = true
 
 [retrieval]                             # §3.4
 embedder           = "gemini"          # "gemini" | "bge-m3"
@@ -123,7 +154,16 @@ route_weights_sparse      = 1.0
 route_weights_structural  = 1.0
 bge_m3_model       = "BAAI/bge-m3"
 bge_m3_device      = "cpu"             # "cpu" | "cuda" | "mps"
+bge_m3_dense_dim   = 1024
 wide_k_multiplier  = 3                 # per-route top-K = max(30, k · m)
+
+[dialog]                                # multi-turn tutoring memory
+model_chat                 = "gemini-3.1-pro-preview"
+recent_messages            = 10         # raw recent messages kept per turn
+max_question_context_chars = 12000      # anchor question/answer context budget
+max_summary_chars          = 3000       # rolling summary budget
+max_key_facts              = 12
+max_open_questions         = 8
 ```
 
 You can always inspect the active config at <http://localhost:3333/settings>
@@ -156,8 +196,8 @@ The compose file uses `depends_on: condition: service_healthy`, so
 Milvus waits for etcd + MinIO and Attu waits for Milvus. First boot
 takes ~90s.
 
-Collections auto-bootstrap on the first FastAPI startup (six total:
-three dense HNSW + three sparse `SPARSE_INVERTED_INDEX`). Manually:
+Collections auto-bootstrap on the first FastAPI startup (twelve total:
+six dense HNSW + six sparse `SPARSE_INVERTED_INDEX`). Manually:
 
 ```bash
 cd backend
@@ -171,6 +211,7 @@ python -m app.services.milvus_setup --doctor   # list + row counts
 cd backend
 python -m venv .venv && source .venv/bin/activate
 pip install -e .
+alembic upgrade head                     # rerun after pulling schema changes
 python -m scripts.seed_knowledge         # ~60 curriculum KnowledgePoints
 uvicorn app.main:app --reload --port 8787
 ```
@@ -184,6 +225,15 @@ npm install                               # installs acorn
 
 The Python wrapper (`app/services/viz_validator.py`) spawns
 `node validate.mjs` once per visualization.
+
+Curated solver few-shot examples live under
+`backend/app/prompts/fewshot/<subject>/<grade_band>/*.json` and are selected
+automatically by `ParsedQuestion.topic_path`.
+
+Each answered question also gets a deterministic pedagogical retrieval index:
+whole question text, whole rendered answer text, and semantic units such as
+`question_focus`, `answer_focus`, `method`, `step`, `extension`, and
+`keyword_profile`.
 
 ### 5. Frontend
 
@@ -224,12 +274,13 @@ cd frontend && npm run dev
 
 | Path | Purpose |
 |---|---|
-| `/` (Ask) | Upload image, edit parsed fields, kick off answer generation. |
-| `/q/[id]` | **Three-column layout**: left TOC rail with section completion markers · center streaming sections (KaTeX `$…$`) · right sticky viz panel with tabs per visualization, sliders/toggles. "加入练习篮" action. |
-| `/library` | Filter by subject/grade/difficulty. Semantic search runs through RRF (dense + sparse + structural); hits show per-route rank. Falls back to `0.5·cos + 0.3·pattern + 0.2·kp` when `multi_route=false`. |
-| `/knowledge` | Tree view (live/pending colors) with a right **detail panel** showing related questions (by weight) + co-occurring method patterns. **Pending** tab for promote / reject. **Prompts** tab shows the `PromptRegistry`. |
+| `/` (Ask) | Upload image, edit parsed fields, and see Gemini `1/4 解析题面` complete before starting answer generation. |
+| `/q/[id]` | **Three-column layout**: left TOC rail with section completion markers · center sections · right sticky viz panel with tabs per visualization, sliders/toggles. The page starts the remaining Gemini calls in the background (`2/4 生成解答`, `3/4 生成可视化`, `4/4 建立索引`) and polls `/api/answer/{id}/resume` for persisted `status` + section rows so long solves show clear stage progress and survive refreshes. Polling `/resume` is a UI progress read, not another solver invocation. Timeout failures now render a stage-specific error card with a retry action. |
+| `/dialog` | Persistent multi-turn tutoring chat. Sessions can be free-form or anchored to a solved question; each turn refreshes a rolling summary, key facts, and open questions, while full messages remain stored for analysis. |
+| `/library` | Filter by subject/grade/difficulty. Semantic search runs through RRF over legacy question text, whole question, whole answer, pedagogical retrieval units, and structural pattern/KP overlap; hits show per-route rank and matched unit kinds when available. Falls back to `0.5·cos + 0.3·pattern + 0.2·kp` when `multi_route=false`. |
+| `/knowledge` | Tree view (live/pending colors) with a right **detail panel** showing related questions (by weight) + co-occurring method patterns. **Pending** tab now supports promote / merge / reject for both KPs and patterns. **Prompts** tab shows the `PromptRegistry`. |
 | `/practice` | 练习篮 (localStorage) · config form (count, `难度:个数` distribution, synthesis toggle) · exam runner with 答案大纲 reveal and ✓/✗/? self-check summary. |
-| `/settings` | Current config cards (masked API key, models per task, retrieval knobs, LLM retry budgets), cost ledger dashboard (totals / per prompt·version / per day, window 1–90 days), Prompt registry. |
+| `/settings` | Current config cards (masked API key, models per task, retrieval knobs, dialog-memory budgets, LLM retry budgets), cost ledger dashboard (totals / per prompt·version / per day, window 1–90 days), dialog analytics counts, Prompt registry. |
 
 ---
 
@@ -239,8 +290,9 @@ cd frontend && npm run dev
 |---|---|---|
 | POST | `/api/ingest/image` | Upload + Parser; returns draft `question_id` + `ParsedQuestion` |
 | PATCH | `/api/ingest/{id}` | Persist edits to parsed fields |
+| POST | `/api/answer/{id}/start` | Start or reattach to the background answer job |
 | POST | `/api/answer/{id}` | **SSE** stream of `AnswerPackage` sections + visualizations + sediment |
-| GET | `/api/answer/{id}/resume` | Stored sections + visualizations — replay view after refresh |
+| GET | `/api/answer/{id}/resume` | Stored status + sections + visualizations — replay/poll view progress after refresh |
 | GET | `/api/questions/{id}` | Full persisted `AnswerPackage` |
 | GET | `/api/questions?subject=&grade_band=&difficulty_min=&difficulty_max=` | Library list |
 | POST | `/api/retrieve/similar` | `{mode: auto\|text\|kp\|pattern, query, k, filters}` |
@@ -248,6 +300,7 @@ cd frontend && npm run dev
 | GET | `/api/practice/exam/{id}` | Hydrated exam with statements, outlines, rubrics |
 | GET | `/api/knowledge/tree` | Taxonomy; filter `subject`, `grade_band`, `status` |
 | GET | `/api/knowledge/pending` | Pending KPs + patterns |
+| GET | `/api/knowledge/patterns` | List method patterns; filter `subject`, `grade_band`, `status` |
 | GET | `/api/knowledge/kp/{id}/detail` | Related questions + co-occurring patterns |
 | GET | `/api/knowledge/pattern/{id}/detail` | Related questions + pitfalls |
 | POST | `/api/knowledge/promote` | `{kind: kp\|pattern, id}` → status=live |
@@ -267,14 +320,16 @@ cd frontend && npm run dev
 image → POST /api/ingest/image
          → Parser prompt → ParsedQuestion → PG (status="parsed")
 / (Ask) → user edits parsed → PATCH /api/ingest/{id}
-/q/[id] → POST /api/answer/{id}  (SSE)
-         → Solver prompt  → AnswerPackage     → PG (status="answered")
+/q/[id] → POST /api/answer/{id}/start  (background job)
+         → poll GET /api/answer/{id}/resume
+         → Solver prompt  → AnswerPackage     → PG (status="solving" → "visualizing" → "indexing" → "answered")
          → emit: question_understanding, key_points_of_question,
                  solution_step×N, key_points_of_answer, method_pattern,
                  similar_questions, knowledge_points, self_check
          → VizCoder prompt → visualizations[]
          → per-viz acorn AST validation → PG + `visualization` events
-         → Sediment: resolve/create pattern + KP, batch-embed,
+         → Sediment: resolve/create pattern + KP, build retrieval profile,
+                     batch-embed full question/answer + semantic units,
                      near-dup (τ=0.96), upsert Milvus (dense+sparse)
          → `sediment` event (pattern_id, kp_ids, near_dup_of)
          → `done`
@@ -284,6 +339,7 @@ On refresh, /q/[id] calls GET /api/answer/{id}/resume to rehydrate.
 /library  → GET /api/questions · POST /api/retrieve/similar
 /knowledge → tree · pending · kp/{id}/detail · promote | reject | merge
 /practice  → POST /api/practice/exam · GET /api/practice/exam/{id}
+/dialog    → GET/POST /api/dialog/sessions · GET /api/dialog/stats · POST /api/dialog/sessions/{id}/messages
 /settings  → GET /api/admin/{config,llm-cost,prompts}
 ```
 
@@ -292,8 +348,8 @@ On refresh, /q/[id] calls GET /api/answer/{id}/resume to rehydrate.
 ## Retrieval strategy (M5, §3.4)
 
 ```
-                 ┌── dense   (bge-m3 or Gemini on q_emb)
-query / anchor ──┼── sparse  (bge-m3 lexical OR online BM25 on q_emb_sparse)
+                 ┌── dense   (legacy q_emb + question_full + answer_full + retrieval_units)
+query / anchor ──┼── sparse  (BM25 / bge-m3 lexical over the same four surfaces)
                  └── struct  (PG: shared pattern + KP overlap)
                           │
                           ▼
@@ -303,19 +359,63 @@ query / anchor ──┼── sparse  (bge-m3 lexical OR online BM25 on q_emb_s
               PG hydrate + difficulty filters → top-K
 ```
 
-Default: Gemini dense + BM25 sparse + structural — zero extra deps.
-For Chinese math/physics recall upgrade, flip to bge-m3:
+Fast remote mode: Gemini dense (`text-embedding-004`) + BM25 sparse +
+structural — no local model load on each query.
+
+```toml
+[gemini]
+model_embed    = "text-embedding-004"
+embed_dim      = 768
+
+[retrieval]
+embedder       = "gemini"
+sparse_encoder = "bm25"
+```
+
+For stronger local mixed-language recall, flip to bge-m3:
 
 ```toml
 [retrieval]
 embedder       = "bge-m3"
 sparse_encoder = "bge-m3"
 bge_m3_device  = "cpu"         # or "cuda" / "mps"
+bge_m3_dense_dim = 1024
 ```
 
 ```bash
-cd backend && pip install -e ".[retrieval]"   # FlagEmbedding + torch
+cd backend && pip install -e ".[retrieval]"   # FlagEmbedding + compatible transformers<5 stack
 ```
+
+For an existing deployment, a clean Gemini → bge-m3 migration is:
+
+```bash
+cd backend
+pip install -e ".[retrieval]"
+python -m app.services.milvus_setup --doctor
+python -m scripts.rebuild_retrieval_index --recreate-dense --recreate-sparse
+```
+
+Truthfully, Milvus itself does not need a special server-side config
+change for `bge-m3`. What matters is that:
+
+- you are on Milvus 2.4+ so `SPARSE_INVERTED_INDEX` is supported
+- the backend can reach `host:port`
+- dense collections are recreated when the active embedder dim changes
+  from Gemini 768 to bge-m3 1024
+
+`python -m app.services.milvus_setup --doctor` now reports the active
+dense dim and any collection mismatches. `scripts.rebuild_retrieval_index`
+rebuilds `q_emb`, `question_full_emb`, `answer_full_emb`,
+`retrieval_unit_emb`, `pattern_emb`, and `kp_emb` from PostgreSQL so
+you do not have to re-answer every old question manually.
+
+If you switch sparse encoder family (`bge-m3` ↔ `bm25`), use
+`--recreate-sparse` as well so Milvus does not keep stale sparse rows
+from the previous encoder.
+
+When using `text-embedding-004`, the backend deliberately uses
+`RETRIEVAL_QUERY` for query vectors and `RETRIEVAL_DOCUMENT` for indexed
+rows, matching Google's retrieval guidance.
 
 Set `multi_route = false` to fall back to the single-route formula
 `0.5·cos + 0.3·pattern_match + 0.2·kp_overlap` (safe when sparse
@@ -365,10 +465,15 @@ python -m scripts.smoke_parse ../data/samples/q1.jpg --subject math
 | `uvicorn` fails at import with `AssertionError` on `config.toml` | `backend/config.toml` missing | `cp config.example.toml config.toml` and set `export GEMINI_API_KEY=...` |
 | `/api/ingest/image` returns `502 parser LLM failed` | Gemini key empty / invalid / rate-limited | Check `/api/admin/config` (`api_key_configured: false`?); set `export GEMINI_API_KEY=<your_key>` and restart uvicorn |
 | `/api/answer/{id}` stream immediately emits `error` | Solver repair loop exhausted (bad schema) | Tail uvicorn logs for the pydantic `ValidationError`; consider bumping `[llm].max_repair_attempts` |
+| `/api/answer/{id}` background job fails with `TransientLLMError(timeout...)` during `2/4 生成解答` | Solver answer is taking longer than the configured timeout, or Gemini stalled before sending chunks | Raise `[llm].solver_timeout_s`; keep `stream_solver_json=true` so long JSON answers use Gemini structured streaming instead of one large blocking wait |
+| Sediment / indexing crashes with `404 NOT_FOUND` for `text-embedding-004` | The modern `google-genai` endpoint rejected that model | This repo now routes `text-embedding-004` through the legacy `google-generativeai` embedding path; if your environment still rejects it, switch `[gemini].model_embed` to `gemini-embedding-001` and rebuild Milvus |
+| `text-embedding-004` is configured but retrieval is still slow | `retrieval.sparse_encoder` is still set to `bge-m3`, so the local model still loads for sparse search | Set `[retrieval].embedder="gemini"` and `[retrieval].sparse_encoder="bm25"`, then rebuild Milvus indexes |
+| `bge-m3` import fails inside `FlagEmbedding` with a `transformers` symbol error | `FlagEmbedding 1.x` was installed alongside an incompatible `transformers` 5.x build | Re-run `cd backend && python -m pip install -e '.[retrieval]'`; the repo now pins `transformers<5` for the retrieval extra |
 | `pytest` fails with `connection refused: 5432` | Postgres not running or DSN wrong | `pg_isready -p 5432`; fix `[postgres].dsn` |
 | Milvus collections missing / `get_collection_stats` errors | Milvus still starting (~90s first boot), or `auto_bootstrap=false` | `docker compose ps` — wait for `healthy`; run `python -m app.services.milvus_setup` |
-| `/library` hits return empty despite questions in PG | Milvus collections not populated (started using the app before Milvus was up) | Re-embed by regenerating answers for existing questions, or manually repopulate via `app.services.sediment_service` |
-| Viz tile shows "可视化加载失败" with AST error | LLM used a forbidden global (e.g. `window`, `fetch`) | Expected — the sandbox rejected it. Either retry viz or rerun the Solver; see `backend/viz_validator/validate.mjs` for the allow-list |
+| Milvus doctor reports dense-dim mismatch (`actual=768`, `expected=1024`) after switching to `bge-m3` | Dense collections were created under Gemini embeddings and are now incompatible with the active embedder | Run `python -m scripts.rebuild_retrieval_index --recreate-dense --recreate-sparse` after switching `[retrieval].embedder` / `sparse_encoder` |
+| `/library` hits return empty despite questions in PG | Milvus collections not populated or still contain old vectors from a previous embedder or sparse encoder | Run `python -m scripts.rebuild_retrieval_index`; if you changed embedder or sparse-encoder family, use `--recreate-dense --recreate-sparse` |
+| Viz tile shows `可视化失败: Evaluating a string as JavaScript ... 'unsafe-eval'` | Old sandbox runtime path still loaded, or frontend dev/build server was not restarted after the sandbox runtime changed | Restart the frontend so `/viz/sandbox.html` serves the updated runtime; the current implementation no longer uses the `Function` constructor |
 | Viz never renders but no error | `public/viz/jsxgraphcore.js` missing | Re-run the two `curl` commands in [first-time setup](#5-frontend) |
 | Practice exam endpoint returns `400 no candidates match filters` | Question bank empty or over-filtered | Lower filters or answer more questions first; set `allow_synthesis=true` |
 | `/settings` cost ledger is empty | No LLM calls yet, or `PgCostLedger` failed silently | Tail uvicorn logs for `cost ledger write failed`; check Postgres connectivity |
@@ -395,11 +500,13 @@ backend/
       vizcoder_service.py  # M4 VizCoder + AST validation
       viz_validator.py     # subprocess wrapper for validate.mjs
       embedding.py         # M5 dense embedders (Gemini + bge-m3)
+      bge_m3_runtime.py    # shared local bge-m3 loader for dense+sparse heads
       sparse_encoder.py    # M5 sparse lexical (BM25 + bge-m3)
       vector_store.py      # Milvus / InMemory, dense + sparse
       rrf.py               # Reciprocal-Rank Fusion (§3.4)
       retrieval_service.py # single- + multi-route retrieval
       sediment_service.py  # M6 pattern/kp resolve + near-dup (§3.6)
+      reindex_service.py   # rebuild Milvus vectors from PostgreSQL
       exam_service.py      # M7 bank selection + LLM variant synthesis
       cost_ledger.py       # M8 PG-backed CostLedger (writes llm_calls)
       milvus_setup.py
@@ -408,6 +515,7 @@ backend/
   migrations/              # Alembic
   scripts/
     seed_knowledge.py      # M6 taxonomy seed (~60 KPs)
+    rebuild_retrieval_index.py
     smoke_parse.py
   tests/                   # 86 tests
 

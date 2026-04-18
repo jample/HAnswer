@@ -1,0 +1,97 @@
+{
+  "topic_prefix": ["力学", "运动学"],
+  "parsed_question": {
+    "subject": "physics",
+    "grade_band": "senior",
+    "topic_path": ["力学", "运动学"],
+    "question_text": "一辆汽车从静止开始做匀加速直线运动, $5\\,\\text{s}$ 内位移为 $50\\,\\text{m}$。求汽车的加速度。",
+    "given": ["初速度为 $0$", "$t=5\\,\\text{s}$", "$s=50\\,\\text{m}$"],
+    "find": ["加速度 $a$"],
+    "diagram_description": "无图, 为匀加速直线运动情境。",
+    "difficulty": 2,
+    "tags": ["运动学", "匀加速"],
+    "confidence": 0.98
+  },
+  "answer_package": {
+    "question_understanding": {
+      "restated_question": "已知初速度、时间和位移, 用匀变速位移公式求加速度。",
+      "givens": ["$v_0=0$", "$t=5\\,\\text{s}$", "$s=50\\,\\text{m}$"],
+      "unknowns": ["$a$"],
+      "implicit_conditions": ["匀加速直线运动满足 $s=v_0t+\\frac12at^2$"]
+    },
+    "key_points_of_question": [
+      "先识别运动模型是匀加速直线运动",
+      "题目给的是位移而不是末速度"
+    ],
+    "solution_steps": [
+      {
+        "step_index": 1,
+        "statement": "写出位移公式",
+        "rationale": "匀加速直线运动满足 $s=v_0t+\\frac12at^2$。",
+        "formula": "$50=0\\times 5+\\frac12 a\\times 5^2$",
+        "why_this_step": "位移公式直接包含题目给出的三个量, 是最短路径。",
+        "viz_ref": "viz_motion_curve"
+      },
+      {
+        "step_index": 2,
+        "statement": "代入数据求解",
+        "rationale": "化简得 $50=12.5a$, 所以 $a=4\\,\\text{m/s}^2$。",
+        "formula": "$a=4\\,\\text{m/s}^2$",
+        "why_this_step": "代入后是一元一次方程, 直接求未知量即可。",
+        "viz_ref": "viz_motion_curve"
+      }
+    ],
+    "key_points_of_answer": [
+      "同一模型下要选最直接对应已知量的公式",
+      "物理量单位必须一并检查"
+    ],
+    "method_pattern": {
+      "pattern_id_suggested": "new:力学>运动学>匀变速位移公式",
+      "name_cn": "匀变速位移公式求参量",
+      "when_to_use": "匀变速直线运动中, 已知位移、时间和部分初末条件, 需要求加速度或初速度时使用。",
+      "general_procedure": [
+        "先确认是否满足匀变速直线运动条件",
+        "选择包含已知量和目标量的位移或速度公式",
+        "代入数值并检查单位"
+      ],
+      "pitfalls": [
+        "把位移公式误写成速度公式",
+        "忽略初速度为零这个简化条件"
+      ]
+    },
+    "similar_questions": [
+      {
+        "statement": "物体从静止出发, $4\\,\\text{s}$ 内位移 $32\\,\\text{m}$, 求加速度。",
+        "answer_outline": "由 $s=\\frac12at^2$ 得 $a=4\\,\\text{m/s}^2$。",
+        "same_pattern": true,
+        "difficulty_delta": -1
+      },
+      {
+        "statement": "列车以 $2\\,\\text{m/s}$ 的初速度匀加速行驶, $3\\,\\text{s}$ 内位移 $15\\,\\text{m}$, 求加速度。",
+        "answer_outline": "由 $15=2\\times3+\\frac12a\\times9$ 求得 $a=2\\,\\text{m/s}^2$。",
+        "same_pattern": true,
+        "difficulty_delta": 0
+      },
+      {
+        "statement": "已知匀加速运动的位移和末速度, 求时间与加速度。",
+        "answer_outline": "联立位移公式与速度公式求解。",
+        "same_pattern": true,
+        "difficulty_delta": 1
+      }
+    ],
+    "knowledge_points": [
+      {
+        "node_ref": "new:力学>运动学>匀变速直线运动",
+        "weight": 0.95
+      },
+      {
+        "node_ref": "new:力学>运动学>位移公式",
+        "weight": 0.75
+      }
+    ],
+    "self_check": [
+      "把求出的加速度代回位移公式再算一遍",
+      "检查结果单位是否为 $\\text{m/s}^2$"
+    ]
+  }
+}

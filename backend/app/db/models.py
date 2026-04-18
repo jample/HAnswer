@@ -27,7 +27,7 @@ from sqlalchemy import (
     func,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
 class Base(DeclarativeBase):
@@ -93,6 +93,38 @@ class AnswerPackageSection(Base):
 
     __table_args__ = (
         Index("ix_answer_packages_question_id", "question_id"),
+    )
+
+
+class QuestionRetrievalProfile(Base):
+    __tablename__ = "question_retrieval_profiles"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    question_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("questions.id", ondelete="CASCADE"),
+        nullable=False, unique=True,
+    )
+    profile_json: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = _created_at()
+
+
+class RetrievalUnitRow(Base):
+    __tablename__ = "retrieval_units"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    question_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("questions.id", ondelete="CASCADE"), nullable=False,
+    )
+    unit_kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    keywords_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=list)
+    weight: Mapped[float] = mapped_column(Numeric(4, 3), nullable=False, default=1.0)
+    source_section: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    created_at: Mapped[datetime] = _created_at()
+
+    __table_args__ = (
+        Index("ix_retrieval_units_question_kind", "question_id", "unit_kind"),
     )
 
 
@@ -234,6 +266,72 @@ class ExamItem(Base):
     synthesized_payload_json: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     answer_outline: Mapped[str] = mapped_column(Text, nullable=False, default="")
     rubric: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+
+class ConversationSession(Base):
+    __tablename__ = "conversation_sessions"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    question_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("questions.id", ondelete="SET NULL"), nullable=True,
+    )
+    title: Mapped[str] = mapped_column(String(256), nullable=False, default="新对话")
+    latest_summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    key_facts_json: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    open_questions_json: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    last_message_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=func.now(), nullable=False,
+    )
+    created_at: Mapped[datetime] = _created_at()
+
+    __table_args__ = (
+        Index("ix_conversation_sessions_last_message_at", "last_message_at"),
+        Index("ix_conversation_sessions_question_id", "question_id"),
+    )
+
+
+class ConversationMessage(Base):
+    __tablename__ = "conversation_messages"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("conversation_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    sequence_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    metadata_json: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = _created_at()
+
+    __table_args__ = (
+        Index("ix_conversation_messages_conversation", "conversation_id", "sequence_no"),
+        UniqueConstraint(
+            "conversation_id", "sequence_no", name="uq_conversation_messages_sequence_no",
+        ),
+        CheckConstraint(
+            "role IN ('user','assistant','system')", name="ck_conversation_messages_role",
+        ),
+    )
+
+
+class ConversationMemorySnapshot(Base):
+    __tablename__ = "conversation_memory_snapshots"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("conversation_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    sequence_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    key_facts_json: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    open_questions_json: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    created_at: Mapped[datetime] = _created_at()
+
+    __table_args__ = (
+        Index("ix_conversation_memory_snapshots_conversation", "conversation_id", "sequence_no"),
+    )
 
 
 class LLMCall(Base):

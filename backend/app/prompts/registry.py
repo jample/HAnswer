@@ -10,6 +10,7 @@ Registration is automatic at import time (see `__init__.py`).
 from __future__ import annotations
 
 from app.prompts.base import PromptTemplate
+from app.prompts.dialog_prompt import DialogPrompt
 from app.prompts.parser_prompt import ParserPrompt
 from app.prompts.solver_prompt import SolverPrompt
 from app.prompts.variant_synth_prompt import VariantSynthPrompt
@@ -19,6 +20,7 @@ from app.prompts.vizcoder_prompt import VizCoderPrompt
 class _Registry:
     def __init__(self) -> None:
         self._templates: dict[str, PromptTemplate] = {}
+        self._register(DialogPrompt())
         self._register(ParserPrompt())
         self._register(SolverPrompt())
         self._register(VizCoderPrompt())

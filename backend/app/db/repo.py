@@ -10,10 +10,19 @@ import hashlib
 import uuid
 from pathlib import Path
 
+from sqlalchemy import delete
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import IngestImage, Question
+from app.db.models import (
+    AnswerPackageSection,
+    IngestImage,
+    Question,
+    QuestionKPLink,
+    QuestionPatternLink,
+    SolutionStepRow,
+    VisualizationRow,
+)
 from app.schemas import ParsedQuestion
 
 
@@ -84,6 +93,15 @@ async def get_question(session: AsyncSession, question_id: uuid.UUID) -> Questio
     return await session.get(Question, question_id)
 
 
+async def get_image_for_question(
+    session: AsyncSession, question_id: uuid.UUID,
+) -> IngestImage | None:
+    q = await get_question(session, question_id)
+    if q is None or q.image_id is None:
+        return None
+    return await session.get(IngestImage, q.image_id)
+
+
 async def update_parsed(
     session: AsyncSession,
     *,
@@ -107,3 +125,65 @@ async def update_parsed(
     q.difficulty = validated.difficulty
     await session.flush()
     return q
+
+
+async def replace_parsed(
+    session: AsyncSession,
+    *,
+    question_id: uuid.UUID,
+    parsed: ParsedQuestion,
+) -> Question:
+    q = await session.get(Question, question_id)
+    if q is None:
+        raise KeyError(f"question {question_id} not found")
+    q.parsed_json = parsed.model_dump(mode="json")
+    q.subject = parsed.subject
+    q.grade_band = parsed.grade_band
+    q.difficulty = parsed.difficulty
+    q.answer_package_json = None
+    q.status = "parsed"
+    await session.flush()
+    return q
+
+
+async def set_question_image(
+    session: AsyncSession,
+    *,
+    question_id: uuid.UUID,
+    image_id: uuid.UUID,
+    dedup_hash: str,
+) -> Question:
+    q = await session.get(Question, question_id)
+    if q is None:
+        raise KeyError(f"question {question_id} not found")
+
+    existing = await get_question_by_dedup(session, dedup_hash)
+    if existing is not None and existing.id != question_id:
+        raise ValueError(f"dedup hash already belongs to question {existing.id}")
+
+    q.image_id = image_id
+    q.dedup_hash = dedup_hash
+    await session.flush()
+    return q
+
+
+async def clear_generated_content(
+    session: AsyncSession,
+    *,
+    question_id: uuid.UUID,
+) -> None:
+    await session.execute(
+        delete(AnswerPackageSection).where(AnswerPackageSection.question_id == question_id),
+    )
+    await session.execute(
+        delete(SolutionStepRow).where(SolutionStepRow.question_id == question_id),
+    )
+    await session.execute(
+        delete(VisualizationRow).where(VisualizationRow.question_id == question_id),
+    )
+    await session.execute(
+        delete(QuestionKPLink).where(QuestionKPLink.question_id == question_id),
+    )
+    await session.execute(
+        delete(QuestionPatternLink).where(QuestionPatternLink.question_id == question_id),
+    )

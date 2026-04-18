@@ -51,6 +51,12 @@ export default function VizSandbox({ vizId, jsxCode, params = [], height = 360 }
     );
   }, [ready, jsxCode]);
 
+  useEffect(() => {
+    return () => {
+      iframeRef.current?.contentWindow?.postMessage({ type: 'dispose' }, '*');
+    };
+  }, []);
+
   function updateParam(name: string, value: unknown) {
     initialParams.current = { ...initialParams.current, [name]: value };
     iframeRef.current?.contentWindow?.postMessage(

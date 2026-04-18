@@ -1,0 +1,97 @@
+{
+  "topic_prefix": ["几何", "三角形", "相似三角形"],
+  "parsed_question": {
+    "subject": "math",
+    "grade_band": "junior",
+    "topic_path": ["几何", "三角形", "相似三角形"],
+    "question_text": "在 $\\triangle ABC$ 中, $DE \\parallel BC$, 且 $D,E$ 分别在 $AB,AC$ 上。已知 $AD=3$, $AB=6$, $AC=10$, 求 $AE$。",
+    "given": ["$DE \\parallel BC$", "$AD=3$", "$AB=6$", "$AC=10$"],
+    "find": ["$AE$"],
+    "diagram_description": "三角形 ABC 中, 线段 DE 连接 AB 与 AC 上的点 D,E 且平行于底边 BC。",
+    "difficulty": 2,
+    "tags": ["几何", "相似"],
+    "confidence": 0.97
+  },
+  "answer_package": {
+    "question_understanding": {
+      "restated_question": "利用平行得到三角形相似, 再求线段 $AE$。",
+      "givens": ["$DE \\parallel BC$", "$AD:AB=3:6$"],
+      "unknowns": ["$AE$ 的长度"],
+      "implicit_conditions": ["平行线对应角相等可推出相似三角形"]
+    },
+    "key_points_of_question": [
+      "看见平行线要联想到相似三角形",
+      "先找出对应边, 再列比例式"
+    ],
+    "solution_steps": [
+      {
+        "step_index": 1,
+        "statement": "判断三角形相似",
+        "rationale": "因为 $DE \\parallel BC$, 所以对应角相等, 得 $\\triangle ADE \\sim \\triangle ABC$。",
+        "formula": "$\\triangle ADE \\sim \\triangle ABC$",
+        "why_this_step": "只有先建立相似, 才能把已知线段关系转化成比例。",
+        "viz_ref": "viz_similar_ratio"
+      },
+      {
+        "step_index": 2,
+        "statement": "列比例求解",
+        "rationale": "由相似得 $\\frac{AD}{AB}=\\frac{AE}{AC}=\\frac{3}{6}=\\frac12$。",
+        "formula": "$AE=\\frac12 \\times 10=5$",
+        "why_this_step": "相似比直接把已知边长映射到目标边。",
+        "viz_ref": "viz_similar_ratio"
+      }
+    ],
+    "key_points_of_answer": [
+      "平行线是相似三角形的常见触发条件",
+      "比例式要确保对应边一一匹配"
+    ],
+    "method_pattern": {
+      "pattern_id_suggested": "new:几何>三角形>平行线判相似",
+      "name_cn": "平行线判相似",
+      "when_to_use": "在三角形中出现一条与某边平行的线段时, 常用来构造相似三角形。",
+      "general_procedure": [
+        "观察平行关系并写出相等角",
+        "判断两个三角形相似",
+        "根据对应边列出比例并求未知量"
+      ],
+      "pitfalls": [
+        "把对应边写反",
+        "只写相似结论却没有利用比例计算"
+      ]
+    },
+    "similar_questions": [
+      {
+        "statement": "在相同条件下, 已知 $AD=2$, $AB=4$, $AC=6$, 求 $AE$。",
+        "answer_outline": "由相似比 $\\frac{AE}{6}=\\frac{2}{4}$, 得 $AE=3$。",
+        "same_pattern": true,
+        "difficulty_delta": -1
+      },
+      {
+        "statement": "在 $\\triangle ABC$ 中, $DE \\parallel BC$, 已知 $AD:AB=2:5$, $AC=15$, 求 $AE$。",
+        "answer_outline": "由相似得 $AE:15=2:5$, 所以 $AE=6$。",
+        "same_pattern": true,
+        "difficulty_delta": 0
+      },
+      {
+        "statement": "在平行线构成的图形中同时求两条线段之比。",
+        "answer_outline": "先判相似, 再联立两组比例式求解。",
+        "same_pattern": true,
+        "difficulty_delta": 1
+      }
+    ],
+    "knowledge_points": [
+      {
+        "node_ref": "new:几何>三角形>相似三角形",
+        "weight": 0.95
+      },
+      {
+        "node_ref": "new:几何>平行线性质",
+        "weight": 0.6
+      }
+    ],
+    "self_check": [
+      "确认比例式中的对应边顺序一致",
+      "计算完成后看结果是否小于整条边 $AC$"
+    ]
+  }
+}

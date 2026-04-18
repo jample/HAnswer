@@ -13,6 +13,7 @@ dependencies = [
     "alembic>=1.13",
     "pymilvus>=2.4",
     "google-genai>=0.3",
+    "google-generativeai>=0.8,<1",
     "httpx>=0.27",
     "python-multipart>=0.0.9",
     "sse-starlette>=2.1",
@@ -31,6 +32,8 @@ retrieval = [
     # BAAI/bge-m3 dense + sparse embeddings (M5, §3.4).
     # Only needed if retrieval.embedder or retrieval.sparse_encoder is "bge-m3".
     "FlagEmbedding>=1.2",
+    # FlagEmbedding 1.x is not compatible with transformers 5.x.
+    "transformers<5",
 ]
 
 [project.scripts]

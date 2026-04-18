@@ -84,5 +84,5 @@ async def test_admin_config_masks_secrets():
 
         # Retrieval config echoed; required keys present.
         r_cfg = body["retrieval"]
-        for k in ("embedder", "sparse_encoder", "multi_route", "rrf_k"):
+        for k in ("embedder", "sparse_encoder", "multi_route", "rrf_k", "active_dense_dim"):
             assert k in r_cfg

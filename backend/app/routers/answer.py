@@ -15,11 +15,16 @@ from app.db import repo
 from app.db.models import AnswerPackageSection, VisualizationRow
 from app.db.session import session_scope
 from app.schemas import AnswerPackage
+from app.services.answer_job_service import (
+    build_pipeline_snapshot,
+    get_answer_job_state,
+    start_answer_job,
+)
 from app.services.embedding import build_dense_embedder
 from app.services.llm_client import LLMError
 from app.services.llm_deps import get_llm_client
 from app.services.sediment_service import sediment
-from app.services.solver_service import generate_answer
+from app.services.solver_service import _sections, generate_answer
 from app.services.sparse_encoder import get_sparse_encoder
 from app.services.vector_store import VectorStore, get_vector_store
 from app.services.vizcoder_service import generate_visualizations
@@ -35,6 +40,20 @@ async def _session():
         yield s
 
 
+@router.post("/{question_id}/start")
+async def start_answer_job_endpoint(
+    question_id: UUID,
+    session: AsyncSession = Depends(_session),
+) -> dict:
+    q = await repo.get_question(session, question_id)
+    if q is None:
+        raise HTTPException(404, "question not found")
+    try:
+        return await start_answer_job(question_id)
+    except KeyError:
+        raise HTTPException(404, "question not found")
+
+
 @router.post("/{question_id}")
 async def start_answer(
     question_id: UUID,
@@ -48,10 +67,24 @@ async def start_answer(
 
     async def _gen():
         try:
+            yield {
+                "event": "status",
+                "data": json.dumps({
+                    "stage": "solver",
+                    "message": "正在调用 Gemini 生成完整教学型答案，复杂题可能需要几十秒。",
+                }, ensure_ascii=False),
+            }
             async for ev in generate_answer(
                 session, question_id=question_id, llm=llm,
             ):
                 yield {"event": ev.name, "data": json.dumps(ev.data, ensure_ascii=False)}
+            yield {
+                "event": "status",
+                "data": json.dumps({
+                    "stage": "vizcoder",
+                    "message": "答案已生成，正在补充可视化。",
+                }, ensure_ascii=False),
+            }
             # Viz stage is a separate prompt (§7.2.3). Its own errors surface
             # as per-viz `error` events, not a whole-stream failure.
             async for ev in generate_visualizations(
@@ -63,6 +96,13 @@ async def start_answer(
             q = await repo.get_question(session, question_id)
             if q is not None and q.answer_package_json is not None:
                 try:
+                    yield {
+                        "event": "status",
+                        "data": json.dumps({
+                            "stage": "sediment",
+                            "message": "正在写入知识点、方法模式与检索索引。",
+                        }, ensure_ascii=False),
+                    }
                     pkg = AnswerPackage.model_validate(q.answer_package_json)
                     result = await sediment(
                         session,
@@ -89,6 +129,13 @@ async def start_answer(
                         "data": json.dumps({"stage": "sediment", "message": str(e)}),
                     }
 
+            yield {
+                "event": "status",
+                "data": json.dumps({
+                    "stage": "done",
+                    "message": "解答完成。",
+                }, ensure_ascii=False),
+            }
             yield {"event": "done", "data": json.dumps({"question_id": str(question_id)})}
         except KeyError:
             yield {"event": "error", "data": json.dumps({"message": "question not found"})}
@@ -125,6 +172,15 @@ async def resume_answer(
         {"section": s.section, "payload": s.payload_json}
         for s in sec_rows
     ]
+    if not sections and q.answer_package_json is not None:
+        try:
+            pkg = AnswerPackage.model_validate(q.answer_package_json)
+            sections = [
+                {"section": ev.name, "payload": ev.data}
+                for ev in _sections(pkg)
+            ]
+        except Exception:  # pragma: no cover - defensive fallback
+            log.exception("resume fallback failed to rebuild sections")
 
     viz_rows = (await session.execute(
         select(VisualizationRow)
@@ -145,13 +201,22 @@ async def resume_answer(
         for v in viz_rows
     ]
 
+    job = get_answer_job_state(question_id)
     return {
         "question_id": str(q.id),
         "status": q.status,
+        "job": job,
+        "pipeline": build_pipeline_snapshot(
+            question_status=q.status,
+            has_parsed=bool(q.parsed_json),
+            has_answer=q.answer_package_json is not None,
+            visualizations_generated=bool(visualizations),
+            job_state=job,
+        ),
         "answer_package": q.answer_package_json,
         "sections": sections,
         "visualizations": visualizations,
-        "complete": q.answer_package_json is not None,
+        "complete": q.status == "answered",
     }
 
 
