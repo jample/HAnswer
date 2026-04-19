@@ -48,6 +48,7 @@ type SimilarHit = {
   question_text: string;
   pattern_name: string | null;
   shared_kp_names: string[] | null;
+  solution_id?: string | null;
 };
 
 const muted = { color: '#888', fontSize: 12 } as const;
@@ -274,7 +275,7 @@ export default function LibraryPage() {
           )}
         <ol style={{ paddingLeft: 20, marginTop: 16 }}>
           {textResults.map((h) => (
-            <li key={h.question_id} style={{ marginBottom: 8 }}>
+            <li key={h.question_id + (h.solution_id ?? '')} style={{ marginBottom: 8 }}>
               <Link href={`/q/${h.question_id}`} style={{ color: '#0366d6', textDecoration: 'none' }}>
                 <div className="q-text-preview">
                   <RichText text={h.question_text || '(无文本)'} />

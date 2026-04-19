@@ -315,7 +315,11 @@ async def resume_answer(
         *[row for row in parsed_stage_reviews if row.get("stage") == "parsed"],
         *solution_reviews,
     ]
-    job = get_answer_job_state(question_id, solution.id if solution is not None else None)
+    job = await get_answer_job_state(
+        session,
+        question_id,
+        solution.id if solution is not None else None,
+    )
     solutions = [serialize_solution(row) for row in await list_solutions(session, question_id=question_id)]
     return {
         "question_id": str(q.id),

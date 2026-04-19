@@ -21,6 +21,7 @@ Resolution rules:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
@@ -36,9 +37,10 @@ from app.db.models import (
     Question,
     QuestionKPLink,
     QuestionPatternLink,
+    RetrievalUnitRow,
 )
 from app.schemas import AnswerPackage, KnowledgePointRef, MethodPattern, ParsedQuestion
-from app.services.embedding import DenseEmbedder
+from app.services.embedding import DenseEmbedder, EmbedItem, TaskKind
 from app.services.indexer_service import build_pedagogical_index, persist_pedagogical_index
 from app.services.solution_ref_service import decode_solution_ref, encode_solution_ref
 from app.services.sparse_encoder import SparseEncoder
@@ -48,6 +50,57 @@ log = logging.getLogger(__name__)
 
 
 NEAR_DUP_THRESHOLD = 0.96  # §3.6.3
+
+# Display labels used in v2 embedding ``title:`` slots.
+SUBJECT_TITLE_CN = {"math": "数学", "physics": "物理"}
+GRADE_BAND_TITLE_CN = {"junior": "初中", "senior": "高中"}
+
+
+def _hash_text(text: str) -> str:
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+def _read_sig(owner, key: str) -> str | None:  # type: ignore[no-untyped-def]
+    """Read the prior embedding signature off a row.
+
+    ``Question.embedding_sigs`` is a JSONB dict keyed by surface
+    (``qfull`` / ``afull``); every other table holds a single string
+    in ``embedding_sig``.
+    """
+    if isinstance(owner, Question):
+        sigs = owner.embedding_sigs or {}
+        value = sigs.get(key)
+        return str(value) if isinstance(value, str) else None
+    value = getattr(owner, "embedding_sig", None)
+    return str(value) if isinstance(value, str) else None
+
+
+def _write_sig(owner, key: str, sig: str) -> None:  # type: ignore[no-untyped-def]
+    if isinstance(owner, Question):
+        sigs = dict(owner.embedding_sigs or {})
+        sigs[key] = sig
+        owner.embedding_sigs = sigs
+        return
+    owner.embedding_sig = sig
+
+
+@dataclass
+class _Surface:
+    collection: str
+    ref_id: str
+    text: str
+    task_kind: TaskKind
+    title: str
+    sig_owner: object
+    sig_key: str
+    subject: str
+    grade_band: str
+    difficulty: int = 0
+    unit_kind: str = ""
+    new_sig: str = ""
+    prior_sig: str | None = None
+    needs_embed: bool = True
+    dense_vec: list[float] | None = None
 
 
 @dataclass
@@ -275,8 +328,18 @@ async def sediment(
         units=index.units,
     )
 
-    # 3. Embeddings — batched single call to save tokens.
-    q_text = q.parsed_json.get("question_text", "") if q.parsed_json else ""
+    # 3. Build the embedding plan ────────────────────────────────────
+    #
+    # One ``_Surface`` per (collection, ref_id). Each surface carries:
+    #   - the text to embed,
+    #   - its task_kind / title (so v2 picks the right embedding head),
+    #   - the SHA256 signature we need to compare against the row's
+    #     ``embedding_sig(s)`` to decide whether to skip the call.
+    #
+    # We then split surfaces into "to_embed" (sig changed or first run)
+    # and "skipped" (sig unchanged → vector already in Milvus). Only
+    # to_embed surfaces incur a Gemini call + a Milvus upsert.
+
     question_full_text = index.profile.query_texts.question_full_text
     answer_full_text = index.profile.query_texts.answer_full_text
     pattern_summary = "\n".join([
@@ -289,140 +352,189 @@ async def sediment(
         node = await session.get(KnowledgePoint, kpid)
         if node is not None:
             kp_rows.append(node)
-    kp_texts = [f"{r.name_cn}\n{r.path_cached}" for r in kp_rows]
-
-    retrieval_unit_texts = [row.text for row in retrieval_unit_rows]
-
-    texts_to_embed = [
-        q_text,
-        question_full_text,
-        answer_full_text,
-        pattern_summary,
-        *kp_texts,
-        *retrieval_unit_texts,
-    ]
-    await _maybe_report(
-        progress,
-        f"调用 Gemini Embedding 生成稠密向量 ({len(texts_to_embed)} 段文本)…",
-    )
-    vectors = await embedding.embed_many(texts_to_embed)
-    q_vec = vectors[0]
-    question_full_vec = vectors[1]
-    answer_full_vec = vectors[2]
-    pattern_vec = vectors[3]
-    kp_start = 4
-    kp_end = kp_start + len(kp_texts)
-    kp_vecs = vectors[kp_start:kp_end]
-    retrieval_unit_vecs = vectors[kp_end:]
 
     solution_ref = encode_solution_ref(question_id=question_id, solution_id=solution_id)
+    subject_label = SUBJECT_TITLE_CN.get(q.subject, q.subject)
+    band_label = GRADE_BAND_TITLE_CN.get(q.grade_band, q.grade_band)
+    kp_path_title = " / ".join(
+        sorted({r.path_cached for r in kp_rows if r.path_cached})
+    ) or "未分类"
+    pattern_title = package.method_pattern.name_cn or "未命名方法"
 
-    # 4. Near-dup check before writing q_emb so self-match doesn't trigger.
-    near_dup_of: uuid.UUID | None = None
-    hits = await vector_store.search(
-        "q_emb",
-        vector=q_vec,
-        k=3,
-        subject=q.subject,
-        grade_band=q.grade_band,
-    )
-    for h in hits:
-        parsed_ref = decode_solution_ref(h.ref_id)
-        if parsed_ref is None:
-            continue
-        hit_question_id, _hit_solution_id = parsed_ref
-        if hit_question_id == question_id:
-            continue
-        if h.score >= NEAR_DUP_THRESHOLD:
-            near_dup_of = hit_question_id
-            break
-
-    # 5. Upserts — fan out concurrently to Milvus.
-    total_dense = 4 + len(kp_rows) + len(retrieval_unit_rows)
-    await _maybe_report(
-        progress,
-        f"写入向量数据库 (稠密 {total_dense} 条)…",
-    )
-    dense_jobs: list[Awaitable[None]] = [
-        vector_store.upsert(
-            "q_emb", ref_id=solution_ref, vector=q_vec,
-            subject=q.subject, grade_band=q.grade_band, difficulty=q.difficulty,
+    surfaces: list[_Surface] = [
+        _Surface(
+            collection="question_full_emb",
+            ref_id=solution_ref,
+            text=question_full_text,
+            task_kind="RETRIEVAL_DOCUMENT",
+            title=f"{subject_label} · {band_label} · {kp_path_title}",
+            sig_owner=q,
+            sig_key="qfull",
+            subject=q.subject,
+            grade_band=q.grade_band,
+            difficulty=q.difficulty,
         ),
-        vector_store.upsert(
-            "question_full_emb", ref_id=solution_ref, vector=question_full_vec,
-            subject=q.subject, grade_band=q.grade_band, difficulty=q.difficulty,
+        _Surface(
+            collection="answer_full_emb",
+            ref_id=solution_ref,
+            text=answer_full_text,
+            # Answers serve QA-style queries (the question text). Gemini
+            # docs explicitly recommend QUESTION_ANSWERING for the
+            # corpus side of QA retrieval.
+            task_kind="QUESTION_ANSWERING",
+            title=f"{subject_label} · 答 · {pattern_title}",
+            sig_owner=q,
+            sig_key="afull",
+            subject=q.subject,
+            grade_band=q.grade_band,
+            difficulty=q.difficulty,
         ),
-        vector_store.upsert(
-            "answer_full_emb", ref_id=solution_ref, vector=answer_full_vec,
-            subject=q.subject, grade_band=q.grade_band, difficulty=q.difficulty,
-        ),
-        vector_store.upsert(
-            "pattern_emb", ref_id=str(pattern_row.id), vector=pattern_vec,
-            subject=q.subject, grade_band=q.grade_band,
+        _Surface(
+            collection="pattern_emb",
+            ref_id=str(pattern_row.id),
+            text=pattern_summary,
+            # Pattern vectors are clustered by similarity, not retrieved
+            # against arbitrary queries → CLUSTERING gives a tighter
+            # neighborhood geometry on the same corpus.
+            task_kind="CLUSTERING",
+            title=pattern_title,
+            sig_owner=pattern_row,
+            sig_key="main",
+            subject=q.subject,
+            grade_band=q.grade_band,
         ),
     ]
-    for row, vec in zip(kp_rows, kp_vecs):
-        dense_jobs.append(vector_store.upsert(
-            "kp_emb", ref_id=str(row.id), vector=vec,
-            subject=row.subject, grade_band=row.grade_band,
+    for kp_row in kp_rows:
+        surfaces.append(_Surface(
+            collection="kp_emb",
+            ref_id=str(kp_row.id),
+            text=f"{kp_row.name_cn}\n{kp_row.path_cached}",
+            task_kind="CLUSTERING",
+            title=kp_row.path_cached or kp_row.name_cn,
+            sig_owner=kp_row,
+            sig_key="main",
+            subject=kp_row.subject,
+            grade_band=kp_row.grade_band,
         ))
-        row.embedding_ref = str(row.id)
-    pattern_row.embedding_ref = str(pattern_row.id)
-    for row, vec in zip(retrieval_unit_rows, retrieval_unit_vecs):
-        dense_jobs.append(vector_store.upsert(
-            "retrieval_unit_emb", ref_id=str(row.id), vector=vec,
-            subject=q.subject, grade_band=q.grade_band,
-            difficulty=q.difficulty, unit_kind=row.unit_kind,
+    for unit_row in retrieval_unit_rows:
+        surfaces.append(_Surface(
+            collection="retrieval_unit_emb",
+            ref_id=str(unit_row.id),
+            text=unit_row.text,
+            task_kind="RETRIEVAL_DOCUMENT",
+            title=f"{unit_row.unit_kind} · {unit_row.title}".strip(" ·"),
+            sig_owner=unit_row,
+            sig_key="main",
+            subject=q.subject,
+            grade_band=q.grade_band,
+            difficulty=q.difficulty,
+            unit_kind=unit_row.unit_kind,
         ))
-    await asyncio.gather(*dense_jobs)
 
-    # 5b. Sparse lexical upserts (M5 multi-route). The sparse encoder
-    # accumulates corpus statistics here so future queries get real
-    # IDF weighting.
-    if sparse_encoder is not None and getattr(vector_store, "supports_sparse", False):
+    # Compute new sigs and decide which surfaces are stale.
+    for s in surfaces:
+        s.new_sig = _hash_text(s.text)
+        s.prior_sig = _read_sig(s.sig_owner, s.sig_key)
+        s.needs_embed = s.prior_sig != s.new_sig
+
+    to_embed = [s for s in surfaces if s.needs_embed]
+    skipped_count = len(surfaces) - len(to_embed)
+
+    # 4. Embed only stale surfaces ────────────────────────────────────
+    if to_embed:
         await _maybe_report(
             progress,
-            f"写入稀疏向量索引 (BM25 / bge-m3, {len(texts_to_embed)} 条)…",
+            f"调用 Gemini Embedding 生成稠密向量 ("
+            f"{len(to_embed)} 段文本{f', {skipped_count} 段命中签名缓存' if skipped_count else ''})…",
         )
-        sparse_vecs = await sparse_encoder.encode(texts_to_embed)
-        sp_q = sparse_vecs[0]
-        sp_question_full = sparse_vecs[1]
-        sp_answer_full = sparse_vecs[2]
-        sp_pat = sparse_vecs[3]
-        sp_kps = sparse_vecs[kp_start:kp_end]
-        sp_units = sparse_vecs[kp_end:]
-        sparse_jobs: list[Awaitable[None]] = [
-            vector_store.upsert_sparse(
-                "q_emb", ref_id=solution_ref, sparse=sp_q,
-                subject=q.subject, grade_band=q.grade_band, difficulty=q.difficulty,
-            ),
-            vector_store.upsert_sparse(
-                "question_full_emb", ref_id=solution_ref, sparse=sp_question_full,
-                subject=q.subject, grade_band=q.grade_band, difficulty=q.difficulty,
-            ),
-            vector_store.upsert_sparse(
-                "answer_full_emb", ref_id=solution_ref, sparse=sp_answer_full,
-                subject=q.subject, grade_band=q.grade_band, difficulty=q.difficulty,
-            ),
-            vector_store.upsert_sparse(
-                "pattern_emb", ref_id=str(pattern_row.id), sparse=sp_pat,
-                subject=q.subject, grade_band=q.grade_band,
-            ),
+        items = [
+            EmbedItem(text=s.text, task_kind=s.task_kind, title=s.title)
+            for s in to_embed
         ]
-        for row, sp in zip(kp_rows, sp_kps):
-            sparse_jobs.append(vector_store.upsert_sparse(
-                "kp_emb", ref_id=str(row.id), sparse=sp,
-                subject=row.subject, grade_band=row.grade_band,
-            ))
-        for row, sp in zip(retrieval_unit_rows, sp_units):
-            sparse_jobs.append(vector_store.upsert_sparse(
-                "retrieval_unit_emb", ref_id=str(row.id), sparse=sp,
-                subject=q.subject, grade_band=q.grade_band,
-                difficulty=q.difficulty, unit_kind=row.unit_kind,
-            ))
-        await asyncio.gather(*sparse_jobs)
+        vectors = await embedding.embed_documents(items)
+        for s, vec in zip(to_embed, vectors, strict=True):
+            s.dense_vec = vec
+    elif skipped_count:
+        await _maybe_report(
+            progress,
+            f"全部 {skipped_count} 段文本命中签名缓存,跳过 Gemini Embedding 调用",
+        )
 
-    # 6. Near-dup: bump evidence on the canonical question.
+    # 5. Near-dup check ───────────────────────────────────────────────
+    #
+    # Uses ``question_full_emb`` (canonical question vector) so the
+    # legacy ``q_emb`` collection can be retired. We only run the probe
+    # when we *just* re-embedded the question — if the question's
+    # signature was unchanged the dedupe verdict is unchanged too.
+    near_dup_of: uuid.UUID | None = None
+    qfull_surface = surfaces[0]  # question_full_emb is always position 0
+    if qfull_surface.dense_vec is not None:
+        hits = await vector_store.search(
+            "question_full_emb",
+            vector=qfull_surface.dense_vec,
+            k=3,
+            subject=q.subject,
+            grade_band=q.grade_band,
+        )
+        for h in hits:
+            parsed_ref = decode_solution_ref(h.ref_id)
+            if parsed_ref is None:
+                continue
+            hit_question_id, _hit_solution_id = parsed_ref
+            if hit_question_id == question_id:
+                continue
+            if h.score >= NEAR_DUP_THRESHOLD:
+                near_dup_of = hit_question_id
+                break
+
+    # 6. Upserts (dense + sparse) for stale surfaces only ─────────────
+    if to_embed:
+        await _maybe_report(
+            progress,
+            f"写入向量数据库 (稠密 {len(to_embed)} 条)…",
+        )
+        dense_jobs: list[Awaitable[None]] = []
+        for s in to_embed:
+            dense_jobs.append(vector_store.upsert(
+                s.collection,
+                ref_id=s.ref_id,
+                vector=s.dense_vec or [],
+                subject=s.subject,
+                grade_band=s.grade_band,
+                difficulty=s.difficulty,
+                unit_kind=s.unit_kind,
+            ))
+        await asyncio.gather(*dense_jobs)
+
+        if sparse_encoder is not None and getattr(vector_store, "supports_sparse", False):
+            await _maybe_report(
+                progress,
+                f"写入稀疏向量索引 (BM25 / bge-m3, {len(to_embed)} 条)…",
+            )
+            sparse_vecs = await sparse_encoder.encode([s.text for s in to_embed])
+            sparse_jobs: list[Awaitable[None]] = []
+            for s, sp in zip(to_embed, sparse_vecs, strict=True):
+                sparse_jobs.append(vector_store.upsert_sparse(
+                    s.collection,
+                    ref_id=s.ref_id,
+                    sparse=sp,
+                    subject=s.subject,
+                    grade_band=s.grade_band,
+                    difficulty=s.difficulty,
+                    unit_kind=s.unit_kind,
+                ))
+            await asyncio.gather(*sparse_jobs)
+
+        # Persist new sigs + cross-table embedding refs.
+        for s in to_embed:
+            _write_sig(s.sig_owner, s.sig_key, s.new_sig)
+
+    # Maintain the legacy embedding_ref columns the UI still inspects.
+    pattern_row.embedding_ref = str(pattern_row.id)
+    for kp_row in kp_rows:
+        kp_row.embedding_ref = str(kp_row.id)
+
+    # 7. Near-dup: bump evidence on the canonical question.
     if near_dup_of is not None:
         canonical = await session.get(Question, near_dup_of)
         if canonical is not None:

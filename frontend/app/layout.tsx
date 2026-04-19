@@ -17,7 +17,6 @@ export default function RootLayout({ children }: { children: ReactNode }) {
           <span className="app-logo-sub">学习伙伴</span>
           <nav className="app-nav">
             <Link href="/" className="nav-link">提问</Link>
-            <Link href="/dialog" className="nav-link">对话</Link>
             <Link href="/library" className="nav-link">题库</Link>
             <Link href="/practice" className="nav-link">练习</Link>
             <Link href="/knowledge" className="nav-link">知识</Link>

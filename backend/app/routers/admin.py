@@ -60,6 +60,7 @@ async def read_config() -> dict:
             "database": settings.milvus.database,
             "auto_bootstrap": settings.milvus.auto_bootstrap,
             "recreate_dense_on_dim_mismatch": settings.milvus.recreate_dense_on_dim_mismatch,
+            "auto_reindex_on_bootstrap_change": settings.milvus.auto_reindex_on_bootstrap_change,
         },
         "retrieval": {
             **settings.retrieval.model_dump(),

@@ -14,7 +14,7 @@ model_vizcoder = "gemini-3.1-pro-preview" # text, AnswerPackage -> visualization
 #   - "gemini-embedding-001"       via google-genai path
 #   - "text-embedding-004"         via legacy google-generativeai path
 model_embed    = "gemini-embedding-2-preview"
-embed_dim      = 768  # model default 3072; 768 recommended for storage efficiency
+embed_dim      = 1536  # MRL prefix; 1536 ≈ 50% storage of 3072, negligible recall delta
 
 [postgres]
 dsn = "postgresql+asyncpg://jianbo@localhost:5432/jianbo"
@@ -26,10 +26,11 @@ database = "default"
 # Auto-create the dense + sparse collections on FastAPI startup if
 # missing. Set to false if you provision Milvus schemas out-of-band.
 auto_bootstrap = true
-# Leave false in normal operation. Turn on only if you intentionally
-# want startup to drop+recreate dense collections after an embedder
-# dim change (for example Gemini 768 -> bge-m3 1024).
-recreate_dense_on_dim_mismatch = false
+# PostgreSQL is the source of truth in this repo, so startup may
+# drop+recreate dense collections after a dim change and then rebuild
+# Milvus from PostgreSQL automatically.
+recreate_dense_on_dim_mismatch = true
+auto_reindex_on_bootstrap_change = true
 
 [server]
 host = "127.0.0.1"
@@ -45,11 +46,12 @@ image_dir = "./data/images"
 max_retries = 2
 max_repair_attempts = 2
 request_timeout_s = 60
-parser_timeout_s = 60
-solver_timeout_s = 180
-vizcoder_timeout_s = 120
+parser_timeout_s = 120
+solver_timeout_s = 300
+vizcoder_timeout_s = 240
 dialog_timeout_s = 90
 embed_timeout_s = 60
+stream_recovery_timeout_s = 300
 stream_solver_json = true
 stream_vizcoder_json = true
 

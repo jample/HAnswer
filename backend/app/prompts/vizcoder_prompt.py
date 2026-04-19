@@ -23,6 +23,8 @@ R=(x(K)+2*cos(t), y(K)+2*sin(t))
 
 ## 2. 线 / 圆 / 多边形
 l=Line(A,B)
+l=Line((0,c),(c,0))
+l=Line(P, Vector((1,-1)))
 s=Segment(A,B)
 c=Circle((0,0),2)
 c=Circle(A,B,C)
@@ -48,6 +50,22 @@ SetAnimating(a, true)
 SetAnimationSpeed(a, 1)
 StartAnimation()
 SetTrace(P, true)
+
+## 5.5 交互参数约定
+- ggb_commands 只负责“定义对象”, 例如 `a=Slider(-3,3,0.1)`、`flag=false`。
+- 不要在 ggb_commands 中写 `SetValue(a, 1.2)` / `SetValue(flag, true)`。
+- 初始值写到 params[].default; 前端会在 GeoGebra 对象创建后自动同步 default。
+- 若某个滑块/开关出现在 params 里, ggb_commands 中必须有同名定义。
+
+## 5.6 条件显示 (重要)
+- 不要使用 `SetConditionToShowObject(obj, expr)` —— 它是 GUI 属性命令,
+  Apps API 的 evalCommand 不接受。
+- 用条件定义实现“开关切换显示”: 把对象本身写成 `If(...)` 形式,
+  条件为假时对象未定义, GeoGebra 自动不绘制。示例:
+  `polyMaxTop=If(isMin==false, Polygon((0,1),(6,1),(6,3),(0,3)))`
+  `lMin1=If(isMin, Line((0, 2*sqrt(6)-3), (2*sqrt(6), -3)))`
+- 互斥的两组对象 (如最大情形 / 最小情形), 用同一布尔条件分别写两组
+  `If(...)`, 学生切换 toggle 时整组对象消失/出现。
 
 ## 6. 文字 / LaTeX
 SetCaption(A, "起点")
@@ -75,6 +93,10 @@ ggb_settings = {
   禁止 `P=K+(dx,dy)` 与 `Translate(K, Vector(...))`。
 - Vector 写 `Vector((dx,dy))` (单个点元组) 或 `Vector(P,Q)` (两点);
   禁止 `Vector((dx),(dy))` (两个标量参数)。
+- `Line(...)` 只能用 GeoGebra 支持的签名: `Line(Point,Point)`、
+    `Line(Point,Vector)`、`Line(Point,ParallelLine)`。
+    禁止 `Line(x+y=c)` / `Line(ax+by=c)` 这种把方程包进 Line(...) 的写法;
+    这在 Apps API 中会失败。请改写成两点式或点+方向向量式。
 - 样式命令 `SetColor(obj, 255, 0, 0)`, `SetLineStyle(obj, 2)`,
   `SetLineThickness(obj, 3)`, `SetPointSize(obj, 5)` —— SetColor 必须用 RGB 三元组,
   禁止色名字符串。
@@ -207,6 +229,8 @@ class VizCoderPrompt(PromptTemplate):
     - 默认令 ggb_settings.perspective="G"; 3D 题用 "T"。不要打开 Algebra/
         Tools/Table 面板, 不要生成额外表格型界面。
   - 通过 Slider(...) 创建滑块; SetAnimating(s, true) + StartAnimation() 触发动画。
+    - 滑块/开关的初始值放进 params[].default, 不要在 ggb_commands 里写 SetValue(...)
+        去二次赋值。
     - 视图范围、网格、坐标轴放进 ggb_settings.coord_system / grid_visible /
         axes_visible, 不要把 SetCoordSystem / SetGridVisible / SetAxesVisible 写进
         ggb_commands。
@@ -230,7 +254,7 @@ class VizCoderPrompt(PromptTemplate):
     一致, 让学生一眼对上 "这个滑块就是解答第 N 步里的 t"。
 - 在动笔之前, 先按下列顺序通读 AnswerPackage:
   1. method_pattern / key_insight — 决定整组图的主题。
-  2. solution_steps[] — 找出最关键、最难想象的 1-3 步, 为它们各配一张图;
+  2. solution_steps[] — 找出最关键、最难想象的 2-3 步, 为它们各配一张图;
      若该步已有 viz_ref, 沿用同一 id, caption_cn 中复述该步的核心结论。
   3. formulas — 出现的关键公式 (函数表达式、几何关系、向量关系) 应在图中
      可视化体现 (画出函数曲线、几何对象、向量等)。
@@ -238,8 +262,13 @@ class VizCoderPrompt(PromptTemplate):
      边界、临界角等), 优先做成可切换/可拖动的对比图。
   5. answer_summary / final_answer — 图中标注最终结果 (交点坐标、距离、
      极值点等), 让学生在图上直接看到答案。
-- 生成 1-3 个可视化, 每图必须有清晰的 learning_goal (一句话, 与所配步骤
-  的目标一致)。
+- **必须生成 3-4 个可视化** (面向中学应考场景; 需覆盖解答中
+  不同的关键阶段)。
+  - 需要为 AnswerPackage.solution_steps[] 中出现的不同关键阶段各配一张图,
+    每个关键阶段只能出现一次, 不要重复。
+  - 若题目含分类讨论 (pitfalls / 有多个情形), 必须为每种情形提供对应的
+    可视化, 要么拆成多张图, 要么用可切换的同一张图。
+  - 每图必须有清晰的 learning_goal (一句话, 与所配步骤的目标一致)。
 - 若需要交互, 在 params 中声明滑块/开关。
   - 对 GeoGebra: params 中 slider 应与 ggb_commands 中 name=Slider(...) 同名,
     前端会通过 setValue() 把控件值同步进 GeoGebra。
@@ -262,12 +291,24 @@ class VizCoderPrompt(PromptTemplate):
   `aAng`/`bAng`/`tAng` 这类 ASCII 名, 并通过
   `SetCaption(aAng, "α")` 把希腊字母作为显示标签呈现给学生 ——
   ggb_commands 中的标识符与界面/解答里看到的符号一致, 只是改了底层名。
+- 对象名不要覆盖 GeoGebra 内置名 (`xAxis`, `yAxis`, `zAxis`, `xOyPlane`,
+  `xOzPlane`, `yOzPlane`, 常量 `e`, `i`)。要画辅助轴请另起名如 `lineX=Line((0,0),(1,0))`,
+  要显示坐标轴直接依靠 ggb_settings.axes_visible 即可。
 - 依赖另一个点的位移必须写坐标式: `P=(x(K)+dx, y(K)+dy)`。
   禁止 `P=K+(dx,dy)` 简写, 也禁止 `Translate(K, Vector(...))` (Apps API 内联 Vector 解析不稳定)。
 - Vector 仅接受单个点元组或两点: 写 `Vector((dx,dy))` 或 `Vector(P,Q)`。
   禁止 `Vector((dx),(dy))` (两个标量, GeoGebra 拒绝)。
+- `Line` 仅使用 GeoGebra 官方支持签名: `Line(P,Q)`、`Line(P,Vector((dx,dy)))`、
+    `Line(P, existingLine)`。禁止 `Line(ax+by=c)` / `Line(x+y=p1)` 这类方程包装;
+    要画隐式方程对应的直线时, 请直接给出两点式或点+方向向量式。
 - SetColor 必须用 RGB 三元组: `SetColor(obj, 255, 0, 0)`。禁止 `SetColor(obj, "Red")` 等色名。
 - 单条命令 ≤ 512 字符, 总命令数 ≤ 64。
+- 禁止在 ggb_commands 中出现 `SetValue(name, value)`。
+    - 定义交互对象时写 `name=Slider(...)` 或 `name=true/false`。
+    - 初始值统一写入 params[].default, 前端会在对象创建后调用 GeoGebra API 同步。
+- 禁止在 ggb_commands 中出现 `SetConditionToShowObject(name, expr)`。
+    - 改为条件定义 `name=If(expr, OriginalDefinition)`。条件为假时对象未定义,
+      GeoGebra 自动隐藏, 等价于显示条件。
 - 上述规则会在后端被严格校验; 任意违例都会触发整段 JSON 重新生成。
 
 __GGB__
@@ -298,12 +339,38 @@ __SCHEMA__
     def user_message(self, **kwargs: Any) -> str:
         answer_package: dict = kwargs["answer_package"]
         parsed_question: dict = kwargs["parsed_question"]
+        steps = answer_package.get("solution_steps") or []
+        pitfalls = (answer_package.get("method_pattern") or {}).get("pitfalls") or []
+        step_lines = []
+        for s in steps:
+            idx = s.get("step_index", "?")
+            stmt = (s.get("statement") or "").strip().replace("\n", " ")
+            if len(stmt) > 80:
+                stmt = stmt[:80] + "…"
+            ref = s.get("viz_ref") or ""
+            tag = f" (viz_ref={ref})" if ref else ""
+            step_lines.append(f"  - step {idx}: {stmt}{tag}")
+        pitfall_lines = [f"  - {p}" for p in pitfalls]
+        coverage_hint = (
+            "\n\n## 覆盖要求 (必须遵守)\n"
+            "- 从上面的 solution_steps 中选出 **至少 3 个关键阶段** 各配一张图,\n"
+            "  并在每张图的 caption_cn 中明确写出对应的 step 编号 (例如 “对应解答 step 2”)。\n"
+            "- 若某些 step 的 viz_ref 已给出, 优先为它们生成, id 必须同名。\n"
+            "- pitfalls 中的分类讨论/临界情形必须有一张可切换的对比图覆盖,\n"
+            "  不能漏。\n"
+            "- visualizations 数量 3-4 个; 绝不可交 1–2 个, 也不要超过 4 个。\n"
+        )
+        steps_block = "\n## 待覆盖的 solution_steps\n" + ("\n".join(step_lines) or "  (无)")
+        pitfalls_block = "\n\n## 待覆盖的 pitfalls\n" + ("\n".join(pitfall_lines) or "  (无)")
         return (
             "## ParsedQuestion\n"
             + json.dumps(parsed_question, indent=2, ensure_ascii=False)
             + "\n\n## AnswerPackage (不含 visualizations)\n"
             + json.dumps(answer_package, indent=2, ensure_ascii=False)
-            + "\n\n请基于上面的 AnswerPackage 生成 1-3 个交互式可视化"
+            + steps_block
+            + pitfalls_block
+            + coverage_hint
+            + "\n请基于上面的 AnswerPackage 生成 3-4 个交互式可视化"
             + ' (默认 engine="geogebra")。'
             + "\n要求:"
             + "\n- 在写命令前, 先列出 ParsedQuestion / AnswerPackage 中已经"
@@ -317,4 +384,6 @@ __SCHEMA__
             + "或几何对象, 让学生看到答案如何在图上呈现。"
             + "\n- 若 solution_steps[].viz_ref 已写出 id, 沿用同 id 以便前端"
             + "把图锚定到该步骤。"
+            + "\n- 对于 params 中的 slider/toggle, ggb_commands 里只定义同名对象,"
+            + "不要再写 SetValue(name, ...); 初始值放到 params[].default。"
         )

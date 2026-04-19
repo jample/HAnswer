@@ -13,6 +13,7 @@ from sqlalchemy import select
 from app.db import models
 from app.db.session import session_scope
 from app.main import app
+from app.services import answer_job_service
 
 
 @pytest.mark.asyncio
@@ -93,6 +94,72 @@ async def test_resume_404_on_missing_question():
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         r = await c.get(f"/api/answer/{uuid.uuid4()}/resume")
         assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_resume_restores_job_state_from_persisted_status_after_restart():
+    marker = f"resume-status-{uuid.uuid4().hex[:8]}"
+
+    async with session_scope() as s:
+        q = models.Question(
+            parsed_json={
+                "subject": "math",
+                "grade_band": "senior",
+                "topic_path": [],
+                "question_text": marker,
+                "given": [],
+                "find": [],
+                "diagram_description": "",
+                "difficulty": 2,
+                "tags": [],
+                "confidence": 0.9,
+            },
+            answer_package_json=None,
+            subject="math", grade_band="senior", difficulty=2,
+            dedup_hash=hashlib.sha1(marker.encode()).hexdigest(),
+            seen_count=1, status="solving",
+        )
+        s.add(q)
+        await s.flush()
+        qid = q.id
+
+        s.add(models.AnswerPackageSection(
+            question_id=qid,
+            section="status",
+            payload_json={
+                "stage": "solving",
+                "message": "正在调用 Gemini 生成完整教学型答案，复杂题可能需要几十秒。",
+                "call_index": 2,
+                "total_calls": 4,
+                "label": "生成解答",
+            },
+        ))
+
+    answer_job_service._states.clear()
+    answer_job_service._tasks.clear()
+
+    try:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as c:
+            r = await c.get(f"/api/answer/{qid}/resume")
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert body["job"]["running"] is False
+            assert body["job"]["stage"] == "solving"
+            assert body["job"]["message"] == "正在调用 Gemini 生成完整教学型答案，复杂题可能需要几十秒。"
+            assert body["job"]["call_index"] == 2
+    finally:
+        async with session_scope() as s:
+            await s.execute(
+                delete(models.AnswerPackageSection)
+                .where(models.AnswerPackageSection.question_id == qid)
+            )
+            await s.execute(
+                delete(models.QuestionStageReview)
+                .where(models.QuestionStageReview.question_id == qid)
+            )
+            await s.execute(delete(models.Question).where(models.Question.id == qid))
+            await s.commit()
 
 
 @pytest.mark.asyncio

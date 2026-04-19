@@ -3,7 +3,7 @@
 Two retrieval strategies:
 
   1. `similar_questions()` — single-route hybrid. Runs dense ANN on
-     `q_emb` and applies the weighted formula
+     `question_full_emb` and applies the weighted formula
         score = 0.5·cos + 0.3·pattern_match + 0.2·kp_overlap
      in a post-hoc rerank. Kept for backward compatibility and for
      deployments that don't need the sparse/structural routes.
@@ -128,6 +128,42 @@ def _profile_pattern_name(profile: dict) -> str | None:
     return labels[0] if labels else None
 
 
+async def _lookup_text_context(
+    session: AsyncSession,
+    text: str,
+    subject: str | None = None,
+) -> tuple[set[str], set[str]]:
+    """Find patterns and KPs whose names appear in *text*.
+
+    This populates source_patterns/source_kps for text-mode queries so
+    the structural route can participate in RRF fusion.
+    """
+    if not text:
+        return set(), set()
+
+    patterns: set[str] = set()
+    kps: set[str] = set()
+
+    pat_stmt = select(MethodPatternRow.name_cn)
+    if subject:
+        pat_stmt = pat_stmt.where(MethodPatternRow.subject == subject)
+    for (name,) in (await session.execute(pat_stmt)).all():
+        if name and name in text:
+            patterns.add(name)
+
+    kp_stmt = select(KnowledgePoint.name_cn, KnowledgePoint.path_cached)
+    if subject:
+        kp_stmt = kp_stmt.where(KnowledgePoint.subject == subject)
+    for (name_cn, path_cached) in (await session.execute(kp_stmt)).all():
+        # Match if name appears in query text or query text appears in path.
+        if name_cn and name_cn in text:
+            kps.add(name_cn)
+        elif path_cached and any(seg in text for seg in path_cached.split("/") if len(seg) >= 2):
+            kps.add(name_cn)
+
+    return patterns, kps
+
+
 async def _question_context(
     session: AsyncSession,
     *,
@@ -151,6 +187,14 @@ def _filter_solution_refs(raw_ids: list[str], excluded_questions: set[uuid.UUID]
         seen.add(ref_id)
         out.append(ref_id)
     return out
+
+
+def _ref_matches_excluded_question(ref_id: str, excluded_questions: set[uuid.UUID]) -> bool:
+    parsed = decode_solution_ref(ref_id)
+    if parsed is None:
+        return False
+    qid, _sid = parsed
+    return qid in excluded_questions
 
 
 def _merge_unit_match_maps(
@@ -209,6 +253,7 @@ async def _hydrate_hit(
     *,
     ref_id: str,
     score: float,
+    cosine: float = 0.0,
     source_patterns: set[str],
     source_kps: set[str],
     query: SimilarQuery,
@@ -248,7 +293,7 @@ async def _hydrate_hit(
         question_id=str(qid),
         solution_id=str(solution_id) if solution_id else None,
         score=score,
-        cosine=0.0,
+        cosine=cosine,
         pattern_match=pattern_match,
         kp_overlap=kp_overlap,
         subject=q.subject,
@@ -332,7 +377,7 @@ async def similar_questions(
 
     vec = await embedding.embed_one(text_for_embed)
     raw_hits = await vector_store.search(
-        "q_emb",
+        "question_full_emb",
         vector=vec,
         k=max(query.k * 3, 30),
         subject=subject,
@@ -360,6 +405,7 @@ async def similar_questions(
             session,
             ref_id=h.ref_id,
             score=(0.5 * cos + 0.3 * pattern_match + 0.2 * kp_overlap),
+            cosine=cos,
             source_patterns=source_patterns,
             source_kps=source_kps,
             query=query,
@@ -429,8 +475,8 @@ async def similar_questions_multi_route(
     """Three-route hybrid retrieval with RRF fusion (§3.4).
 
     Routes:
-      - dense:      ANN on q_emb with the dense embedding.
-      - sparse:     BM25 / bge-m3 lexical weights on q_emb_sparse.
+      - dense:      ANN on question_full_emb / answer_full_emb / retrieval_unit_emb.
+      - sparse:     BM25 / bge-m3 lexical weights on the *_sparse companions.
       - structural: PG counts of shared pattern + KP links (no ANN).
 
     Route weights + RRF damping constant come from
@@ -471,6 +517,9 @@ async def similar_questions_multi_route(
         if not query.query:
             return []
         text_for_embed = query.query
+        source_patterns, source_kps = await _lookup_text_context(
+            session, text_for_embed, subject=subject,
+        )
     elif query.mode == "kp":
         if not query.kp_id:
             return []
@@ -496,15 +545,11 @@ async def similar_questions_multi_route(
     # ── Run three routes in parallel ─────────────────────────────
     matched_units: dict[str, dict[str, set[str]]] = {}
 
-    async def _dense() -> list[str]:
+    async def _dense() -> tuple[list[str], dict[str, float]]:
         if not text_for_embed:
-            return []
+            return [], {}
         vec = await embedding.embed_one(text_for_embed)
-        legacy_hits, question_full_hits, answer_full_hits, unit_hits = await asyncio.gather(
-            vector_store.search(
-                "q_emb", vector=vec, k=wide_k,
-                subject=subject, grade_band=grade_band,
-            ),
+        question_full_hits, answer_full_hits, unit_hits = await asyncio.gather(
             vector_store.search(
                 "question_full_emb", vector=vec, k=wide_k,
                 subject=subject, grade_band=grade_band,
@@ -524,9 +569,18 @@ async def similar_questions_multi_route(
             excluded=excluded,
         )
         _merge_unit_match_maps(matched_units, unit_match_map)
+
+        # Collect best dense score per ref_id across all sub-collections.
+        raw_dense_scores: dict[str, float] = {}
+        for h in question_full_hits + answer_full_hits + unit_hits:
+            if _ref_matches_excluded_question(h.ref_id, excluded):
+                continue
+            prev = raw_dense_scores.get(h.ref_id)
+            if prev is None or h.score > prev:
+                raw_dense_scores[h.ref_id] = h.score
+
         fused = rrf_fuse(
             routes={
-                "legacy_q": _filter_solution_refs([h.ref_id for h in legacy_hits], excluded),
                 "question_full": _filter_solution_refs(
                     [h.ref_id for h in question_full_hits], excluded,
                 ),
@@ -537,7 +591,7 @@ async def similar_questions_multi_route(
             },
             k=rc.rrf_k,
         )
-        return [h.ref_id for h in fused]
+        return [h.ref_id for h in fused], raw_dense_scores
 
     async def _sparse() -> list[str]:
         if not text_for_embed or not vector_store.supports_sparse:
@@ -545,11 +599,7 @@ async def similar_questions_multi_route(
         sv = await sparse.encode_one(text_for_embed)
         if not sv:
             return []
-        legacy_hits, question_full_hits, answer_full_hits, unit_hits = await asyncio.gather(
-            vector_store.search_sparse(
-                "q_emb", sparse=sv, k=wide_k,
-                subject=subject, grade_band=grade_band,
-            ),
+        question_full_hits, answer_full_hits, unit_hits = await asyncio.gather(
             vector_store.search_sparse(
                 "question_full_emb", sparse=sv, k=wide_k,
                 subject=subject, grade_band=grade_band,
@@ -571,9 +621,6 @@ async def similar_questions_multi_route(
         _merge_unit_match_maps(matched_units, unit_match_map)
         fused = rrf_fuse(
             routes={
-                "legacy_q_sparse": _filter_solution_refs(
-                    [h.ref_id for h in legacy_hits], excluded,
-                ),
                 "question_full_sparse": _filter_solution_refs(
                     [h.ref_id for h in question_full_hits], excluded,
                 ),
@@ -595,7 +642,7 @@ async def similar_questions_multi_route(
             k=wide_k, excluded=excluded,
         )
 
-    dense_ids, sparse_ids, struct_ids = await asyncio.gather(
+    (dense_ids, raw_dense_scores), sparse_ids, struct_ids = await asyncio.gather(
         _dense(), _sparse(), _structural()
     )
 
@@ -614,10 +661,15 @@ async def similar_questions_multi_route(
     # ── Hydrate + apply final PG filters (difficulty, etc.) ──────
     hydrated: list[Hit] = []
     for fh in fused:
+        dense_ip = raw_dense_scores.get(fh.ref_id, 0.0)
+        # Milvus HNSW with metric_type=IP returns inner product.
+        # For normalized vectors IP ≈ cosine; clamp to [0, 1].
+        cos = max(0.0, min(1.0, dense_ip))
         hit = await _hydrate_hit(
             session,
             ref_id=fh.ref_id,
             score=fh.score,
+            cosine=cos,
             source_patterns=source_patterns,
             source_kps=source_kps,
             query=query,

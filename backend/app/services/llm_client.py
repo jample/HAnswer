@@ -207,7 +207,7 @@ class GeminiClient:
 
     @retry(
         stop=stop_after_attempt(settings.llm.max_retries),
-        wait=wait_exponential(multiplier=1, min=1, max=12),
+        wait=wait_exponential(multiplier=2, min=2, max=30),
         retry=retry_if_exception_type(TransientLLMError),
         before_sleep=before_sleep_log(log, logging.WARNING, exc_info=True),
         reraise=True,
@@ -264,15 +264,38 @@ class GeminiClient:
         raw_json = ""
         t0 = time.perf_counter()
         ptok = ctok = 0
+        use_stream = stream
 
         while attempt <= settings.llm.max_repair_attempts:
-            raw_json, ptok, ctok = await self._raw_call(
-                model=model,
-                messages=messages,
-                response_schema=template.schema,
-                timeout_s=resolved_timeout_s,
-                stream=stream,
-            )
+            try:
+                raw_json, ptok, ctok = await self._raw_call(
+                    model=model,
+                    messages=messages,
+                    response_schema=template.schema,
+                    timeout_s=resolved_timeout_s,
+                    stream=use_stream,
+                )
+            except TransientLLMError:
+                if not use_stream:
+                    raise
+                recovery_timeout_s = max(
+                    resolved_timeout_s,
+                    settings.llm.stream_recovery_timeout_s,
+                )
+                log.warning(
+                    "streaming structured call failed; retrying once via non-stream "
+                    "path (stream_timeout=%ss, recovery_timeout=%ss)",
+                    resolved_timeout_s,
+                    recovery_timeout_s,
+                )
+                raw_json, ptok, ctok = await self._raw_call(
+                    model=model,
+                    messages=messages,
+                    response_schema=template.schema,
+                    timeout_s=recovery_timeout_s,
+                    stream=False,
+                )
+                use_stream = False
             try:
                 parsed = model_cls.model_validate_json(raw_json)
                 latency = int((time.perf_counter() - t0) * 1000)
@@ -310,6 +333,7 @@ class GeminiClient:
                     },
                 ]
                 attempt += 1
+                use_stream = False
 
         latency = int((time.perf_counter() - t0) * 1000)
         await self.ledger.record(
@@ -374,6 +398,7 @@ class GeminiClient:
         ptok = ctok = 0
         t0 = time.perf_counter()
         full_text_parts: list[str] = []
+        stream_error: Exception | None = None
 
         try:
             async for chunk in iter_fn(
@@ -390,10 +415,32 @@ class GeminiClient:
                     ptok = chunk.prompt_tokens
                 if chunk.completion_tokens:
                     ctok = chunk.completion_tokens
-        except TimeoutError as e:
-            raise TransientLLMError(
-                f"timeout after {resolved_timeout_s}s: {e}"
-            ) from e
+        except (TimeoutError, TransientLLMError) as e:
+            stream_error = e
+
+        if stream_error is not None:
+            recovery_timeout_s = max(
+                resolved_timeout_s,
+                settings.llm.stream_recovery_timeout_s,
+            )
+            log.warning(
+                "streaming transport failed; falling back to bulk structured call "
+                "(stream_timeout=%ss, recovery_timeout=%ss): %s",
+                resolved_timeout_s,
+                recovery_timeout_s,
+                stream_error,
+            )
+            parsed = await self.call_structured(
+                template=template,
+                model=model,
+                model_cls=model_cls,
+                template_kwargs=template_kwargs,
+                messages_override=messages_override,
+                timeout_s=recovery_timeout_s,
+                stream=False,
+            )
+            yield parsed
+            return
 
         raw_json = "".join(full_text_parts)
         try:

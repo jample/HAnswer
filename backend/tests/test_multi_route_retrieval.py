@@ -9,6 +9,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import uuid
 
 import pytest
 
@@ -19,12 +20,14 @@ from app.services.ingest_service import ingest_image
 from app.services.llm_client import FakeTransport, GeminiClient
 from app.services.retrieval_service import (
     SimilarQuery,
+    _ref_matches_excluded_question,
     similar_questions_multi_route,
 )
 from app.services.rrf import fuse
 from app.services.sediment_service import sediment
 from app.services.solver_service import generate_answer
 from app.services.sparse_encoder import BM25SparseEncoder
+from app.services.solution_ref_service import encode_solution_ref
 from app.services.vector_store import InMemoryVectorStore
 
 # Reuse fixtures + canned packages from the existing test module.
@@ -68,6 +71,14 @@ def test_rrf_respects_weights():
 def test_rrf_handles_empty_routes():
     assert fuse({}) == []
     assert fuse({"dense": []}) == []
+
+
+def test_solution_ref_exclusion_decodes_uuid_question_ids():
+    qid = uuid.uuid4()
+    sid = uuid.uuid4()
+    ref_id = encode_solution_ref(question_id=qid, solution_id=sid)
+    assert _ref_matches_excluded_question(ref_id, {qid}) is True
+    assert _ref_matches_excluded_question(ref_id, {uuid.uuid4()}) is False
 
 
 # ── BM25 encoder ────────────────────────────────────────────────────

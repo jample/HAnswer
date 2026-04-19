@@ -14,6 +14,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 
 from sqlalchemy import delete, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.db import repo
@@ -129,6 +130,15 @@ def _job_key(question_id: uuid.UUID | str, solution_id: uuid.UUID | str | None =
     qid = str(question_id)
     sid = str(solution_id) if solution_id is not None else "question"
     return f"{qid}:{sid}"
+
+
+def _parse_uuid(value: object) -> uuid.UUID | None:
+    if value in (None, ""):
+        return None
+    try:
+        return uuid.UUID(str(value))
+    except (TypeError, ValueError, AttributeError):
+        return None
 
 
 def _serialize_viz_row(row: VisualizationRow) -> dict:
@@ -270,6 +280,7 @@ async def _set_stage(
             "total_calls": 4,
             "label": str(meta["label"]),
             "description": str(meta["description"]),
+            "solution_id": str(solution_id) if solution_id else None,
         },
         clear_prior_status=True,
     )
@@ -299,6 +310,18 @@ async def _append_error(
         error=str(payload.get("message") or message),
     )
     await _set_question_status(question_id, "error")
+    # Also update the solution status so /resume returns "error" for the
+    # solution path (not just the question-level status).
+    if solution_id is not None:
+        try:
+            async with session_scope() as session:
+                from app.db.models import QuestionSolution
+                sol = await session.get(QuestionSolution, solution_id)
+                if sol is not None:
+                    sol.status = "error"
+                    await session.flush()
+        except Exception:  # noqa: BLE001
+            log.warning("failed to update solution %s status to error", solution_id)
     await _append_section(
         question_id,
         section="error",
@@ -319,6 +342,7 @@ async def _append_error(
             "label": last.label if last else stage,
             "kind": payload.get("kind"),
             "hint": payload.get("hint"),
+            "solution_id": str(solution_id) if solution_id else None,
         },
         clear_prior_status=True,
     )
@@ -388,6 +412,7 @@ async def _mark_stage_ready_for_review(
             "label": str(meta["label"]),
             "description": str(meta["description"]),
             "needs_confirmation": True,
+            "solution_id": str(solution_id) if solution_id else None,
         },
         clear_prior_status=True,
     )
@@ -735,6 +760,20 @@ async def start_answer_job(
         label="等待开始",
         message=f"等待开始 Gemini {int(meta['call_index'])}/4 · {str(meta['label'])}",
     )
+    await _append_section(
+        question_id,
+        section="status",
+        payload={
+            "stage": stage,
+            "message": f"等待开始 Gemini {int(meta['call_index'])}/4 · {str(meta['label'])}",
+            "call_index": int(meta["call_index"]),
+            "total_calls": 4,
+            "label": "等待开始",
+            "description": str(meta["description"]),
+            "solution_id": str(resolved_solution_id),
+        },
+        clear_prior_status=True,
+    )
     return {
         "question_id": qid,
         "solution_id": str(resolved_solution_id),
@@ -807,6 +846,7 @@ async def confirm_stage(
                     "call_index": 4,
                     "total_calls": 4,
                     "label": "全部完成",
+                    "solution_id": str(resolved_solution_id) if resolved_solution_id else None,
                 },
                 clear_prior_status=True,
             )
@@ -907,11 +947,148 @@ async def reject_and_rerun_stage(
     return await start_answer_job(question_id, from_stage=stage, solution_id=resolved_solution_id)
 
 
-def get_answer_job_state(question_id: uuid.UUID, solution_id: uuid.UUID | None = None) -> dict:
+def _state_from_status_payload(
+    question_id: uuid.UUID,
+    payload: dict | None,
+    *,
+    solution_id: uuid.UUID | None,
+) -> JobState | None:
+    if not payload:
+        return None
+    payload_solution_id = payload.get("solution_id")
+    if solution_id is not None and payload_solution_id not in (None, "", str(solution_id)):
+        return None
+    stage = str(
+        payload.get("failed_stage")
+        or payload.get("review_stage")
+        or payload.get("stage")
+        or ""
+    )
+    persisted_stage = str(payload.get("stage") or "")
+    needs_confirmation = bool(payload.get("needs_confirmation"))
+    done = persisted_stage in {"done", "error"} or needs_confirmation
+    error = str(payload.get("message") or "") if persisted_stage == "error" else None
+    return JobState(
+        question_id=str(question_id),
+        solution_id=str(solution_id) if solution_id else None,
+        stage=stage,
+        call_index=int(payload.get("call_index") or 0),
+        total_calls=int(payload.get("total_calls") or 4),
+        label=str(payload.get("label") or ""),
+        message=str(payload.get("message") or ""),
+        done=done,
+        error=error,
+    )
+
+
+def _should_recover_persisted_job(payload: dict | None, state: JobState | None) -> bool:
+    if not payload or state is None or state.done:
+        return False
+    if payload.get("needs_confirmation"):
+        return False
+    persisted_stage = str(payload.get("stage") or "")
+    if persisted_stage in {"", "done", "error"}:
+        return False
+    return state.stage in _STAGE_META
+
+
+async def _load_persisted_job_state(
+    session: AsyncSession,
+    *,
+    question_id: uuid.UUID,
+    solution_id: uuid.UUID | None,
+) -> JobState | None:
+    rows = (await session.execute(
+        select(AnswerPackageSection)
+        .where(AnswerPackageSection.question_id == question_id)
+        .where(AnswerPackageSection.section == "status")
+        .order_by(AnswerPackageSection.created_at.desc())
+    )).scalars().all()
+    for row in rows:
+        state = _state_from_status_payload(
+            question_id,
+            row.payload_json,
+            solution_id=solution_id,
+        )
+        if state is not None:
+            return state
+    return None
+
+
+async def recover_inflight_answer_jobs() -> int:
+    """Re-enqueue persisted in-flight jobs after a process restart."""
+    candidates: list[tuple[uuid.UUID, uuid.UUID | None, str]] = []
+    seen: set[str] = set()
+
+    async with session_scope() as session:
+        rows = (await session.execute(
+            select(AnswerPackageSection)
+            .where(AnswerPackageSection.section == "status")
+            .order_by(AnswerPackageSection.created_at.desc())
+        )).scalars().all()
+
+        for row in rows:
+            payload = dict(row.payload_json or {})
+            solution_id = _parse_uuid(payload.get("solution_id"))
+            key = _job_key(row.question_id, solution_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            state = _state_from_status_payload(
+                row.question_id,
+                payload,
+                solution_id=solution_id,
+            )
+            if not _should_recover_persisted_job(payload, state):
+                continue
+            candidates.append((row.question_id, solution_id, state.stage))
+
+    recovered = 0
+    for question_id, solution_id, stage in reversed(candidates):
+        key = _job_key(question_id, solution_id)
+        existing = _tasks.get(key)
+        if existing is not None and not existing.done():
+            continue
+        try:
+            result = await start_answer_job(
+                question_id,
+                from_stage=stage,
+                solution_id=solution_id,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "failed to recover answer job %s/%s at stage %s",
+                question_id,
+                solution_id,
+                stage,
+            )
+            continue
+        if result.get("state") in {"started", "running"}:
+            recovered += 1
+            log.info(
+                "recovered answer job %s/%s at stage %s",
+                question_id,
+                solution_id,
+                stage,
+            )
+    return recovered
+
+
+async def get_answer_job_state(
+    session: AsyncSession,
+    question_id: uuid.UUID,
+    solution_id: uuid.UUID | None = None,
+) -> dict:
     qid = str(question_id)
     key = _job_key(question_id, solution_id)
     state = _states.get(key)
     task = _tasks.get(key)
+    if state is None:
+        state = await _load_persisted_job_state(
+            session,
+            question_id=question_id,
+            solution_id=solution_id,
+        )
     return {
         "question_id": qid,
         "solution_id": str(solution_id) if solution_id else None,

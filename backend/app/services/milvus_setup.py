@@ -10,12 +10,31 @@ Milvus 2.4+).
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 
 from pymilvus import CollectionSchema, DataType, FieldSchema, MilvusClient
 
 from app.config import settings
 
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class BootstrapReport:
+    expected_dense_dim: int
+    created_dense: list[str] = field(default_factory=list)
+    recreated_dense: list[str] = field(default_factory=list)
+    created_sparse: list[str] = field(default_factory=list)
+    recreated_sparse: list[str] = field(default_factory=list)
+
+    @property
+    def changed(self) -> bool:
+        return any((
+            self.created_dense,
+            self.recreated_dense,
+            self.created_sparse,
+            self.recreated_sparse,
+        ))
 
 
 def _base_fields(extra_scalar: list[FieldSchema]) -> list[FieldSchema]:
@@ -40,19 +59,12 @@ def _sparse_fields(extra_scalar: list[FieldSchema]) -> list[FieldSchema]:
 
 
 COLLECTIONS = {
-    "q_emb": CollectionSchema(
-        fields=_base_fields([
-            FieldSchema(name="ref_pg_id", dtype=DataType.VARCHAR, max_length=128),
-            FieldSchema(name="difficulty", dtype=DataType.INT64),
-        ]),
-        description="Question text embeddings",
-    ),
     "question_full_emb": CollectionSchema(
         fields=_base_fields([
             FieldSchema(name="question_id", dtype=DataType.VARCHAR, max_length=128),
             FieldSchema(name="difficulty", dtype=DataType.INT64),
         ]),
-        description="Whole-question embeddings",
+        description="Whole-question embeddings (canonical question vector after q_emb retirement)",
     ),
     "answer_full_emb": CollectionSchema(
         fields=_base_fields([
@@ -84,13 +96,6 @@ COLLECTIONS = {
 }
 
 SPARSE_COLLECTIONS = {
-    "q_emb_sparse": CollectionSchema(
-        fields=_sparse_fields([
-            FieldSchema(name="ref_pg_id", dtype=DataType.VARCHAR, max_length=128),
-            FieldSchema(name="difficulty", dtype=DataType.INT64),
-        ]),
-        description="Question sparse lexical (BM25 / bge-m3)",
-    ),
     "question_full_emb_sparse": CollectionSchema(
         fields=_sparse_fields([
             FieldSchema(name="question_id", dtype=DataType.VARCHAR, max_length=128),
@@ -192,7 +197,7 @@ def ensure_collections(
     recreate_dense_on_dim_mismatch: bool | None = None,
     force_recreate_dense: bool = False,
     recreate_sparse: bool = False,
-) -> None:
+) -> BootstrapReport:
     client = get_client()
     recreate_dense = (
         settings.milvus.recreate_dense_on_dim_mismatch
@@ -200,12 +205,14 @@ def ensure_collections(
         else recreate_dense_on_dim_mismatch
     )
     expected_dim = settings.retrieval_dense_dim
+    report = BootstrapReport(expected_dense_dim=expected_dim)
     for name, schema in COLLECTIONS.items():
         if client.has_collection(name):
             if force_recreate_dense:
                 log.warning("milvus: dropping and recreating dense collection %s", name)
                 client.drop_collection(collection_name=name)
                 _create_dense_collection(client, name, schema)
+                report.recreated_dense.append(name)
                 continue
             desc = client.describe_collection(collection_name=name)
             actual_dim = _extract_vector_dim(desc)
@@ -220,6 +227,7 @@ def ensure_collections(
                 log.warning("%s Dropping and recreating %s.", msg, name)
                 client.drop_collection(collection_name=name)
                 _create_dense_collection(client, name, schema)
+                report.recreated_dense.append(name)
                 continue
             log.info("milvus: %s exists", name)
             client.load_collection(name)
@@ -227,6 +235,7 @@ def ensure_collections(
 
         log.info("milvus: creating %s", name)
         _create_dense_collection(client, name, schema)
+        report.created_dense.append(name)
 
     for name, schema in SPARSE_COLLECTIONS.items():
         if client.has_collection(name):
@@ -234,12 +243,16 @@ def ensure_collections(
                 log.warning("milvus: dropping and recreating sparse collection %s", name)
                 client.drop_collection(collection_name=name)
                 _create_sparse_collection(client, name, schema)
+                report.recreated_sparse.append(name)
                 continue
             log.info("milvus: %s exists", name)
             client.load_collection(name)
             continue
         log.info("milvus: creating %s", name)
         _create_sparse_collection(client, name, schema)
+        report.created_sparse.append(name)
+
+    return report
 
 
 def doctor() -> dict:
@@ -280,10 +293,10 @@ def doctor() -> dict:
     return report
 
 
-async def ensure_collections_async() -> None:
+async def ensure_collections_async() -> BootstrapReport:
     """Async wrapper for FastAPI lifespan — offloads pymilvus to a thread."""
     import asyncio
-    await asyncio.to_thread(ensure_collections)
+    return await asyncio.to_thread(ensure_collections)
 
 
 if __name__ == "__main__":

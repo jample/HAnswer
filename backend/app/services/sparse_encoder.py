@@ -219,6 +219,46 @@ def set_sparse_encoder(encoder: SparseEncoder | None) -> None:
     _instance = encoder
 
 
+async def warmup_bm25_from_db(session) -> None:  # type: ignore[no-untyped-def]
+    """Populate BM25 corpus stats from PostgreSQL so queries get proper IDF.
+
+    Without this, every server restart resets the in-memory corpus to empty,
+    making BM25 degenerate to raw TF (all IDF=1.0, avgdl=1.0). Call once
+    at startup from the FastAPI lifespan.
+    """
+    encoder = get_sparse_encoder()
+    if not isinstance(encoder, BM25SparseEncoder):
+        return
+
+    from sqlalchemy import select, func
+    from app.db.models import RetrievalUnitRow, Question, QuestionSolution
+
+    # Gather text from retrieval units (richest per-document text) and
+    # question parsed_json question_text as fallback.
+    texts: list[str] = []
+    unit_rows = (await session.execute(
+        select(RetrievalUnitRow.text)
+    )).scalars().all()
+    texts.extend(unit_rows)
+
+    # Also add question text from parsed_json so BM25 has question-level
+    # lexical coverage even before retrieval units are populated.
+    q_rows = (await session.execute(
+        select(Question.parsed_json).where(Question.parsed_json.is_not(None))
+    )).scalars().all()
+    for pj in q_rows:
+        if isinstance(pj, dict):
+            qt = pj.get("question_text")
+            if qt:
+                texts.append(qt)
+
+    if not texts:
+        return
+
+    # encode() updates corpus stats internally.
+    await encoder.encode(texts)
+
+
 __all__: Iterable[str] = [
     "SparseEncoder", "BM25SparseEncoder", "BGEM3SparseEncoder",
     "get_sparse_encoder", "set_sparse_encoder",

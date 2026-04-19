@@ -23,6 +23,7 @@ LLM_DEP = Depends(get_llm_client)
 class CreateDialogSessionRequest(BaseModel):
     title: str | None = None
     question_id: UUID | None = None
+    solution_id: UUID | None = None
 
 
 class CreateDialogMessageRequest(BaseModel):
@@ -37,9 +38,15 @@ async def list_dialog_sessions() -> dict:
 @router.post("/sessions")
 async def create_dialog_session(payload: CreateDialogSessionRequest) -> dict:
     try:
-        return await create_session(title=payload.title, question_id=payload.question_id)
+        return await create_session(
+            title=payload.title,
+            question_id=payload.question_id,
+            solution_id=payload.solution_id,
+        )
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @router.get("/sessions/{conversation_id}")

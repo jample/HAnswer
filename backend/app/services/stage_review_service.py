@@ -280,7 +280,7 @@ async def _delete_question_level_vectors(
     if vector_store is None:
         return
     ref_id = encode_solution_ref(question_id=question_id, solution_id=solution_id)
-    for collection in ("q_emb", "question_full_emb", "answer_full_emb"):
+    for collection in ("question_full_emb", "answer_full_emb"):
         await vector_store.delete(collection, ref_id=ref_id)
 
 

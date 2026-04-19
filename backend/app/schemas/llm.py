@@ -187,6 +187,11 @@ _GGB_TRANSLATE_INLINE_VECTOR = re.compile(
 _GGB_SETCOLOR_NAMED = re.compile(
     r"SetColor\s*\([^,]+,\s*[\"\'][A-Za-z]+[\"\']\s*\)"
 )
+_GGB_SETVALUE = re.compile(r"^SetValue\s*\(")
+_GGB_LINE_EQUATION_WRAPPER = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*\s*=\s*Line\s*\(\s*[^,]+=[^,]+\s*\)$"
+)
+_GGB_SETCONDITION_TO_SHOW = re.compile(r"^SetConditionToShowObject\s*\(")
 # GeoGebra reserves Greek-letter aliases (it auto-renames a `beta=Slider(...)`
 # to `beta_1` because `beta` ↔ β collides with built-ins). Any subsequent
 # `cos(beta)` then fails to resolve. Force ASCII identifiers that don't
@@ -195,6 +200,13 @@ _GGB_GREEK_ALIASES = frozenset({
     "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta",
     "iota", "kappa", "lambda", "mu", "nu", "xi", "omicron", "pi", "rho",
     "sigma", "tau", "upsilon", "phi", "chi", "psi", "omega",
+})
+# GeoGebra reserves a handful of built-in object names. Re-defining them via
+# `xAxis=Line(...)` collides with the built-in axes/views and the assignment
+# is silently rejected (or auto-renamed), breaking every later reference.
+_GGB_RESERVED_NAMES = frozenset({
+    "xAxis", "yAxis", "zAxis", "xOyPlane", "xOzPlane", "yOzPlane",
+    "e", "i",
 })
 _GGB_LHS_NAME = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*(?:\([^)]*\))?\s*=")
 
@@ -291,6 +303,29 @@ class Visualization(BaseModel):
                     f"#{i} '{cmd[:80]}': SetColor expects an RGB triple, e.g. "
                     f"SetColor(obj, 255, 0, 0). Color names are not portable."
                 )
+            if _GGB_SETVALUE.match(cmd):
+                problems.append(
+                    f"#{i} '{cmd[:80]}': do not emit SetValue(...) inside ggb_commands. "
+                    f"Define the object with 'name=Slider(...)' or 'flag=true/false', "
+                    f"then put the initial UI value into params[].default so the "
+                    f"frontend applies it via the GeoGebra API."
+                )
+            if _GGB_LINE_EQUATION_WRAPPER.match(cmd):
+                problems.append(
+                    f"#{i} '{cmd[:80]}': do not wrap an equation inside Line(...). "
+                    f"GeoGebra Line accepts point-point / point-direction inputs, not "
+                    f"Line(ax+by=c). Re-express the line with two points, for example "
+                    f"'l=Line((0,c),(c,0))' for x+y=c, or use a point plus direction vector."
+                )
+            if _GGB_SETCONDITION_TO_SHOW.match(cmd):
+                problems.append(
+                    f"#{i} '{cmd[:80]}': SetConditionToShowObject is a GUI-only object "
+                    f"property; the GeoGebra Apps API rejects it through evalCommand. "
+                    f"Express conditional visibility through conditional definition "
+                    f"instead, e.g. 'polyA=If(flag==false, Polygon(...))' or "
+                    f"'segA=If(flag, Segment(P,Q))'. When the condition is false the "
+                    f"object is undefined and GeoGebra automatically hides it."
+                )
             lhs = _GGB_LHS_NAME.match(cmd)
             if lhs:
                 name = lhs.group(1)
@@ -300,6 +335,14 @@ class Visualization(BaseModel):
                         f"GeoGebra auto-renames to '{name}_1' (collides with built-in "
                         f"{name}↔Greek). Every later command referencing '{name}' will "
                         f"fail. Use a non-Greek ASCII name like 'tParam', 'angA', 'k1'."
+                    )
+                if name in _GGB_RESERVED_NAMES:
+                    problems.append(
+                        f"#{i} '{cmd[:80]}': '{name}' is a built-in GeoGebra identifier "
+                        f"(coordinate axis / plane / constant). Re-defining it collides "
+                        f"with the built-in and the assignment is rejected. Rename to "
+                        f"something like 'xAxisRef' / 'lineX' / 'lineY'. To draw the "
+                        f"coordinate axes, leave them on via ggb_settings.axes_visible."
                     )
         if problems:
             raise ValueError(
@@ -321,7 +364,7 @@ class VisualizationList(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    visualizations: list[Visualization]
+    visualizations: list[Visualization] = Field(min_length=3, max_length=4)
 
 
 # ── Variant synthesis (M7) ──────────────────────────────────────────

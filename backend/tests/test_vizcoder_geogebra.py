@@ -94,16 +94,21 @@ def test_visualization_legacy_jsxgraph_default():
 
 
 def test_visualization_list_round_trips_geogebra():
+    def _v(vid, cmd):
+        return {
+            "id": vid,
+            "title_cn": "抛物线",
+            "caption_cn": "$y=x^2$",
+            "learning_goal": "看顶点平移",
+            "engine": "geogebra",
+            "ggb_commands": [cmd],
+        }
+
     payload = {
         "visualizations": [
-            {
-                "id": "v1",
-                "title_cn": "抛物线",
-                "caption_cn": "$y=x^2$",
-                "learning_goal": "看顶点平移",
-                "engine": "geogebra",
-                "ggb_commands": ["a=Slider(-3,3,0.1)", "f(x)=(x-a)^2"],
-            }
+            _v("v1", "a=Slider(-3,3,0.1)"),
+            _v("v2", "f(x)=x^2"),
+            _v("v3", "g(x)=x^3"),
         ]
     }
     parsed = VisualizationList.model_validate(payload)
@@ -112,8 +117,25 @@ def test_visualization_list_round_trips_geogebra():
     dumped = parsed.model_dump(mode="json")
     v0 = dumped["visualizations"][0]
     assert v0["engine"] == "geogebra"
-    assert v0["ggb_commands"] == ["a=Slider(-3,3,0.1)", "f(x)=(x-a)^2"]
+    assert v0["ggb_commands"] == ["a=Slider(-3,3,0.1)"]
     assert v0["jsx_code"] == ""
+
+
+def test_visualization_list_rejects_fewer_than_three():
+    payload = {
+        "visualizations": [
+            {
+                "id": "v1",
+                "title_cn": "t",
+                "caption_cn": "c",
+                "learning_goal": "g",
+                "engine": "geogebra",
+                "ggb_commands": ["A=(0,0)"],
+            }
+        ]
+    }
+    with pytest.raises(ValidationError, match="at least 3"):
+        VisualizationList.model_validate(payload)
 
 
 # ── Pydantic anti-pattern guards (drive the LLM repair loop) ──────
@@ -188,6 +210,41 @@ def test_validator_rejects_setcolor_named():
 
 def test_validator_accepts_setcolor_rgb_triple():
     viz = _make_viz(["c=Circle((0,0),1)", "SetColor(c, 255, 0, 0)"])
+    assert len(viz.ggb_commands) == 2
+
+
+def test_validator_rejects_setvalue_in_commands():
+    with pytest.raises(ValidationError, match="SetValue"):
+        _make_viz(["a=Slider(0,1,0.1)", "SetValue(a, 0.5)"])
+
+
+def test_validator_rejects_line_equation_wrapper():
+    with pytest.raises(ValidationError, match="Line"):
+        _make_viz(["p1=3", "l1=Line(x+y=p1)"])
+
+
+def test_validator_rejects_set_condition_to_show_object():
+    with pytest.raises(ValidationError, match="SetConditionToShowObject"):
+        _make_viz([
+            "isMin=false",
+            "p=Polygon((0,0),(1,0),(0,1))",
+            "SetConditionToShowObject(p, isMin==false)",
+        ])
+
+
+def test_validator_rejects_reserved_axis_name():
+    with pytest.raises(ValidationError, match="built-in GeoGebra identifier"):
+        _make_viz([
+            "xAxis=Line((0,0),(1,0))",
+            "yAxis=Line((0,0),(0,1))",
+        ])
+
+
+def test_validator_accepts_conditional_definition():
+    viz = _make_viz([
+        "isMin=false",
+        "p=If(isMin==false, Polygon((0,0),(1,0),(0,1)))",
+    ])
     assert len(viz.ggb_commands) == 2
 
 

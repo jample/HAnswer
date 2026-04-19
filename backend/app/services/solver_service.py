@@ -175,6 +175,11 @@ async def generate_answer(
             ),
         })
 
+    # Solver streaming can run for tens of seconds. End the current
+    # transaction before the LLM call so we don't hold an open DB
+    # transaction for the entire stream duration.
+    await session.commit()
+
     if not settings.llm.stream_solver_json:
         # Bulk path — preserved for callers/tests that pin streaming off.
         try:

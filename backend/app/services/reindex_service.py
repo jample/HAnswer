@@ -92,12 +92,10 @@ async def rebuild_retrieval_indexes(
         pattern_row = await _load_pattern(session, question_id=q.id)
         kp_rows = await _load_kps(session, question_id=q.id)
 
-        q_text = parsed.question_text
         question_full_text = index.profile.query_texts.question_full_text
         answer_full_text = index.profile.query_texts.answer_full_text
 
         embed_plan: list[tuple[str, object, str]] = [
-            ("q_emb", f"{q.id}::{solution.id}", q_text),
             ("question_full_emb", f"{q.id}::{solution.id}", question_full_text),
             ("answer_full_emb", f"{q.id}::{solution.id}", answer_full_text),
         ]
@@ -128,7 +126,7 @@ async def rebuild_retrieval_indexes(
             difficulty = q.difficulty
             unit_kind = ""
             ref_id = ""
-            if collection in {"q_emb", "question_full_emb", "answer_full_emb"}:
+            if collection in {"question_full_emb", "answer_full_emb"}:
                 ref_id = str(row)
             elif collection == "pattern_emb":
                 assert isinstance(row, MethodPatternRow)

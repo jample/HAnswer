@@ -31,7 +31,7 @@ HAnswer is a local-first learning companion for Chinese middle-school and high-s
 | Database | PostgreSQL | 13+ | All structured data + cost ledger |
 | Vector DB | Milvus | 2.6.14 | 12 collections (6 dense + 6 sparse) |
 | LLM | Google Gemini | gemini-3.1-pro-preview | Sole LLM provider |
-| Embeddings | gemini-embedding-2-preview or bge-m3 | 768-dim (default) or 1024-dim | Dense vectors; v2 model uses text prefixes, not task_type param |
+| Embeddings | gemini-embedding-2-preview or bge-m3 | 1536-dim (default) or 1024-dim | Dense vectors; v2 model uses text prefixes, not task_type param |
 | Sparse | BM25 or bge-m3 lexical | — | Chinese-friendly bigram tokenizer |
 | Frontend | Next.js 16 + React 19 | App Router | TypeScript, port 3333 |
 | Math Rendering | MathJax 3 | CDN | LaTeX inline ($...$) and block ($$...$$) |
@@ -292,7 +292,7 @@ POST /api/answer/{id}/start → Background job spawns
 | VizCoder | gemini-3.1-pro-preview | AnswerPackage → Visualization[] (JSXGraph code) |
 | VariantSynth | gemini-3.1-pro-preview | Source question → VariantQuestion[] |
 | Dialog | gemini-3.1-pro-preview | Context + memory + message → ConversationTurnResult |
-| Embedding | gemini-embedding-2-preview (recommended), gemini-embedding-001, or legacy text-embedding-004 | Text → dense vectors (768-dim default) |
+| Embedding | gemini-embedding-2-preview (recommended), gemini-embedding-001, or legacy text-embedding-004 | Text → dense vectors (1536-dim default) |
 
 ### LLM Client Architecture
 ```
@@ -377,7 +377,7 @@ Query / anchor
 - Sparse (SPARSE_INVERTED_INDEX, IP metric): `q_emb_sparse`, `question_full_emb_sparse`, `answer_full_emb_sparse`, `retrieval_unit_emb_sparse`, `pattern_emb_sparse`, `kp_emb_sparse`
 
 ### Embedding Configuration
-- **Fast remote mode**: Gemini `gemini-embedding-2-preview` (768-dim) + BM25 sparse. No local model load. V2 model uses text prefixes instead of task_type API param.
+- **Fast remote mode**: Gemini `gemini-embedding-2-preview` (1536-dim) + BM25 sparse. No local model load. V2 model uses text prefixes instead of task_type API param.
 - **Strong local mode**: bge-m3 (1024-dim) dense + bge-m3 lexical sparse. Requires `pip install -e '.[retrieval]'`.
 
 Switching embedder requires Milvus dense collection rebuild: `python -m scripts.rebuild_retrieval_index --recreate-dense --recreate-sparse`

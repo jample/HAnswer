@@ -181,3 +181,119 @@ async def test_call_structured_streaming_falls_back_on_validation_error():
     # falls back to bulk repair which yields a validated model.
     assert isinstance(items[-1], _Model)
     assert items[-1].a == 1 and items[-1].b == "ok"
+
+
+@pytest.mark.asyncio
+async def test_call_structured_streaming_falls_back_on_transient_stream_error():
+    from pydantic import BaseModel
+
+    from app.prompts.base import PromptTemplate
+    from app.services.llm_client import FakeTransport, GeminiClient, StreamChunk, TransientLLMError
+
+    class _Model(BaseModel):
+        a: int
+        b: str
+
+    class _Tpl(PromptTemplate):
+        name = "test"
+        version = "v0"
+        purpose = "test"
+        input_description = "x"
+        output_description = "y"
+        design_decisions: list = []
+
+        def system_message(self, **kwargs):
+            return "sys"
+
+        def user_message(self, **kwargs):
+            return "x"
+
+        @property
+        def schema(self):
+            return {"type": "object"}
+
+    good = json.dumps({"a": 1, "b": "ok"})
+
+    class _Flaky(FakeTransport):
+        def __init__(self):
+            super().__init__()
+            self.bulk_calls = 0
+
+        async def generate_json(self, *, model, messages, response_schema, timeout_s):
+            self.bulk_calls += 1
+            return good, 0, 0
+
+        async def generate_json_stream_iter(
+            self, *, model, messages, response_schema, timeout_s,
+        ):
+            yield StreamChunk(text='{"a":1')
+            raise TransientLLMError("stream stalled")
+
+    transport = _Flaky()
+    client = GeminiClient(transport)
+    items: list = []
+    async for item in client.call_structured_streaming(
+        template=_Tpl(),
+        model="m",
+        model_cls=_Model,
+    ):
+        items.append(item)
+
+    assert transport.bulk_calls == 1
+    assert isinstance(items[-1], _Model)
+    assert items[-1].a == 1 and items[-1].b == "ok"
+
+
+@pytest.mark.asyncio
+async def test_call_structured_stream_flag_falls_back_to_non_stream_on_transient_error():
+    from pydantic import BaseModel
+
+    from app.prompts.base import PromptTemplate
+    from app.services.llm_client import FakeTransport, GeminiClient, TransientLLMError
+
+    class _Model(BaseModel):
+        a: int
+        b: str
+
+    class _Tpl(PromptTemplate):
+        name = "test"
+        version = "v0"
+        purpose = "test"
+        input_description = "x"
+        output_description = "y"
+        design_decisions: list = []
+
+        def system_message(self, **kwargs):
+            return "sys"
+
+        def user_message(self, **kwargs):
+            return "x"
+
+        @property
+        def schema(self):
+            return {"type": "object"}
+
+    class _Transport(FakeTransport):
+        def __init__(self):
+            super().__init__()
+            self.stream_calls = 0
+            self.bulk_calls = 0
+
+        async def generate_json_stream(self, *, model, messages, response_schema, timeout_s):
+            self.stream_calls += 1
+            raise TransientLLMError("stream timeout")
+
+        async def generate_json(self, *, model, messages, response_schema, timeout_s):
+            self.bulk_calls += 1
+            return json.dumps({"a": 1, "b": "ok"}), 0, 0
+
+    client = GeminiClient(_Transport())
+    parsed = await client.call_structured(
+        template=_Tpl(),
+        model="m",
+        model_cls=_Model,
+        stream=True,
+    )
+
+    assert parsed.a == 1
+    assert parsed.b == "ok"

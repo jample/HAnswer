@@ -282,6 +282,11 @@ select:focus {
 /* All direct grid children must not overflow their track */
 .qpage-grid > * { min-width: 0; }
 
+.qpage-sidepanel {
+  min-width: 0;
+  position: relative;
+}
+
 /* Answer article — break long words & clip overflowing content */
 .qpage-article {
   min-width: 0;
@@ -304,6 +309,148 @@ select:focus {
     grid-template-columns: minmax(160px, 200px) minmax(0, 1fr);
   }
   .qpage-outline { display: block; }
+}
+
+@media (min-width: 1024px) {
+  .qpage-grid.with-dialog {
+    grid-template-columns: minmax(0, 1fr) minmax(320px, var(--dialog-panel-width, 380px));
+  }
+
+  .qpage-grid.with-dialog .qpage-outline {
+    display: none;
+  }
+
+  .qpage-grid.with-dialog .qpage-sidepanel {
+    position: sticky;
+    top: 76px;
+    align-self: start;
+    max-height: calc(100vh - 92px);
+    overflow-y: auto;
+  }
+
+  .qpage-grid.with-dialog.dialog-collapsed {
+    grid-template-columns: minmax(0, 1fr) 84px;
+  }
+
+  .qpage-grid.with-dialog .qpage-sidepanel-resizer {
+    position: absolute;
+    top: 0;
+    left: -12px;
+    width: 20px;
+    height: 100%;
+    cursor: col-resize;
+    z-index: 20;
+  }
+
+  .qpage-grid.with-dialog .qpage-sidepanel-resizer::before {
+    content: '';
+    position: absolute;
+    top: 24px;
+    bottom: 24px;
+    left: 9px;
+    width: 2px;
+    border-radius: 999px;
+    background: linear-gradient(180deg, rgba(148, 163, 184, 0.15) 0%, rgba(99, 102, 241, 0.5) 50%, rgba(148, 163, 184, 0.15) 100%);
+  }
+
+  .qpage-grid.with-dialog.dialog-collapsed .qpage-sidepanel-resizer {
+    display: none;
+  }
+}
+
+@media (min-width: 1440px) {
+  .qpage-grid.with-dialog {
+    grid-template-columns: minmax(150px, 180px) minmax(0, 1fr) minmax(320px, var(--dialog-panel-width, 380px));
+  }
+
+  .qpage-grid.with-dialog .qpage-outline {
+    display: block;
+  }
+
+  .qpage-grid.with-dialog.dialog-collapsed {
+    grid-template-columns: minmax(150px, 180px) minmax(0, 1fr) 84px;
+  }
+}
+
+.question-dialog-panel {
+  margin-bottom: 0;
+}
+
+.question-dialog-panel.collapsed {
+  padding: 14px 10px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+
+.question-dialog-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.dialog-inline-hint {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.question-dialog-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.question-dialog-collapse-btn {
+  min-width: auto;
+}
+
+.question-dialog-collapsed-label {
+  writing-mode: vertical-rl;
+  text-orientation: mixed;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  color: var(--text-secondary);
+}
+
+.question-dialog-collapsed-sub {
+  writing-mode: vertical-rl;
+  text-orientation: mixed;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.dialog-session-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.dialog-session-tab {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-secondary);
+  border-radius: 999px;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.dialog-session-tab.active {
+  border-color: var(--border-focus);
+  background: #f8fbff;
+  color: #245ea8;
+}
+
+.dialog-memory-stack {
+  margin-top: 14px;
+  display: grid;
+  gap: 10px;
 }
 
 /* ─── Dialog page ──────────────────────────────────────────────────── */

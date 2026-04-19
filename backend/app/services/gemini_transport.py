@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 
 from app.config import settings
 from app.services.llm_client import GeminiTransport, StreamChunk, TransientLLMError
@@ -17,6 +18,13 @@ _EMBED_FALLBACK_MODEL = "gemini-embedding-2-preview"
 _LEGACY_TEXT_EMBED_MODELS = {"text-embedding-004", "models/text-embedding-004"}
 # gemini-embedding-2-preview uses task prefixes in prompt text, NOT task_type param
 _EMBED_V2_MODELS = {"gemini-embedding-2-preview"}
+
+
+def _l2_renormalize(vec: list[float]) -> list[float]:
+    norm = math.sqrt(sum(v * v for v in vec))
+    if norm <= 0.0:
+        return vec
+    return [v / norm for v in vec]
 
 
 def _flatten_messages(messages: list[dict]) -> tuple[str, list[dict]]:
@@ -171,6 +179,9 @@ class GoogleGeminiTransport(GeminiTransport):
         (for example ``GeminiClient.call_structured_streaming``) feed
         the deltas into a streaming JSON parser to emit SSE events
         without waiting for the full response.
+
+        Retries the initial stream connection on transient errors
+        (503, timeout) before entering the yield loop.
         """
         from google.genai import types  # type: ignore
 
@@ -180,15 +191,35 @@ class GoogleGeminiTransport(GeminiTransport):
             response_mime_type="application/json",
             response_json_schema=response_schema,
         )
+
+        max_stream_retries = 3
+        for attempt in range(max_stream_retries + 1):
+            try:
+                stream = await asyncio.wait_for(
+                    self._client.aio.models.generate_content_stream(  # type: ignore[attr-defined]
+                        model=model,
+                        contents=contents,
+                        config=cfg,
+                    ),
+                    timeout=timeout_s,
+                )
+                break
+            except Exception as e:  # noqa: BLE001
+                msg = str(e).lower()
+                is_transient = isinstance(e, TimeoutError) or any(
+                    k in msg for k in ("timeout", "unavailable", "429", "503", "deadline")
+                )
+                if not is_transient or attempt >= max_stream_retries:
+                    raise TransientLLMError(str(e)) from e
+                wait_s = 2 ** attempt
+                import logging
+                logging.getLogger(__name__).warning(
+                    "stream connection retry %d/%d after %.1fs: %s",
+                    attempt + 1, max_stream_retries, wait_s, msg,
+                )
+                await asyncio.sleep(wait_s)
+
         try:
-            stream = await asyncio.wait_for(
-                self._client.aio.models.generate_content_stream(  # type: ignore[attr-defined]
-                    model=model,
-                    contents=contents,
-                    config=cfg,
-                ),
-                timeout=timeout_s,
-            )
             while True:
                 try:
                     chunk = await asyncio.wait_for(
@@ -275,7 +306,11 @@ class GoogleGeminiTransport(GeminiTransport):
                 ),
                 timeout=settings.llm.embed_timeout_s,
             )
-            return [list(emb.values) for emb in resp.embeddings]
+            # Matryoshka note: when ``output_dimensionality`` is anything
+            # other than the model's native dim (3072 for v2-preview), the
+            # server returns the truncated prefix WITHOUT renormalizing.
+            # We renormalize so cosine == dot-product downstream.
+            return [_l2_renormalize(list(emb.values)) for emb in resp.embeddings]
 
         async def _embed_all(model_name: str, use_task_type: bool = True) -> list[list[float]]:
             chunks = [texts[i : i + MAX_BATCH] for i in range(0, len(texts), MAX_BATCH)]

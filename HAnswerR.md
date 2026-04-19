@@ -601,10 +601,10 @@ Dense collections (HNSW / IP metric):
 - `retrieval_unit_emb` — `retrieval_unit_id`, `unit_kind`, `subject`, `grade_band`, `difficulty`, `vector`.
 
 Companion sparse collections for M5 multi-route retrieval (`SPARSE_INVERTED_INDEX` / IP metric, requires Milvus ≥ 2.4):
-- `q_emb_sparse`, `pattern_emb_sparse`, `kp_emb_sparse` — same scalar fields as their dense siblings but with `sparse_vector (SPARSE_FLOAT_VECTOR)` instead of a fixed-dim dense vector. Populated by the active `SparseEncoder` (`bge-m3` lexical head or online BM25) during the same sediment step (§3.6.2).
+- `pattern_emb_sparse`, `kp_emb_sparse` — same scalar fields as their dense siblings but with `sparse_vector (SPARSE_FLOAT_VECTOR)` instead of a fixed-dim dense vector. Populated by the active `SparseEncoder` (`bge-m3` lexical head or online BM25) during the same sediment step (§3.6.2).
 - `question_full_emb_sparse`, `answer_full_emb_sparse`, `retrieval_unit_emb_sparse` — sparse lexical companions for the whole-question, whole-answer, and semantic-facet routes from §3.4.1–§3.4.7.
 
-`embed_dim` comes from `retrieval.embedder`: 768 for Gemini embeddings, 1024 for `bge-m3`. Swapping embedders changes dense dim but not the sparse schema, so sparse indexes remain schema-compatible across migrations. Even so, operators should recreate dense collections when the dense dim changes, and should recreate sparse collections as well when the sparse encoder family changes (`bge-m3` lexical head ↔ BM25) to avoid stale lexical rows.
+`embed_dim` comes from `retrieval.embedder`: 1536 for Gemini embeddings, 1024 for `bge-m3`. Swapping embedders changes dense dim but not the sparse schema, so sparse indexes remain schema-compatible across migrations. Even so, operators should recreate dense collections when the dense dim changes, and should recreate sparse collections as well when the sparse encoder family changes (`bge-m3` lexical head ↔ BM25) to avoid stale lexical rows. In the current repo defaults, startup can recreate stale dense collections and rebuild Milvus from PostgreSQL automatically.
 
 ---
 

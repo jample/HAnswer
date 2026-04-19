@@ -28,7 +28,12 @@ class GeminiSettings(BaseModel):
     #   - gemini-embedding-001 (google-genai path)
     #   - text-embedding-004 (legacy google-generativeai path)
     model_embed: str = "gemini-embedding-2-preview"
-    embed_dim: int = 768  # model default 3072; 768 recommended for storage
+    # `gemini-embedding-2-preview` is a Matryoshka model: native 3072-dim
+    # output is L2-renormalized to a smaller prefix on the server. 1536 is
+    # the recommended sweet spot — ~50% of the storage of 3072 with a
+    # negligible recall delta on Chinese math/physics. Changing this
+    # requires rebuilding every Milvus dense collection.
+    embed_dim: int = 1536
 
 
 class PostgresSettings(BaseModel):
@@ -45,9 +50,13 @@ class MilvusSettings(BaseModel):
     # Milvus itself is unreachable.
     auto_bootstrap: bool = True
     # Dense collections must be recreated if the active embedder's
-    # vector dim changes (for example Gemini 768 -> bge-m3 1024).
-    # Keep this off by default because it drops Milvus data.
-    recreate_dense_on_dim_mismatch: bool = False
+    # vector dim changes (for example Gemini 1536 -> bge-m3 1024).
+    # Keep this on in local-first mode: PostgreSQL remains the source of
+    # truth and bootstrap can rebuild Milvus after recreating the schema.
+    recreate_dense_on_dim_mismatch: bool = True
+    # When bootstrap creates or recreates Milvus collections, repopulate
+    # retrieval data from PostgreSQL automatically.
+    auto_reindex_on_bootstrap_change: bool = True
 
 
 class ServerSettings(BaseModel):
@@ -61,14 +70,15 @@ class StorageSettings(BaseModel):
 
 
 class LLMSettings(BaseModel):
-    max_retries: int = 2
+    max_retries: int = 4
     max_repair_attempts: int = 2
-    request_timeout_s: int = 60
-    parser_timeout_s: int = 60
-    solver_timeout_s: int = 180
-    vizcoder_timeout_s: int = 120
+    request_timeout_s: int = 90
+    parser_timeout_s: int = 120
+    solver_timeout_s: int = 300
+    vizcoder_timeout_s: int = 240
     dialog_timeout_s: int = 90
     embed_timeout_s: int = 60
+    stream_recovery_timeout_s: int = 300
     stream_solver_json: bool = True
     stream_vizcoder_json: bool = True
 

@@ -1,9 +1,9 @@
 'use client';
 
-import Link from 'next/link';
 import { use, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { TeX, RichText } from '../../../components/MathText';
+import QuestionDialogPanel from '../../../components/QuestionDialogPanel';
 import VizSandbox from '../../../components/VizSandbox';
 import { apiUrl } from '../../../lib/api';
 
@@ -76,6 +76,7 @@ const mutedStyle: React.CSSProperties = { color: '#888', fontSize: 12 };
 
 export default function QuestionPage({ params: paramsPromise }: { params: Promise<{ id: string }> }) {
   const params = use(paramsPromise);
+  const dialogResizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
   const [events, setEvents] = useState<AnyEv[]>([]);
   const [done, setDone] = useState(false);
   const [initial, setInitial] = useState<any | null>(null);
@@ -90,6 +91,8 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
   const [creatingSolution, setCreatingSolution] = useState(false);
   const [stageActionPending, setStageActionPending] = useState<string | null>(null);
   const [stageNoteDrafts, setStageNoteDrafts] = useState<Record<string, string>>({});
+  const [dialogCollapsed, setDialogCollapsed] = useState(false);
+  const [dialogPanelWidth, setDialogPanelWidth] = useState(380);
 
   const withSolution = useCallback((path: string, solutionId?: string | null) => {
     if (!solutionId) return path;
@@ -108,14 +111,43 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
     }).catch(() => {});
   }, [currentSolutionId, params.id, withSolution]);
 
+  useEffect(() => {
+    try {
+      const rawWidth = window.localStorage.getItem('hanswer.answer.dialog.width');
+      const rawCollapsed = window.localStorage.getItem('hanswer.answer.dialog.collapsed');
+      const parsedWidth = Number(rawWidth);
+      if (Number.isFinite(parsedWidth)) {
+        setDialogPanelWidth(Math.max(320, Math.min(560, parsedWidth)));
+      }
+      if (rawCollapsed === 'true') {
+        setDialogCollapsed(true);
+      }
+    } catch {
+      /* noop */
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('hanswer.answer.dialog.width', String(dialogPanelWidth));
+      window.localStorage.setItem('hanswer.answer.dialog.collapsed', dialogCollapsed ? 'true' : 'false');
+    } catch {
+      /* noop */
+    }
+  }, [dialogCollapsed, dialogPanelWidth]);
+
   const loadResume = useCallback(async () => {
     const res = await fetch(apiUrl(withSolution(`/api/answer/${params.id}/resume`, currentSolutionId)));
     if (!res.ok) return null;
     const body = await res.json();
     const replay = resumeToEvents(body);
     setEvents(replay);
-    setDone(Boolean(body?.complete) || body?.status === 'error');
-    setRunning(Boolean(body?.job?.running) || ['solving', 'visualizing', 'indexing'].includes(body?.status));
+    // Check both body.status AND job.error/job.done — the latter catches
+    // cases where solution.status wasn't updated but job state recorded the error.
+    const hasError = body?.status === 'error' || Boolean(body?.job?.error);
+    const jobDone = Boolean(body?.job?.done);
+    setDone(Boolean(body?.complete) || hasError || jobDone);
+    setRunning(Boolean(body?.job?.running) && !hasError);
     setJobStage(typeof body?.job?.stage === 'string' ? body.job.stage : body?.status ?? null);
     setPipeline(body?.pipeline ?? null);
     setStageReviews(Array.isArray(body?.stage_reviews) ? body.stage_reviews : []);
@@ -246,6 +278,44 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
     () => getPendingStageReview(stageReviews),
     [stageReviews],
   );
+  const hasAnswerContent = Boolean(
+    initial?.answer_package
+    || byName.solution_step?.length
+    || byName.method_pattern?.length
+    || byName.key_points_of_answer?.length,
+  );
+  const canOpenDialog = Boolean(currentSolutionId && hasAnswerContent);
+  const pageGridStyle = currentSolutionId
+    ? ({ ['--dialog-panel-width' as string]: `${dialogPanelWidth}px` } as React.CSSProperties)
+    : undefined;
+
+  const handleDialogResize = useCallback((event: PointerEvent) => {
+    const state = dialogResizeRef.current;
+    if (!state) return;
+    const nextWidth = Math.max(320, Math.min(560, state.startWidth - (event.clientX - state.startX)));
+    setDialogPanelWidth(nextWidth);
+  }, []);
+
+  const stopDialogResize = useCallback(() => {
+    dialogResizeRef.current = null;
+    window.removeEventListener('pointermove', handleDialogResize);
+    window.removeEventListener('pointerup', stopDialogResize);
+  }, [handleDialogResize]);
+
+  useEffect(() => {
+    return () => {
+      window.removeEventListener('pointermove', handleDialogResize);
+      window.removeEventListener('pointerup', stopDialogResize);
+    };
+  }, [handleDialogResize, stopDialogResize]);
+
+  const startDialogResize = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    if (dialogCollapsed || window.innerWidth < 1024) return;
+    event.preventDefault();
+    dialogResizeRef.current = { startX: event.clientX, startWidth: dialogPanelWidth };
+    window.addEventListener('pointermove', handleDialogResize);
+    window.addEventListener('pointerup', stopDialogResize);
+  }, [dialogCollapsed, dialogPanelWidth, handleDialogResize, stopDialogResize]);
 
   async function handleStageAction(stage: string, action: 'confirm' | 'rerun') {
     const key = `${stage}:${action}`;
@@ -287,7 +357,10 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
   }
 
   return (
-    <section className="qpage-grid">
+    <section
+      className={`qpage-grid${canOpenDialog ? ' with-dialog' : ''}${dialogCollapsed ? ' dialog-collapsed' : ''}`}
+      style={pageGridStyle}
+    >
       <aside className="qpage-outline" style={{
         position: 'sticky', top: 12, alignSelf: 'start',
         maxHeight: 'calc(100vh - 80px)', overflowY: 'auto',
@@ -307,9 +380,11 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
         {inBasket ? '✓ 已加入练习篮 (点击移除)' : '加入练习篮'}
       </button>
       <div style={{ marginBottom: 12 }}>
-        <Link href={`/dialog?questionId=${params.id}`} style={{ fontSize: 13 }}>
-          进入多轮追问对话 →
-        </Link>
+        {canOpenDialog ? (
+          <span style={mutedStyle}>右侧追问面板已绑定当前解法；窄屏时会自动折到下方。</span>
+        ) : (
+          <span style={mutedStyle}>完成“生成解答”后, 才能进入基于答案的多轮对话。</span>
+        )}
       </div>
       <SolutionSwitcher
         solutions={solutions}
@@ -513,6 +588,27 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
         <ErrorPanel events={byName.error} onRetry={restartAnswer} restarting={restarting} />
       )}
       </article>
+
+      {currentSolutionId && (
+        <aside className="qpage-sidepanel">
+          {canOpenDialog && !dialogCollapsed && (
+            <div
+              className="qpage-sidepanel-resizer"
+              onPointerDown={startDialogResize}
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="调整追问面板宽度"
+            />
+          )}
+          <QuestionDialogPanel
+            questionId={params.id}
+            solutionId={currentSolutionId}
+            canOpen={canOpenDialog}
+            collapsed={dialogCollapsed}
+            onToggleCollapse={() => setDialogCollapsed((prev) => !prev)}
+          />
+        </aside>
+      )}
     </section>
   );
 }

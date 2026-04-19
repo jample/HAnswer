@@ -115,7 +115,7 @@ Core: `questions`, `question_solutions`, `answer_packages`, `question_stage_revi
 
 ## Configuration
 
-Backend config (`config.toml`) sections: `[gemini]`, `[postgres]`, `[milvus]`, `[server]`, `[storage]`, `[llm]`, `[retrieval]`, `[dialog]`. Override path via `$HANSWER_CONFIG` env var. Embedding model can be Gemini (`gemini-embedding-2-preview`, default 768-dim) or local bge-m3 (1024-dim); switch requires Milvus dense collection rebuild.
+Backend config (`config.toml`) sections: `[gemini]`, `[postgres]`, `[milvus]`, `[server]`, `[storage]`, `[llm]`, `[retrieval]`, `[dialog]`. Override path via `$HANSWER_CONFIG` env var. Embedding model can be Gemini (`gemini-embedding-2-preview`, default 1536-dim MRL prefix) or local bge-m3 (1024-dim); switching dense dimensions requires Milvus dense collection rebuild.
 
 ## Known Issues (from P2S.md)
 

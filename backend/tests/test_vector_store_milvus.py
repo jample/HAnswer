@@ -24,7 +24,7 @@ async def test_milvus_upsert_replaces_by_ref_id():
     client = _FakeMilvusClient()
     store = MilvusVectorStore(client=client)
     await store.upsert(
-        "q_emb",
+        "question_full_emb",
         ref_id="abc-123",
         vector=[0.1, 0.2],
         subject="math",
@@ -32,12 +32,12 @@ async def test_milvus_upsert_replaces_by_ref_id():
         difficulty=2,
     )
     assert client.calls[0][0] == "delete"
-    assert client.calls[0][1]["collection_name"] == "q_emb"
-    assert client.calls[0][1]["filter"] == 'ref_pg_id == "abc-123"'
+    assert client.calls[0][1]["collection_name"] == "question_full_emb"
+    assert client.calls[0][1]["filter"] == 'question_id == "abc-123"'
     assert client.calls[1][0] == "insert"
-    assert client.calls[1][1]["data"][0]["ref_pg_id"] == "abc-123"
+    assert client.calls[1][1]["data"][0]["question_id"] == "abc-123"
     assert client.calls[2][0] == "flush"
-    assert client.calls[2][1]["collection_name"] == "q_emb"
+    assert client.calls[2][1]["collection_name"] == "question_full_emb"
 
 
 @pytest.mark.asyncio

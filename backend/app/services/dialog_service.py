@@ -21,6 +21,12 @@ from app.db.session import session_scope
 from app.prompts import PromptRegistry
 from app.schemas import AnswerPackage, ConversationTurnResult
 from app.services.llm_client import GeminiClient
+from app.services.question_solution_service import (
+    ensure_current_solution,
+    get_current_solution,
+    get_solution,
+    list_solutions,
+)
 
 log = logging.getLogger(__name__)
 
@@ -98,14 +104,78 @@ def _compact_answer_context(answer_json: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _build_question_context(question) -> dict[str, Any]:
+async def _resolve_dialog_question_and_solution(
+    session,
+    *,
+    question_id: uuid.UUID,
+    solution_id: uuid.UUID | None,
+    require_answer: bool,
+):
+    question = await repo.get_question(session, question_id)
+    if question is None:
+        raise KeyError(f"question {question_id} not found")
+
+    solution = None
+    if solution_id is not None:
+        solution = await get_solution(
+            session,
+            question_id=question_id,
+            solution_id=solution_id,
+        )
+        if solution is None:
+            raise KeyError(
+                f"solution {solution_id} not found for question {question_id}",
+            )
+    else:
+        solution = await get_current_solution(session, question_id=question_id)
+        if solution is None and question.answer_package_json is not None:
+            solution = await ensure_current_solution(session, question_id=question_id)
+        if solution is None or solution.answer_package_json is None:
+            answered = [
+                row
+                for row in await list_solutions(session, question_id=question_id)
+                if row.answer_package_json is not None
+            ]
+            if answered:
+                current_answered = next((row for row in answered if row.is_current), None)
+                solution = current_answered or answered[-1]
+
+    if require_answer and (solution is None or solution.answer_package_json is None):
+        raise ValueError("question-linked dialog requires at least one completed answer solution")
+
+    return question, solution
+
+
+def _build_question_context(question, solution=None) -> dict[str, Any]:
     parsed = question.parsed_json or {}
+    answer_json = None
+    answer_anchor = None
+    if solution is not None:
+        answer_json = solution.answer_package_json
+        answer_anchor = {
+            "solution_id": str(solution.id),
+            "title": solution.title,
+            "status": solution.status,
+            "has_answer": solution.answer_package_json is not None,
+            "anchor_scope": "solution",
+        }
+    elif question.answer_package_json:
+        answer_json = question.answer_package_json
+        answer_anchor = {
+            "solution_id": None,
+            "title": "题目当前答案",
+            "status": question.status,
+            "has_answer": True,
+            "anchor_scope": "question",
+        }
+
     ctx: dict[str, Any] = {
         "question_id": str(question.id),
+        "solution_id": str(solution.id) if solution is not None else None,
         "subject": question.subject,
         "grade_band": question.grade_band,
         "difficulty": question.difficulty,
-        "status": question.status,
+        "status": solution.status if solution is not None else question.status,
         "parsed_question": {
             "topic_path": _clip_items(parsed.get("topic_path") or [], limit=8, item_limit=80),
             "question_text": _clip(str(parsed.get("question_text") or ""), 4000),
@@ -115,8 +185,10 @@ def _build_question_context(question) -> dict[str, Any]:
             "tags": _clip_items(parsed.get("tags") or [], limit=12, item_limit=80),
         },
     }
-    if question.answer_package_json:
-        ctx["answer_context"] = _compact_answer_context(question.answer_package_json)
+    if answer_anchor is not None:
+        ctx["answer_anchor"] = answer_anchor
+    if answer_json:
+        ctx["answer_context"] = _compact_answer_context(answer_json)
 
     serialized = json.dumps(ctx, ensure_ascii=False)
     if len(serialized) <= settings.dialog.max_question_context_chars:
@@ -152,6 +224,7 @@ def _serialize_session(row: ConversationSession) -> dict[str, Any]:
     return {
         "id": str(row.id),
         "question_id": str(row.question_id) if row.question_id else None,
+        "solution_id": str(row.solution_id) if row.solution_id else None,
         "title": row.title,
         "latest_summary": row.latest_summary,
         "key_facts": list(row.key_facts_json or []),
@@ -159,6 +232,17 @@ def _serialize_session(row: ConversationSession) -> dict[str, Any]:
         "last_message_at": row.last_message_at.isoformat(),
         "created_at": row.created_at.isoformat(),
     }
+
+
+async def _next_message_sequence(
+    session,
+    *,
+    conversation_id: uuid.UUID,
+) -> int:
+    return int((await session.execute(
+        select(func.coalesce(func.max(ConversationMessage.sequence_no), 0))
+        .where(ConversationMessage.conversation_id == conversation_id)
+    )).scalar_one()) + 1
 
 
 async def list_sessions() -> list[dict[str, Any]]:
@@ -171,25 +255,40 @@ async def list_sessions() -> list[dict[str, Any]]:
         return [_serialize_session(row) for row in rows]
 
 
-async def create_session(*, title: str | None = None, question_id: uuid.UUID | None = None) -> dict[str, Any]:
+async def create_session(
+    *,
+    title: str | None = None,
+    question_id: uuid.UUID | None = None,
+    solution_id: uuid.UUID | None = None,
+) -> dict[str, Any]:
     async with session_scope() as session:
         question = None
+        solution = None
         resolved_title = _normalize_title(title)
+        if solution_id is not None and question_id is None:
+            raise ValueError("solution_id requires question_id")
         if question_id is not None:
-            question = await repo.get_question(session, question_id)
-            if question is None:
-                raise KeyError(f"question {question_id} not found")
+            question, solution = await _resolve_dialog_question_and_solution(
+                session,
+                question_id=question_id,
+                solution_id=solution_id,
+                require_answer=True,
+            )
             if not title:
                 resolved_title = _question_title_from_parsed(question.parsed_json)
 
         row = ConversationSession(
             question_id=question_id,
+            solution_id=solution.id if solution is not None else None,
             title=resolved_title,
             last_message_at=_utcnow(),
         )
         session.add(row)
         await session.flush()
-        question_context = _build_question_context(question) if question is not None else None
+        question_context = (
+            _build_question_context(question, solution)
+            if question is not None else None
+        )
         return {
             "session": _serialize_session(row),
             "messages": [],
@@ -216,9 +315,16 @@ async def get_session_detail(conversation_id: uuid.UUID) -> dict[str, Any]:
 
         question_context = None
         if convo.question_id:
-            question = await repo.get_question(session, convo.question_id)
-            if question is not None:
-                question_context = _build_question_context(question)
+            question, solution = await _resolve_dialog_question_and_solution(
+                session,
+                question_id=convo.question_id,
+                solution_id=convo.solution_id,
+                require_answer=False,
+            )
+            if convo.solution_id is None and solution is not None and solution.answer_package_json is not None:
+                convo.solution_id = solution.id
+                await session.flush()
+            question_context = _build_question_context(question, solution)
 
         return {
             "session": _serialize_session(convo),
@@ -266,18 +372,30 @@ async def append_message(
         raise ValueError("message content is empty")
 
     prompt_template = PromptRegistry.get("dialog")
+    question_id: uuid.UUID | None = None
+    solution_id: uuid.UUID | None = None
 
     async with session_scope() as session:
         convo = await session.get(ConversationSession, conversation_id)
         if convo is None:
             raise KeyError(f"conversation {conversation_id} not found")
         session_title = convo.title
+        question_id = convo.question_id
+        solution_id = convo.solution_id
 
         question_context = None
-        if convo.question_id:
-            question = await repo.get_question(session, convo.question_id)
-            if question is not None:
-                question_context = _build_question_context(question)
+        if question_id:
+            question, solution = await _resolve_dialog_question_and_solution(
+                session,
+                question_id=question_id,
+                solution_id=solution_id,
+                require_answer=True,
+            )
+            if convo.solution_id is None and solution is not None:
+                convo.solution_id = solution.id
+                await session.flush()
+                solution_id = solution.id
+            question_context = _build_question_context(question, solution)
 
         rows = (await session.execute(
             select(ConversationMessage)
@@ -289,22 +407,6 @@ async def append_message(
             {"role": row.role, "content": _clip(row.content, 1200)}
             for row in reversed(rows)
         ]
-
-        next_sequence = int((await session.execute(
-            select(func.coalesce(func.max(ConversationMessage.sequence_no), 0))
-            .where(ConversationMessage.conversation_id == conversation_id)
-        )).scalar_one()) + 1
-
-        user_row = ConversationMessage(
-            conversation_id=conversation_id,
-            role="user",
-            sequence_no=next_sequence,
-            content=user_content,
-            metadata_json={"source": "ui"},
-        )
-        convo.last_message_at = _utcnow()
-        session.add(user_row)
-        await session.flush()
 
         prior_summary = _clip(convo.latest_summary or "", settings.dialog.max_summary_chars)
         prior_key_facts = _clip_items(
@@ -336,32 +438,41 @@ async def append_message(
         )
     except Exception as exc:
         async with session_scope() as session:
-            convo = await session.get(ConversationSession, conversation_id)
+            convo = await session.get(ConversationSession, conversation_id, with_for_update=True)
             if convo is None:
                 raise
-            err_seq = int((await session.execute(
-                select(func.coalesce(func.max(ConversationMessage.sequence_no), 0))
-                .where(ConversationMessage.conversation_id == conversation_id)
-            )).scalar_one()) + 1
-            convo.last_message_at = _utcnow()
-            session.add(ConversationMessage(
+            next_sequence = await _next_message_sequence(
+                session,
                 conversation_id=conversation_id,
-                role="system",
-                sequence_no=err_seq,
-                content=f"对话生成失败: {exc}",
-                metadata_json={"error": True},
-            ))
+            )
+            convo.last_message_at = _utcnow()
+            session.add_all([
+                ConversationMessage(
+                    conversation_id=conversation_id,
+                    role="user",
+                    sequence_no=next_sequence,
+                    content=user_content,
+                    metadata_json={"source": "ui"},
+                ),
+                ConversationMessage(
+                    conversation_id=conversation_id,
+                    role="system",
+                    sequence_no=next_sequence + 1,
+                    content=f"对话生成失败: {exc}",
+                    metadata_json={"error": True},
+                ),
+            ])
         raise
 
     async with session_scope() as session:
-        convo = await session.get(ConversationSession, conversation_id)
+        convo = await session.get(ConversationSession, conversation_id, with_for_update=True)
         if convo is None:
             raise KeyError(f"conversation {conversation_id} not found")
-
-        assistant_sequence = int((await session.execute(
-            select(func.coalesce(func.max(ConversationMessage.sequence_no), 0))
-            .where(ConversationMessage.conversation_id == conversation_id)
-        )).scalar_one()) + 1
+        next_sequence = await _next_message_sequence(
+            session,
+            conversation_id=conversation_id,
+        )
+        assistant_sequence = next_sequence + 1
 
         refreshed_summary = _clip(
             llm_result.memory.summary, settings.dialog.max_summary_chars,
@@ -385,6 +496,13 @@ async def append_message(
         convo.open_questions_json = refreshed_open_questions
         convo.last_message_at = _utcnow()
 
+        user_row = ConversationMessage(
+            conversation_id=conversation_id,
+            role="user",
+            sequence_no=next_sequence,
+            content=user_content,
+            metadata_json={"source": "ui"},
+        )
         assistant_row = ConversationMessage(
             conversation_id=conversation_id,
             role="assistant",
@@ -392,24 +510,34 @@ async def append_message(
             content=llm_result.assistant_reply.strip(),
             metadata_json={
                 "follow_up_suggestions": llm_result.follow_up_suggestions[:3],
+                "pending": False,
             },
         )
-        session.add(assistant_row)
+        session.add_all([
+            user_row,
+            assistant_row,
+            ConversationMemorySnapshot(
+                conversation_id=conversation_id,
+                sequence_no=assistant_sequence,
+                summary=refreshed_summary,
+                key_facts_json=refreshed_key_facts,
+                open_questions_json=refreshed_open_questions,
+            ),
+        ])
         await session.flush()
 
-        session.add(ConversationMemorySnapshot(
-            conversation_id=conversation_id,
-            sequence_no=assistant_sequence,
-            summary=refreshed_summary,
-            key_facts_json=refreshed_key_facts,
-            open_questions_json=refreshed_open_questions,
-        ))
-
         question_context = None
-        if convo.question_id:
-            question = await repo.get_question(session, convo.question_id)
-            if question is not None:
-                question_context = _build_question_context(question)
+        if question_id:
+            question, solution = await _resolve_dialog_question_and_solution(
+                session,
+                question_id=question_id,
+                solution_id=convo.solution_id,
+                require_answer=False,
+            )
+            if convo.solution_id is None and solution is not None and solution.answer_package_json is not None:
+                convo.solution_id = solution.id
+                await session.flush()
+            question_context = _build_question_context(question, solution)
 
         messages = (await session.execute(
             select(ConversationMessage)

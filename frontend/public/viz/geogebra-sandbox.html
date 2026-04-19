@@ -254,6 +254,25 @@
       return false;
     }
 
+    if (name === 'SetValue' && args.length === 2) {
+      boolA = parseBoolToken(args[1]);
+      if (boolA !== null) {
+        ggbApi.setValue(stripOuterQuotes(args[0]), boolA ? 1 : 0);
+        return true;
+      }
+      numA = parseNumberToken(args[1]);
+      if (numA !== null) {
+        ggbApi.setValue(stripOuterQuotes(args[0]), numA);
+        return true;
+      }
+      var textValue = stripOuterQuotes(args[1]);
+      if (textValue !== String(args[1] || '').trim()) {
+        ggbApi.setTextValue(stripOuterQuotes(args[0]), textValue);
+        return true;
+      }
+      return false;
+    }
+
     if (name === 'SetAnimationSpeed' && args.length === 2) {
       numA = parseNumberToken(args[1]);
       if (numA !== null) {
@@ -368,6 +387,91 @@
     return false;
   }
 
+  function maybeCreateImplicitLine(cmd) {
+    var match = /^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*Line\s*\((.*)\)\s*$/.exec(String(cmd || '').trim());
+    if (!match || !ggbApi || typeof ggbApi.evalCommandGetLabels !== 'function') return false;
+    var targetName = match[1];
+    var inner = String(match[2] || '').trim();
+    var args = parseSimpleArgs(inner);
+    if (args.length !== 1 || inner.indexOf('=') === -1) return false;
+    var created = '';
+    try {
+      created = String(ggbApi.evalCommandGetLabels(inner) || '');
+    } catch (_) {
+      return false;
+    }
+    var first = created.split(',')[0] ? created.split(',')[0].trim() : '';
+    if (!first) return false;
+    if (first === targetName) return true;
+    try {
+      if (ggbApi.exists(targetName)) ggbApi.deleteObject(targetName);
+    } catch (_) {}
+    try {
+      if (typeof ggbApi.renameObject === 'function' && ggbApi.renameObject(first, targetName)) {
+        return true;
+      }
+    } catch (_) {}
+    return true;
+  }
+  // Conditional-visibility bridge for legacy payloads.
+  //
+  // The GeoGebra Apps API does not accept SetConditionToShowObject(...)
+  // through evalCommand (it is a GUI-only Object Properties setting). For
+  // already-persisted visualizations that emit it we synthesise the same
+  // behaviour: define a hidden boolean for the condition expression, read
+  // its current value to set initial visibility, and register an update
+  // listener so toggling the controlling slider/boolean re-applies it.
+  var conditionRegistry = [];
+  var conditionCounter = 0;
+
+  function disposeConditions() {
+    if (!ggbApi) { conditionRegistry = []; return; }
+    for (var i = 0; i < conditionRegistry.length; i++) {
+      var entry = conditionRegistry[i];
+      try {
+        if (entry.listener && typeof ggbApi.unregisterObjectUpdateListener === 'function') {
+          ggbApi.unregisterObjectUpdateListener(entry.boolName);
+        }
+      } catch (_) {}
+    }
+    conditionRegistry = [];
+  }
+
+  function maybeApplyShowCondition(cmd) {
+    var match = /^SetConditionToShowObject\s*\((.*)\)\s*$/.exec(String(cmd || '').trim());
+    if (!match || !ggbApi) return false;
+    var args = parseSimpleArgs(match[1]);
+    if (args.length !== 2) return false;
+    var targetName = stripOuterQuotes(args[0]).trim();
+    var expr = String(args[1] || '').trim();
+    if (!targetName || !expr) return false;
+    if (!ggbApi.exists(targetName)) return false;
+    conditionCounter += 1;
+    var boolName = '__hgCond_' + conditionCounter;
+    var defined = false;
+    try {
+      defined = ggbApi.evalCommand(boolName + '=' + expr) !== false;
+    } catch (_) {}
+    if (!defined) return false;
+    try { ggbApi.setVisible(boolName, false); } catch (_) {}
+    try { if (typeof ggbApi.setAuxiliary === 'function') ggbApi.setAuxiliary(boolName, true); } catch (_) {}
+    function applyOnce() {
+      try {
+        var raw = ggbApi.getValue(boolName);
+        ggbApi.setVisible(targetName, raw === 1 || raw === true);
+      } catch (_) {}
+    }
+    applyOnce();
+    var listener = null;
+    try {
+      if (typeof ggbApi.registerObjectUpdateListener === 'function') {
+        listener = applyOnce;
+        ggbApi.registerObjectUpdateListener(boolName, listener);
+      }
+    } catch (_) {}
+    conditionRegistry.push({ boolName: boolName, listener: listener });
+    return true;
+  }
   // ── 1. Bootstrap the GeoGebra applet ───────────────────────────────
   function bootstrap(settings, commands) {
     var appName = inferAppName(settings || {}, commands || []);
@@ -475,6 +579,8 @@
         // (evalCommand doesn't support setCoordSystem etc.). For everything
         // else we hand the verbatim command to the GeoGebra parser.
         if (maybeApplyApiCommand(cmd)) continue;
+        if (maybeCreateImplicitLine(cmd)) continue;
+        if (maybeApplyShowCondition(cmd)) continue;
         var ok = ggbApi.evalCommand(cmd);
         if (ok === false) failures.push({ index: i, cmd: cmd });
       } catch (e) {
@@ -520,6 +626,7 @@
       try { ggbApi.reset(); } catch (_) {
         try { ggbApi.newConstruction(); } catch (_) {}
       }
+      disposeConditions();
       ggbApi.setRepaintingActive(false);
       applySettings(req.ggbSettings);
       runCommands(req.ggbCommands);

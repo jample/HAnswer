@@ -10,6 +10,7 @@ import { apiUrl } from '../../lib/api';
 type SessionSummary = {
   id: string;
   question_id: string | null;
+  solution_id: string | null;
   title: string;
   latest_summary: string;
   key_facts: string[];
@@ -35,10 +36,18 @@ type Memory = {
 
 type QuestionContext = {
   question_id: string;
+  solution_id: string | null;
   subject: string;
   grade_band: string;
   difficulty: number;
   status: string;
+  answer_anchor?: {
+    solution_id: string | null;
+    title: string;
+    status: string;
+    has_answer: boolean;
+    anchor_scope: string;
+  };
   parsed_question: {
     topic_path: string[];
     question_text: string;
@@ -78,6 +87,7 @@ function DialogPageInner() {
   const searchParams = useSearchParams();
   const sessionIdFromQuery = searchParams.get('sessionId');
   const questionIdFromQuery = searchParams.get('questionId');
+  const solutionIdFromQuery = searchParams.get('solutionId');
   const autoCreatedRef = useRef(false);
 
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
@@ -121,7 +131,7 @@ function DialogPageInner() {
     }
   }
 
-  async function createSession(payload: { title?: string; question_id?: string | null }) {
+  async function createSession(payload: { title?: string; question_id?: string | null; solution_id?: string | null }) {
     setError(null);
     try {
       const res = await fetch(apiUrl('/api/dialog/sessions'), {
@@ -187,7 +197,10 @@ function DialogPageInner() {
     }
 
     if (questionIdFromQuery) {
-      const existing = sessions.find((item) => item.question_id === questionIdFromQuery);
+      const existing = sessions.find((item) => (
+        item.question_id === questionIdFromQuery
+        && (!solutionIdFromQuery || item.solution_id === solutionIdFromQuery)
+      ));
       if (existing) {
         if (selectedId !== existing.id) {
           loadSession(existing.id).catch(() => {});
@@ -196,7 +209,7 @@ function DialogPageInner() {
       }
       if (!autoCreatedRef.current) {
         autoCreatedRef.current = true;
-        createSession({ question_id: questionIdFromQuery }).catch(() => {});
+        createSession({ question_id: questionIdFromQuery, solution_id: solutionIdFromQuery }).catch(() => {});
       }
       return;
     }
@@ -204,7 +217,7 @@ function DialogPageInner() {
     if (!selectedId && sessions[0]) {
       loadSession(sessions[0].id).catch(() => {});
     }
-  }, [loadingSessions, questionIdFromQuery, selectedId, sessionIdFromQuery, sessions]);
+  }, [loadingSessions, questionIdFromQuery, selectedId, sessionIdFromQuery, sessions, solutionIdFromQuery]);
 
   const lastAssistant = [...(detail?.messages || [])].reverse().find((msg) => msg.role === 'assistant');
   const followUps = lastAssistant?.metadata?.follow_up_suggestions || [];
@@ -226,9 +239,9 @@ function DialogPageInner() {
           <button
             className="btn btn-secondary"
             style={{ width: '100%', marginTop: 12, justifyContent: 'center' }}
-            onClick={() => createSession({ question_id: questionIdFromQuery })}
+            onClick={() => createSession({ question_id: questionIdFromQuery, solution_id: solutionIdFromQuery })}
           >
-            基于题目新建对话
+            基于当前解法新建对话
           </button>
         )}
 
@@ -246,7 +259,9 @@ function DialogPageInner() {
             >
               <div className="dialog-session-title">{session.title}</div>
               <div className="dialog-session-meta">
-                {session.question_id ? `题目 ${session.question_id.slice(0, 8)}` : '自由学习对话'}
+                {session.question_id
+                  ? `题目 ${session.question_id.slice(0, 8)}${session.solution_id ? ` · 解法 ${session.solution_id.slice(0, 8)}` : ''}`
+                  : '自由学习对话'}
               </div>
               <div className="dialog-session-preview">
                 {session.latest_summary || '暂无摘要，发送第一条消息后会建立记忆。'}
@@ -274,6 +289,11 @@ function DialogPageInner() {
                     {detail.session.question_id ? (
                       <>
                         绑定题目 <code>{detail.session.question_id}</code>
+                        {detail.session.solution_id && (
+                          <>
+                            {' · '}锚定解法 <code>{detail.session.solution_id}</code>
+                          </>
+                        )}
                         {' · '}
                         <Link href={`/q/${detail.session.question_id}`}>回到解答页</Link>
                       </>
@@ -299,6 +319,15 @@ function DialogPageInner() {
                       <RichText text={detail.question_context.parsed_question.question_text} />
                     </div>
                   </div>
+                  {detail.question_context.answer_anchor && (
+                    <div style={{ marginTop: 12, padding: 12, borderRadius: 12, background: 'rgba(15, 23, 42, 0.04)' }}>
+                      <div style={{ fontWeight: 600 }}>对话锚定答案</div>
+                      <div style={{ marginTop: 6, color: 'var(--text-secondary)' }}>
+                        {detail.question_context.answer_anchor.title}
+                        {' · '}状态 {detail.question_context.answer_anchor.status}
+                      </div>
+                    </div>
+                  )}
                   {detail.question_context.answer_context?.method_pattern?.name_cn && (
                     <div style={{ marginTop: 10, color: 'var(--text-secondary)' }}>
                       方法模式: <strong>{detail.question_context.answer_context.method_pattern.name_cn}</strong>

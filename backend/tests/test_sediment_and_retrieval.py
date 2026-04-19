@@ -214,7 +214,6 @@ async def test_sediment_creates_pattern_and_kp_rows(session, tmp_image_dir):
     unit_kinds = {row.unit_kind for row in retrieval_units}
     assert {"question_focus", "answer_focus", "method", "keyword_profile"} <= unit_kinds
 
-    assert str(qid) in vs._rows["q_emb"]
     assert str(qid) in vs._rows["question_full_emb"]
     assert str(qid) in vs._rows["answer_full_emb"]
     for row in retrieval_units:

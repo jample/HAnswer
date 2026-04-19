@@ -69,6 +69,9 @@ class Question(Base):
     dedup_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     seen_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="draft")
+    # Per-surface SHA256 of the text we last embedded for this question
+    # ({"qfull": "...", "afull": "..."}). NULL = never sedimented.
+    embedding_sigs: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = _created_at()
 
     __table_args__ = (
@@ -180,6 +183,7 @@ class RetrievalUnitRow(Base):
     keywords_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=list)
     weight: Mapped[float] = mapped_column(Numeric(4, 3), nullable=False, default=1.0)
     source_section: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    embedding_sig: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = _created_at()
 
     __table_args__ = (
@@ -240,6 +244,7 @@ class KnowledgePoint(Base):
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
     seen_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     embedding_ref: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    embedding_sig: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = _created_at()
 
     __table_args__ = (
@@ -261,6 +266,7 @@ class MethodPatternRow(Base):
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
     seen_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     embedding_ref: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    embedding_sig: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = _created_at()
 
     __table_args__ = (
@@ -337,6 +343,9 @@ class ConversationSession(Base):
     question_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("questions.id", ondelete="SET NULL"), nullable=True,
     )
+    solution_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("question_solutions.id", ondelete="SET NULL"), nullable=True,
+    )
     title: Mapped[str] = mapped_column(String(256), nullable=False, default="新对话")
     latest_summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
     key_facts_json: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
@@ -349,6 +358,7 @@ class ConversationSession(Base):
     __table_args__ = (
         Index("ix_conversation_sessions_last_message_at", "last_message_at"),
         Index("ix_conversation_sessions_question_id", "question_id"),
+        Index("ix_conversation_sessions_solution_id", "solution_id"),
     )
 
 

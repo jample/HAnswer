@@ -241,6 +241,9 @@ VISUALIZATION_SCHEMA: dict = {
                 " 这里只放创建对象/样式/动画命令; SetCoordSystem /"
                 " SetGridVisible / SetAxesVisible / SetPerspective 这类视图或"
                 " 布局控制应写入 ggb_settings。对象标签尽量使用简短 ASCII 名称,"
+                " 若某个交互参数出现在 params 中, 这里只定义同名对象, 不要"
+                " 再写 SetValue(name, value) 初始化; 初始值统一放到"
+                " params[].default。"
                 " 避免下划线和中文。"
                 "禁止换行符 (一行一个命令); 单条命令最长 512 字符; 总数 ≤ 64。"
             ),
@@ -298,6 +301,11 @@ VISUALIZATION_SCHEMA: dict = {
                     "step": {"type": "number"},
                     "default": {},
                 },
+                "description": (
+                    "前端交互参数。name 必须对应 ggb_commands 中已经定义的同名"
+                    "滑块/开关对象; default 是其初始值。不要额外生成"
+                    "SetValue(name, value) 命令。"
+                ),
             },
         },
         "animation": {
@@ -316,7 +324,16 @@ VISUALIZATION_LIST_SCHEMA: dict = {
     "type": "object",
     "required": ["visualizations"],
     "properties": {
-        "visualizations": {"type": "array", "items": VISUALIZATION_SCHEMA},
+        "visualizations": {
+            "type": "array",
+            "items": VISUALIZATION_SCHEMA,
+            "minItems": 3,
+            "maxItems": 4,
+            "description": (
+                "面向中学应考场景, 3-4 个可视化; 需覆盖解答中不同"
+                "的关键阶段/分类讨论/最终结论。"
+            ),
+        },
     },
     "additionalProperties": False,
 }

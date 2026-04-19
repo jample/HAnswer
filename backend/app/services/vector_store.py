@@ -25,7 +25,7 @@ class Hit:
     score: float                # higher is better (IP / cosine)
     subject: str = ""
     grade_band: str = ""
-    difficulty: int = 0         # only used for q_emb
+    difficulty: int = 0         # only used for question_full / answer_full / retrieval_unit
 
 
 class VectorStore(Protocol):
@@ -118,7 +118,6 @@ class InMemoryVectorStore:
 
     def __init__(self) -> None:
         self._rows: dict[str, dict[str, dict]] = {
-            "q_emb": {},
             "question_full_emb": {},
             "answer_full_emb": {},
             "retrieval_unit_emb": {},
@@ -126,7 +125,6 @@ class InMemoryVectorStore:
             "kp_emb": {},
         }
         self._sparse: dict[str, dict[str, dict]] = {
-            "q_emb": {},
             "question_full_emb": {},
             "answer_full_emb": {},
             "retrieval_unit_emb": {},
@@ -237,7 +235,6 @@ class MilvusVectorStore:
     """Production backend — pymilvus client (lazy-initialized)."""
 
     _RAW_FIELDS = {
-        "q_emb": ("ref_pg_id",),
         "question_full_emb": ("question_id",),
         "answer_full_emb": ("question_id",),
         "retrieval_unit_emb": ("retrieval_unit_id",),
@@ -330,7 +327,7 @@ class MilvusVectorStore:
             "grade_band": grade_band,
             "vector": vector,
         }
-        if collection in {"q_emb", "question_full_emb", "answer_full_emb", "retrieval_unit_emb"}:
+        if collection in {"question_full_emb", "answer_full_emb", "retrieval_unit_emb"}:
             row["difficulty"] = difficulty
         if collection == "retrieval_unit_emb":
             row["unit_kind"] = unit_kind
@@ -369,7 +366,7 @@ class MilvusVectorStore:
                 "subject", "grade_band",
             ] + (
                 ["difficulty"]
-                if collection in {"q_emb", "question_full_emb", "answer_full_emb", "retrieval_unit_emb"}
+                if collection in {"question_full_emb", "answer_full_emb", "retrieval_unit_emb"}
                 else []
             ) + (["unit_kind"] if collection == "retrieval_unit_emb" else []),
         )
@@ -404,7 +401,7 @@ class MilvusVectorStore:
             "grade_band": grade_band,
             "sparse_vector": sparse,
         }
-        if collection in {"q_emb", "question_full_emb", "answer_full_emb", "retrieval_unit_emb"}:
+        if collection in {"question_full_emb", "answer_full_emb", "retrieval_unit_emb"}:
             row["difficulty"] = difficulty
         if collection == "retrieval_unit_emb":
             row["unit_kind"] = unit_kind
@@ -444,7 +441,7 @@ class MilvusVectorStore:
                 "subject", "grade_band",
             ] + (
                 ["difficulty"]
-                if collection in {"q_emb", "question_full_emb", "answer_full_emb", "retrieval_unit_emb"}
+                if collection in {"question_full_emb", "answer_full_emb", "retrieval_unit_emb"}
                 else []
             ) + (["unit_kind"] if collection == "retrieval_unit_emb" else []),
         )

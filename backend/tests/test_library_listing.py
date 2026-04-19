@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -224,4 +225,82 @@ async def test_list_questions_only_returns_learning_ready_items_and_supports_fac
             await s.execute(delete(models.MethodPatternRow).where(
                 models.MethodPatternRow.id == pattern_id
             ))
+            await s.commit()
+
+
+@pytest.mark.asyncio
+async def test_list_questions_scans_beyond_old_cap_and_supports_offset_pagination():
+    marker = f"lib-page-{uuid.uuid4().hex[:8]}"
+    created_ids: list[uuid.UUID] = []
+
+    async with session_scope() as s:
+        base_time = datetime.now(UTC) - timedelta(hours=1)
+        rows: list[models.Question] = []
+        for idx in range(30):
+            rows.append(models.Question(
+                parsed_json=_parsed_payload(f"{marker} match {idx}"),
+                answer_package_json=None,
+                subject="math",
+                grade_band="senior",
+                difficulty=3,
+                dedup_hash=hashlib.sha1(f"{marker}-match-{idx}".encode()).hexdigest(),
+                seen_count=1,
+                status="answered",
+                created_at=base_time + timedelta(seconds=idx),
+            ))
+        for idx in range(100):
+            rows.append(models.Question(
+                parsed_json=_parsed_payload(f"other-noise-{idx}"),
+                answer_package_json=None,
+                subject="math",
+                grade_band="senior",
+                difficulty=3,
+                dedup_hash=hashlib.sha1(f"{marker}-noise-{idx}".encode()).hexdigest(),
+                seen_count=1,
+                status="answered",
+                created_at=base_time + timedelta(minutes=10, seconds=idx),
+            ))
+        s.add_all(rows)
+        await s.flush()
+        created_ids = [row.id for row in rows]
+
+    try:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as c:
+            first = await c.get(
+                "/api/questions",
+                params={
+                    "q": marker,
+                    "learning_ready": "false",
+                    "limit": 20,
+                    "offset": 0,
+                },
+            )
+            assert first.status_code == 200, first.text
+            first_body = first.json()
+            assert first_body["count"] == 20
+            assert first_body["total_count"] == 30
+            assert first_body["has_more"] is True
+            assert first_body["next_offset"] == 20
+            assert all(marker in item["question_text"] for item in first_body["items"])
+
+            second = await c.get(
+                "/api/questions",
+                params={
+                    "q": marker,
+                    "learning_ready": "false",
+                    "limit": 20,
+                    "offset": 20,
+                },
+            )
+            assert second.status_code == 200, second.text
+            second_body = second.json()
+            assert second_body["count"] == 10
+            assert second_body["total_count"] == 30
+            assert second_body["has_more"] is False
+            assert second_body["next_offset"] is None
+            assert all(marker in item["question_text"] for item in second_body["items"])
+    finally:
+        async with session_scope() as s:
+            await s.execute(delete(models.Question).where(models.Question.id.in_(created_ids)))
             await s.commit()

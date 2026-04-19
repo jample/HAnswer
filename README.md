@@ -112,7 +112,7 @@ model_parser   = "gemini-3.1-pro-preview" # image → ParsedQuestion
 model_solver   = "gemini-3.1-pro-preview" # ParsedQuestion → AnswerPackage
 model_vizcoder = "gemini-3.1-pro-preview" # AnswerPackage → visualizations[]
 model_embed    = "gemini-embedding-2-preview"  # or "gemini-embedding-001"
-embed_dim      = 768  # model default 3072; 768 saves storage
+embed_dim      = 1536 # model default 3072; 1536 is the recommended MRL prefix
 
 [postgres]
 dsn = "postgresql+asyncpg://jianbo@localhost:5432/jianbo"  # asyncpg driver required
@@ -122,7 +122,8 @@ host     = "localhost"
 port     = 19530
 database = "default"
 auto_bootstrap = true                   # create collections on FastAPI startup
-recreate_dense_on_dim_mismatch = false  # safety valve; don't auto-drop by default
+recreate_dense_on_dim_mismatch = true   # recreate stale dense collections when dim changes
+auto_reindex_on_bootstrap_change = true # rebuild Milvus from PostgreSQL after bootstrap changes
 
 [server]
 host         = "127.0.0.1"
@@ -365,7 +366,7 @@ structural — no local model load on each query.
 ```toml
 [gemini]
 model_embed    = "gemini-embedding-2-preview"
-embed_dim      = 768
+embed_dim      = 1536
 
 [retrieval]
 embedder       = "gemini"
@@ -401,13 +402,19 @@ change for `bge-m3`. What matters is that:
 - you are on Milvus 2.4+ so `SPARSE_INVERTED_INDEX` is supported
 - the backend can reach `host:port`
 - dense collections are recreated when the active embedder dim changes
-  from Gemini 768 to bge-m3 1024
+  from Gemini 1536 to bge-m3 1024
+
+In the current repo defaults, FastAPI startup will auto-bootstrap Milvus,
+recreate stale dense collections on a dim mismatch, and then rebuild the
+Milvus retrieval rows from PostgreSQL automatically. The manual
+`scripts.rebuild_retrieval_index` flow is still useful for one-off repairs
+or explicit operator control.
 
 `python -m app.services.milvus_setup --doctor` now reports the active
 dense dim and any collection mismatches. `scripts.rebuild_retrieval_index`
-rebuilds `q_emb`, `question_full_emb`, `answer_full_emb`,
-`retrieval_unit_emb`, `pattern_emb`, and `kp_emb` from PostgreSQL so
-you do not have to re-answer every old question manually.
+rebuilds `question_full_emb`, `answer_full_emb`, `retrieval_unit_emb`,
+`pattern_emb`, and `kp_emb` from PostgreSQL so you do not have to
+re-answer every old question manually.
 
 If you switch sparse encoder family (`bge-m3` ↔ `bm25`), use
 `--recreate-sparse` as well so Milvus does not keep stale sparse rows
@@ -473,7 +480,7 @@ python -m scripts.smoke_parse ../data/samples/q1.jpg --subject math
 | `bge-m3` import fails inside `FlagEmbedding` with a `transformers` symbol error | `FlagEmbedding 1.x` was installed alongside an incompatible `transformers` 5.x build | Re-run `cd backend && python -m pip install -e '.[retrieval]'`; the repo now pins `transformers<5` for the retrieval extra |
 | `pytest` fails with `connection refused: 5432` | Postgres not running or DSN wrong | `pg_isready -p 5432`; fix `[postgres].dsn` |
 | Milvus collections missing / `get_collection_stats` errors | Milvus still starting (~90s first boot), or `auto_bootstrap=false` | `docker compose ps` — wait for `healthy`; run `python -m app.services.milvus_setup` |
-| Milvus doctor reports dense-dim mismatch (`actual=768`, `expected=1024`) after switching to `bge-m3` | Dense collections were created under Gemini embeddings and are now incompatible with the active embedder | Run `python -m scripts.rebuild_retrieval_index --recreate-dense --recreate-sparse` after switching `[retrieval].embedder` / `sparse_encoder` |
+| Milvus doctor reports a dense-dim mismatch after an embedder switch | Existing dense collections were created under a different embedding dimension and are now incompatible with the active embedder | Restart the backend to let auto-bootstrap recreate and reindex Milvus, or run `python -m scripts.rebuild_retrieval_index --recreate-dense --recreate-sparse` for a manual rebuild |
 | `/library` hits return empty despite questions in PG | Milvus collections not populated or still contain old vectors from a previous embedder or sparse encoder | Run `python -m scripts.rebuild_retrieval_index`; if you changed embedder or sparse-encoder family, use `--recreate-dense --recreate-sparse` |
 | Viz tile shows `可视化失败: Evaluating a string as JavaScript ... 'unsafe-eval'` | Old sandbox runtime path still loaded, or frontend dev/build server was not restarted after the sandbox runtime changed | Restart the frontend so `/viz/sandbox.html` serves the updated runtime; the current implementation no longer uses the `Function` constructor |
 | Viz never renders but no error | `public/viz/jsxgraphcore.js` missing | Re-run the two `curl` commands in [first-time setup](#5-frontend) |

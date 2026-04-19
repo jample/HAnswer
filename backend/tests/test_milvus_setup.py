@@ -75,9 +75,10 @@ def test_milvus_setup_recreates_dense_mismatch(monkeypatch):
         fake = _FakeMilvusClient(existing={name: 768 for name in milvus_setup.COLLECTIONS})
         fake.existing.update({name: 0 for name in milvus_setup.SPARSE_COLLECTIONS})
         monkeypatch.setattr(milvus_setup, "get_client", lambda: fake)
-        milvus_setup.ensure_collections(recreate_dense_on_dim_mismatch=True)
+        bootstrap = milvus_setup.ensure_collections(recreate_dense_on_dim_mismatch=True)
         assert set(fake.dropped) == set(milvus_setup.COLLECTIONS)
         assert set(fake.created) == set(milvus_setup.COLLECTIONS)
+        assert set(bootstrap.recreated_dense) == set(milvus_setup.COLLECTIONS)
     finally:
         settings.retrieval.embedder = old_embedder
 
@@ -86,8 +87,9 @@ def test_milvus_setup_force_recreates_dense(monkeypatch):
     fake = _FakeMilvusClient(existing={name: settings.retrieval_dense_dim for name in milvus_setup.COLLECTIONS})
     fake.existing.update({name: 0 for name in milvus_setup.SPARSE_COLLECTIONS})
     monkeypatch.setattr(milvus_setup, "get_client", lambda: fake)
-    milvus_setup.ensure_collections(force_recreate_dense=True)
+    bootstrap = milvus_setup.ensure_collections(force_recreate_dense=True)
     assert set(fake.dropped) == set(milvus_setup.COLLECTIONS)
+    assert set(bootstrap.recreated_dense) == set(milvus_setup.COLLECTIONS)
 
 
 def test_milvus_doctor_reports_dense_dim_mismatch(monkeypatch):
@@ -99,7 +101,7 @@ def test_milvus_doctor_reports_dense_dim_mismatch(monkeypatch):
         monkeypatch.setattr(milvus_setup, "get_client", lambda: fake)
         report = milvus_setup.doctor()
         assert report["expected_dense_dim"] == settings.retrieval.bge_m3_dense_dim
-        assert report["dense_dim_mismatches"]["q_emb"]["actual"] == 768
+        assert report["dense_dim_mismatches"]["question_full_emb"]["actual"] == 768
     finally:
         settings.retrieval.embedder = old_embedder
 
@@ -107,5 +109,15 @@ def test_milvus_doctor_reports_dense_dim_mismatch(monkeypatch):
 def test_milvus_setup_recreates_sparse_when_requested(monkeypatch):
     fake = _FakeMilvusClient(existing={name: 0 for name in milvus_setup.SPARSE_COLLECTIONS})
     monkeypatch.setattr(milvus_setup, "get_client", lambda: fake)
-    milvus_setup.ensure_collections(recreate_sparse=True)
+    bootstrap = milvus_setup.ensure_collections(recreate_sparse=True)
     assert set(fake.dropped) == set(milvus_setup.SPARSE_COLLECTIONS)
+    assert set(bootstrap.recreated_sparse) == set(milvus_setup.SPARSE_COLLECTIONS)
+
+
+def test_milvus_setup_reports_created_collections(monkeypatch):
+    fake = _FakeMilvusClient(existing={})
+    monkeypatch.setattr(milvus_setup, "get_client", lambda: fake)
+    bootstrap = milvus_setup.ensure_collections()
+    assert set(bootstrap.created_dense) == set(milvus_setup.COLLECTIONS)
+    assert set(bootstrap.created_sparse) == set(milvus_setup.SPARSE_COLLECTIONS)
+    assert bootstrap.changed is True

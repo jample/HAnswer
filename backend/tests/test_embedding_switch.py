@@ -102,5 +102,9 @@ async def test_text_embedding_004_falls_back_when_unavailable():
         task_type="RETRIEVAL_QUERY",
     )
 
-    assert out == [[0.5, 0.6]]
+    # Fallback path goes through the v2 transport which renormalizes the
+    # MRL-truncated prefix; expect L2 norm ~= 1.
+    assert len(out) == 1 and len(out[0]) == 2
+    norm = (out[0][0] ** 2 + out[0][1] ** 2) ** 0.5
+    assert abs(norm - 1.0) < 1e-6
     assert transport._text_embedding_004_available is False

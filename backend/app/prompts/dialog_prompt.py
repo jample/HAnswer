@@ -10,7 +10,7 @@ from app.prompts.schemas import CONVERSATION_TURN_RESULT_SCHEMA
 
 
 class DialogPrompt(PromptTemplate):
-    version = PromptVersion(major=1, minor=0, date_updated="2026-04-18")
+    version = PromptVersion(major=1, minor=1, date_updated="2026-04-19")
     name = "dialog"
 
     purpose = (
@@ -56,6 +56,14 @@ class DialogPrompt(PromptTemplate):
             ),
         ),
         DesignDecision(
+            title="对话锚定到具体解法答案",
+            rationale=(
+                "当会话绑定题目时, question_context 中不仅包含题面, 还包含一个具体"
+                " solution 的 answer_context。模型被要求优先围绕这份已生成答案解释、"
+                "追问和澄清, 避免脱离当前解法重新发散。"
+            ),
+        ),
+        DesignDecision(
             title="记忆只保留可迁移信息",
             rationale=(
                 "要求 summary/key_facts/open_questions 只保留后续推理会需要的事实、"
@@ -76,9 +84,11 @@ class DialogPrompt(PromptTemplate):
 ## 回答原则
 1. 优先回答用户当前这一问, 不要机械复述整个历史。
 2. 如果提供了 question_context, 必须以它为主要事实来源, 不要脱离题面和已有解答。
-3. summary / key_facts / open_questions 代表系统缓存的长期记忆; recent_messages 只代表最近局部上下文。
-4. 如果信息不足, 明确指出缺什么, 再给出在现有信息下最可靠的解释。
-5. 风格保持教学型、简洁、可追问; 适合中学数学/物理学习。
+3. 如果 question_context 中包含 answer_anchor / answer_context, 这代表会话已经绑定到某个具体解法。优先围绕这份答案解释“为什么这么做”“每一步从哪来”“还能怎样理解”; 不要忽略它重新另起一套无关解法。
+4. summary / key_facts / open_questions 代表系统缓存的长期记忆; recent_messages 只代表最近局部上下文。
+5. 如果信息不足, 明确指出缺什么, 再给出在现有信息下最可靠的解释。
+6. 风格保持教学型、简洁、可追问; 适合中学数学/物理学习。
+7. 如果用户明确要求比较别的解法, 可以在先解释当前锚定答案的基础上补充对比, 但要明确说明“当前对话锚定的是哪一个解法答案”。
 
 ## 记忆维护原则
 - summary: 压缩后的当前会话状态, 便于下一轮恢复上下文。
