@@ -45,6 +45,7 @@ from app.services.sparse_encoder import get_sparse_encoder
 from app.services.stage_review_service import (
     REVIEW_CONFIRMED,
     REVIEW_PENDING,
+    REVIEW_REJECTED,
     build_stage_user_guidance,
     clear_stage_outputs,
     list_stage_reviews,
@@ -137,7 +138,10 @@ def _serialize_viz_row(row: VisualizationRow) -> dict:
         "caption_cn": row.caption,
         "learning_goal": row.learning_goal,
         "helpers_used": list(row.helpers_used_json or []),
+        "engine": getattr(row, "engine", None) or "jsxgraph",
         "jsx_code": row.jsx_code,
+        "ggb_commands": list(getattr(row, "ggb_commands_json", None) or []),
+        "ggb_settings": getattr(row, "ggb_settings_json", None),
         "params": list(row.params_json or []),
         "animation": row.animation_json,
     }
@@ -423,13 +427,30 @@ async def _run_answer_job(
                     solution=solution,
                     target_stage="solving",
                 )
-                async for _ in generate_answer(
+                async for ev in generate_answer(
                     session,
                     question_id=question_id,
                     llm=llm,
                     user_guidance=user_guidance,
                 ):
-                    pass
+                    # Persist each streamed section in its own transaction
+                    # so the polling /resume endpoint sees progress while
+                    # Gemini is still generating later sections. The
+                    # solver's final _persist rewrites these rows
+                    # transactionally with the validated payload.
+                    try:
+                        await _append_section(
+                            question_id,
+                            section=ev.name,
+                            payload=ev.data,
+                        )
+                    except Exception:  # noqa: BLE001
+                        # Streaming-progress writes are best-effort; the
+                        # canonical write still happens in solver._persist.
+                        log.exception(
+                            "incremental section persist failed for %s/%s",
+                            question_id, ev.name,
+                        )
                 q = await repo.get_question(session, question_id)
                 if q is None or q.answer_package_json is None:
                     raise KeyError(f"question {question_id} missing answer package")
@@ -510,9 +531,18 @@ async def _run_answer_job(
             await _set_stage(
                 question_id,
                 stage="indexing",
-                message="正在写入知识点、方法模式与检索索引。",
+                message="准备进入索引阶段…",
                 solution_id=solution_id,
             )
+
+            async def _progress(msg: str) -> None:
+                await _set_stage(
+                    question_id,
+                    stage="indexing",
+                    message=msg,
+                    solution_id=solution_id,
+                )
+
             summary: dict | None = None
             refs: dict | None = None
             async with session_scope() as session:
@@ -538,6 +568,7 @@ async def _run_answer_job(
                         embedding=build_dense_embedder(llm),
                         vector_store=vector_store,
                         sparse_encoder=get_sparse_encoder(),
+                        progress=_progress,
                     )
                     retrieval_rows = list((await session.execute(
                         select(RetrievalUnitRow).where(RetrievalUnitRow.question_id == question_id)

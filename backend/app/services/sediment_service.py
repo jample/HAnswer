@@ -20,8 +20,10 @@ Resolution rules:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 from sqlalchemy import select
@@ -211,6 +213,18 @@ async def _upsert_kp_link(
 # ── main entry point ────────────────────────────────────────────────
 
 
+ProgressCallback = Callable[[str], Awaitable[None]]
+
+
+async def _maybe_report(progress: ProgressCallback | None, message: str) -> None:
+    if progress is None:
+        return
+    try:
+        await progress(message)
+    except Exception:  # noqa: BLE001
+        log.exception("sediment progress callback failed")
+
+
 async def sediment(
     session: AsyncSession,
     *,
@@ -220,6 +234,7 @@ async def sediment(
     embedding: DenseEmbedder,
     vector_store: VectorStore,
     sparse_encoder: SparseEncoder | None = None,
+    progress: ProgressCallback | None = None,
 ) -> SedimentResult:
     """Persist pattern / kps / embeddings for a freshly answered question.
 
@@ -234,6 +249,7 @@ async def sediment(
         raise KeyError(f"question {question_id} not found")
 
     # 1. Pattern
+    await _maybe_report(progress, "解析方法模式与知识点…")
     pattern_row, _ = await _resolve_pattern(
         session, mp=package.method_pattern, subject=q.subject, grade_band=q.grade_band,
     )
@@ -248,6 +264,7 @@ async def sediment(
         kp_ids.append(kp_row.id)
         await _upsert_kp_link(session, question_id, kp_row.id, weight=ref.weight)
 
+    await _maybe_report(progress, "构建检索单元 (步骤 / 公式 / 易错点)…")
     parsed = ParsedQuestion.model_validate(q.parsed_json or {})
     index = build_pedagogical_index(parsed=parsed, package=package)
     retrieval_unit_rows = await persist_pedagogical_index(
@@ -284,6 +301,10 @@ async def sediment(
         *kp_texts,
         *retrieval_unit_texts,
     ]
+    await _maybe_report(
+        progress,
+        f"调用 Gemini Embedding 生成稠密向量 ({len(texts_to_embed)} 段文本)…",
+    )
     vectors = await embedding.embed_many(texts_to_embed)
     q_vec = vectors[0]
     question_full_vec = vectors[1]
@@ -316,63 +337,53 @@ async def sediment(
             near_dup_of = hit_question_id
             break
 
-    # 5. Upserts
-    await vector_store.upsert(
-        "q_emb",
-        ref_id=solution_ref,
-        vector=q_vec,
-        subject=q.subject,
-        grade_band=q.grade_band,
-        difficulty=q.difficulty,
+    # 5. Upserts — fan out concurrently to Milvus.
+    total_dense = 4 + len(kp_rows) + len(retrieval_unit_rows)
+    await _maybe_report(
+        progress,
+        f"写入向量数据库 (稠密 {total_dense} 条)…",
     )
-    await vector_store.upsert(
-        "question_full_emb",
-        ref_id=solution_ref,
-        vector=question_full_vec,
-        subject=q.subject,
-        grade_band=q.grade_band,
-        difficulty=q.difficulty,
-    )
-    await vector_store.upsert(
-        "answer_full_emb",
-        ref_id=solution_ref,
-        vector=answer_full_vec,
-        subject=q.subject,
-        grade_band=q.grade_band,
-        difficulty=q.difficulty,
-    )
-    await vector_store.upsert(
-        "pattern_emb",
-        ref_id=str(pattern_row.id),
-        vector=pattern_vec,
-        subject=q.subject,
-        grade_band=q.grade_band,
-    )
+    dense_jobs: list[Awaitable[None]] = [
+        vector_store.upsert(
+            "q_emb", ref_id=solution_ref, vector=q_vec,
+            subject=q.subject, grade_band=q.grade_band, difficulty=q.difficulty,
+        ),
+        vector_store.upsert(
+            "question_full_emb", ref_id=solution_ref, vector=question_full_vec,
+            subject=q.subject, grade_band=q.grade_band, difficulty=q.difficulty,
+        ),
+        vector_store.upsert(
+            "answer_full_emb", ref_id=solution_ref, vector=answer_full_vec,
+            subject=q.subject, grade_band=q.grade_band, difficulty=q.difficulty,
+        ),
+        vector_store.upsert(
+            "pattern_emb", ref_id=str(pattern_row.id), vector=pattern_vec,
+            subject=q.subject, grade_band=q.grade_band,
+        ),
+    ]
     for row, vec in zip(kp_rows, kp_vecs):
-        await vector_store.upsert(
-            "kp_emb",
-            ref_id=str(row.id),
-            vector=vec,
-            subject=row.subject,
-            grade_band=row.grade_band,
-        )
+        dense_jobs.append(vector_store.upsert(
+            "kp_emb", ref_id=str(row.id), vector=vec,
+            subject=row.subject, grade_band=row.grade_band,
+        ))
         row.embedding_ref = str(row.id)
     pattern_row.embedding_ref = str(pattern_row.id)
     for row, vec in zip(retrieval_unit_rows, retrieval_unit_vecs):
-        await vector_store.upsert(
-            "retrieval_unit_emb",
-            ref_id=str(row.id),
-            vector=vec,
-            subject=q.subject,
-            grade_band=q.grade_band,
-            difficulty=q.difficulty,
-            unit_kind=row.unit_kind,
-        )
+        dense_jobs.append(vector_store.upsert(
+            "retrieval_unit_emb", ref_id=str(row.id), vector=vec,
+            subject=q.subject, grade_band=q.grade_band,
+            difficulty=q.difficulty, unit_kind=row.unit_kind,
+        ))
+    await asyncio.gather(*dense_jobs)
 
     # 5b. Sparse lexical upserts (M5 multi-route). The sparse encoder
     # accumulates corpus statistics here so future queries get real
     # IDF weighting.
     if sparse_encoder is not None and getattr(vector_store, "supports_sparse", False):
+        await _maybe_report(
+            progress,
+            f"写入稀疏向量索引 (BM25 / bge-m3, {len(texts_to_embed)} 条)…",
+        )
         sparse_vecs = await sparse_encoder.encode(texts_to_embed)
         sp_q = sparse_vecs[0]
         sp_question_full = sparse_vecs[1]
@@ -380,40 +391,36 @@ async def sediment(
         sp_pat = sparse_vecs[3]
         sp_kps = sparse_vecs[kp_start:kp_end]
         sp_units = sparse_vecs[kp_end:]
-        await vector_store.upsert_sparse(
-            "q_emb", ref_id=solution_ref, sparse=sp_q,
-            subject=q.subject, grade_band=q.grade_band,
-            difficulty=q.difficulty,
-        )
-        await vector_store.upsert_sparse(
-            "question_full_emb", ref_id=solution_ref, sparse=sp_question_full,
-            subject=q.subject, grade_band=q.grade_band,
-            difficulty=q.difficulty,
-        )
-        await vector_store.upsert_sparse(
-            "answer_full_emb", ref_id=solution_ref, sparse=sp_answer_full,
-            subject=q.subject, grade_band=q.grade_band,
-            difficulty=q.difficulty,
-        )
-        await vector_store.upsert_sparse(
-            "pattern_emb", ref_id=str(pattern_row.id), sparse=sp_pat,
-            subject=q.subject, grade_band=q.grade_band,
-        )
+        sparse_jobs: list[Awaitable[None]] = [
+            vector_store.upsert_sparse(
+                "q_emb", ref_id=solution_ref, sparse=sp_q,
+                subject=q.subject, grade_band=q.grade_band, difficulty=q.difficulty,
+            ),
+            vector_store.upsert_sparse(
+                "question_full_emb", ref_id=solution_ref, sparse=sp_question_full,
+                subject=q.subject, grade_band=q.grade_band, difficulty=q.difficulty,
+            ),
+            vector_store.upsert_sparse(
+                "answer_full_emb", ref_id=solution_ref, sparse=sp_answer_full,
+                subject=q.subject, grade_band=q.grade_band, difficulty=q.difficulty,
+            ),
+            vector_store.upsert_sparse(
+                "pattern_emb", ref_id=str(pattern_row.id), sparse=sp_pat,
+                subject=q.subject, grade_band=q.grade_band,
+            ),
+        ]
         for row, sp in zip(kp_rows, sp_kps):
-            await vector_store.upsert_sparse(
+            sparse_jobs.append(vector_store.upsert_sparse(
                 "kp_emb", ref_id=str(row.id), sparse=sp,
                 subject=row.subject, grade_band=row.grade_band,
-            )
+            ))
         for row, sp in zip(retrieval_unit_rows, sp_units):
-            await vector_store.upsert_sparse(
-                "retrieval_unit_emb",
-                ref_id=str(row.id),
-                sparse=sp,
-                subject=q.subject,
-                grade_band=q.grade_band,
-                difficulty=q.difficulty,
-                unit_kind=row.unit_kind,
-            )
+            sparse_jobs.append(vector_store.upsert_sparse(
+                "retrieval_unit_emb", ref_id=str(row.id), sparse=sp,
+                subject=q.subject, grade_band=q.grade_band,
+                difficulty=q.difficulty, unit_kind=row.unit_kind,
+            ))
+        await asyncio.gather(*sparse_jobs)
 
     # 6. Near-dup: bump evidence on the canonical question.
     if near_dup_of is not None:

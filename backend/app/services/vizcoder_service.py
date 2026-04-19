@@ -2,10 +2,13 @@
 
 After the Solver finishes, this service:
   1. Loads the stored AnswerPackage + ParsedQuestion.
-  2. Calls VizCoderPrompt → `VisualizationList`.
-  3. Runs each viz through the AST validator (`viz_validator`).
-  4. Persists passing viz to `visualizations` and emits SSE `visualization`
-     events; failures emit an `error` event with the viz id but do not
+  2. Calls VizCoderPrompt → `VisualizationList`. The Pydantic
+     `Visualization` model enforces GeoGebra command shape rules;
+     violations trigger the LLM repair loop in `GeminiClient`.
+  3. For ``engine == "jsxgraph"`` legacy payloads, runs the Node/acorn
+     AST validator.
+  4. Persists passing viz to `visualizations` and emits SSE
+     `visualization` events; failures emit an `error` event but do not
      abort the stream (§3.3.3 fallback UI).
 """
 
@@ -40,7 +43,12 @@ async def _persist_viz(
         caption=viz.caption_cn,
         learning_goal=viz.learning_goal,
         helpers_used_json=list(viz.helpers_used),
+        engine=viz.engine,
         jsx_code=viz.jsx_code,
+        ggb_commands_json=list(viz.ggb_commands),
+        ggb_settings_json=(
+            viz.ggb_settings.model_dump(mode="json") if viz.ggb_settings else None
+        ),
         params_json=[p.model_dump(mode="json") for p in viz.params],
         animation_json=viz.animation.model_dump(mode="json") if viz.animation else None,
     ))
@@ -102,29 +110,36 @@ async def generate_visualizations(
         return
 
     for viz in result.visualizations:
-        try:
-            report = await validate_jsx_code(viz.jsx_code)
-        except VizValidationError as e:
-            log.warning("viz %s rejected: %s", viz.id, e.violations)
-            yield SSEEvent("error", {
-                "stage": "viz_validator",
-                "viz_id": viz.id,
-                "violations": e.violations,
-            })
-            continue
-        except RuntimeError as e:
-            # Node not installed etc. — surface so the operator notices,
-            # but don't fail the whole answer stream.
-            log.error("viz validator unavailable: %s", e)
-            yield SSEEvent("error", {
-                "stage": "viz_validator",
-                "viz_id": viz.id,
-                "message": str(e),
-            })
-            continue
+        ast_node_count = 0
+        if viz.engine == "geogebra":
+            # GeoGebra command shapes were validated by Pydantic; the
+            # repair loop already corrected anything fixable.
+            pass
+        else:
+            try:
+                report = await validate_jsx_code(viz.jsx_code)
+                ast_node_count = report.node_count
+            except VizValidationError as e:
+                log.warning("viz %s rejected: %s", viz.id, e.violations)
+                yield SSEEvent("error", {
+                    "stage": "viz_validator",
+                    "viz_id": viz.id,
+                    "violations": e.violations,
+                })
+                continue
+            except RuntimeError as e:
+                # Node not installed etc. — surface so the operator notices,
+                # but don't fail the whole answer stream.
+                log.error("viz validator unavailable: %s", e)
+                yield SSEEvent("error", {
+                    "stage": "viz_validator",
+                    "viz_id": viz.id,
+                    "message": str(e),
+                })
+                continue
 
         await _persist_viz(session, question_id, viz)
         yield SSEEvent("visualization", {
             **viz.model_dump(mode="json"),
-            "ast_node_count": report.node_count,
+            "ast_node_count": ast_node_count,
         })

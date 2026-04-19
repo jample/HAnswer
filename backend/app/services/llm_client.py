@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any, Protocol, TypeVar
 
@@ -28,6 +29,7 @@ from tenacity import (
 
 from app.config import settings
 from app.prompts.base import PromptTemplate
+from app.services.streaming_json import TopLevelStreamParser
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +57,21 @@ class LLMCallRecord:
     latency_ms: int
     status: str               # "ok" | "error" | "repaired"
     error: str | None = None
+
+
+@dataclass
+class StreamChunk:
+    """One delta yielded by ``generate_json_stream_iter``.
+
+    ``text`` is the new text since the previous chunk (may be empty if
+    this chunk only carries usage metadata). ``prompt_tokens`` /
+    ``completion_tokens`` are the latest cumulative counts and may be
+    zero until the final chunk.
+    """
+
+    text: str
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
 
 
 class CostLedger(Protocol):
@@ -95,6 +112,22 @@ class GeminiTransport(Protocol):
         """Return streamed partial JSON concatenated into one final JSON string."""
         ...
 
+    def generate_json_stream_iter(
+        self,
+        *,
+        model: str,
+        messages: list[dict],
+        response_schema: dict,
+        timeout_s: int,
+    ) -> AsyncIterator["StreamChunk"]:
+        """Yield raw text deltas as they arrive from the LLM.
+
+        The final chunk's ``usage`` carries the prompt/completion token
+        counts. Implementations should accumulate the partial text
+        themselves if they also need a final string for fallback.
+        """
+        ...
+
     async def embed(
         self,
         *,
@@ -125,6 +158,19 @@ class FakeTransport:
         raw = self.json_by_model.get(model, "{}")
         return raw, 0, 0
 
+    async def generate_json_stream_iter(
+        self, *, model, messages, response_schema, timeout_s,
+    ):
+        """Test double: yield the canned JSON in two halves to simulate
+        a streaming response."""
+        self.calls.append(
+            {"model": model, "messages": messages, "stream": True, "iter": True}
+        )
+        raw = self.json_by_model.get(model, "{}")
+        mid = max(1, len(raw) // 2)
+        yield StreamChunk(text=raw[:mid], prompt_tokens=0, completion_tokens=0)
+        yield StreamChunk(text=raw[mid:], prompt_tokens=0, completion_tokens=0)
+
     async def embed(self, *, model, texts, task_type=None) -> list[list[float]]:
         return [[0.0] * settings.gemini.embed_dim for _ in texts]
 
@@ -138,6 +184,7 @@ _COST_PER_1K: dict[str, tuple[float, float]] = {
     "gemini-3.1-pro-preview": (0.00125, 0.0050),
     "text-embedding-004": (0.0000125, 0.0),
     "gemini-embedding-001": (0.0000125, 0.0),
+    "gemini-embedding-2-preview": (0.0000125, 0.0),
 }
 
 
@@ -282,6 +329,121 @@ class GeminiClient:
             f"LLM output failed validation after "
             f"{settings.llm.max_repair_attempts} repair attempts: {last_err}"
         )
+
+    async def call_structured_streaming(
+        self,
+        *,
+        template: PromptTemplate,
+        model: str,
+        model_cls: type[T],
+        template_kwargs: dict[str, Any] | None = None,
+        messages_override: list[dict] | None = None,
+        timeout_s: int | None = None,
+    ) -> AsyncIterator[tuple[str, object] | T]:
+        """Stream-parse the LLM JSON, yielding ``(key, value)`` tuples
+        as each top-level field completes, then a final validated
+        ``model_cls`` instance.
+
+        On streaming-parse failure (malformed JSON or pydantic
+        validation), falls back to ``call_structured`` for one bulk
+        retry+repair cycle. The final yielded item is always either a
+        validated model instance or this method raises ``LLMError``.
+        """
+        tk = template_kwargs or {}
+        messages = messages_override or template.build(**tk)
+        trace = template.trace_tag()
+        resolved_timeout_s = timeout_s or settings.llm.request_timeout_s
+
+        # If the transport doesn't expose a true iterator, fall back to
+        # bulk path so callers still get a validated model out.
+        iter_fn = getattr(self.transport, "generate_json_stream_iter", None)
+        if iter_fn is None:
+            parsed = await self.call_structured(
+                template=template,
+                model=model,
+                model_cls=model_cls,
+                template_kwargs=template_kwargs,
+                messages_override=messages_override,
+                timeout_s=timeout_s,
+                stream=True,
+            )
+            yield parsed
+            return
+
+        parser = TopLevelStreamParser()
+        ptok = ctok = 0
+        t0 = time.perf_counter()
+        full_text_parts: list[str] = []
+
+        try:
+            async for chunk in iter_fn(
+                model=model,
+                messages=messages,
+                response_schema=template.schema,
+                timeout_s=resolved_timeout_s,
+            ):
+                if chunk.text:
+                    full_text_parts.append(chunk.text)
+                    for pair in parser.feed(chunk.text):
+                        yield pair
+                if chunk.prompt_tokens:
+                    ptok = chunk.prompt_tokens
+                if chunk.completion_tokens:
+                    ctok = chunk.completion_tokens
+        except TimeoutError as e:
+            raise TransientLLMError(
+                f"timeout after {resolved_timeout_s}s: {e}"
+            ) from e
+
+        raw_json = "".join(full_text_parts)
+        try:
+            parsed = model_cls.model_validate_json(raw_json)
+            latency = int((time.perf_counter() - t0) * 1000)
+            await self.ledger.record(
+                LLMCallRecord(
+                    task=trace["prompt_name"],
+                    prompt_version=trace["prompt_version"],
+                    model=model,
+                    prompt_tokens=ptok,
+                    completion_tokens=ctok,
+                    cost_usd=_estimate_cost_usd(model, ptok, ctok),
+                    latency_ms=latency,
+                    status="ok",
+                )
+            )
+            yield parsed
+            return
+        except ValidationError as e:
+            log.warning(
+                "streaming output failed validation; falling back to repair loop: %s",
+                e,
+            )
+            # Fallback: hand the bad JSON to the repair loop. We pass
+            # the prior assistant text so the repair prompt can correct
+            # it instead of regenerating from scratch.
+            repair_messages = [
+                *messages,
+                {"role": "assistant", "content": raw_json},
+                {
+                    "role": "user",
+                    "content": (
+                        "上一次输出不符合 JSON Schema, 请仅修正以下问题并重新输出"
+                        "完整 JSON (不要省略任何字段):\n"
+                        f"{e}\n\n"
+                        "仍须严格遵循 Schema, 不要添加解释文字。"
+                    ),
+                },
+            ]
+            parsed = await self.call_structured(
+                template=template,
+                model=model,
+                model_cls=model_cls,
+                template_kwargs=template_kwargs,
+                messages_override=repair_messages,
+                timeout_s=timeout_s,
+                stream=False,
+            )
+            yield parsed
 
     async def embed(
         self,

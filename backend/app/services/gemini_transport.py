@@ -10,11 +10,13 @@ import asyncio
 import logging
 
 from app.config import settings
-from app.services.llm_client import GeminiTransport, TransientLLMError
+from app.services.llm_client import GeminiTransport, StreamChunk, TransientLLMError
 
 log = logging.getLogger(__name__)
-_EMBED_FALLBACK_MODEL = "gemini-embedding-001"
+_EMBED_FALLBACK_MODEL = "gemini-embedding-2-preview"
 _LEGACY_TEXT_EMBED_MODELS = {"text-embedding-004", "models/text-embedding-004"}
+# gemini-embedding-2-preview uses task prefixes in prompt text, NOT task_type param
+_EMBED_V2_MODELS = {"gemini-embedding-2-preview"}
 
 
 def _flatten_messages(messages: list[dict]) -> tuple[str, list[dict]]:
@@ -155,6 +157,58 @@ class GoogleGeminiTransport(GeminiTransport):
                 raise TransientLLMError(str(e)) from e
             raise
 
+    async def generate_json_stream_iter(
+        self,
+        *,
+        model: str,
+        messages: list[dict],
+        response_schema: dict,
+        timeout_s: int,
+    ):
+        """Yield ``StreamChunk`` deltas as they arrive from Gemini.
+
+        This is the true incremental-streaming path. Callers downstream
+        (for example ``GeminiClient.call_structured_streaming``) feed
+        the deltas into a streaming JSON parser to emit SSE events
+        without waiting for the full response.
+        """
+        from google.genai import types  # type: ignore
+
+        system_instruction, contents = _flatten_messages(messages)
+        cfg = types.GenerateContentConfig(
+            system_instruction=system_instruction or None,
+            response_mime_type="application/json",
+            response_json_schema=response_schema,
+        )
+        try:
+            stream = await asyncio.wait_for(
+                self._client.aio.models.generate_content_stream(  # type: ignore[attr-defined]
+                    model=model,
+                    contents=contents,
+                    config=cfg,
+                ),
+                timeout=timeout_s,
+            )
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(
+                        stream.__anext__(), timeout=timeout_s
+                    )
+                except StopAsyncIteration:
+                    return
+                text = getattr(chunk, "text", None) or ""
+                ptok, ctok = self._usage_counts(chunk)
+                yield StreamChunk(
+                    text=str(text), prompt_tokens=ptok, completion_tokens=ctok,
+                )
+        except Exception as e:  # noqa: BLE001
+            msg = str(e).lower()
+            if isinstance(e, TimeoutError) or any(
+                k in msg for k in ("timeout", "unavailable", "429", "503", "deadline")
+            ):
+                raise TransientLLMError(str(e)) from e
+            raise
+
     async def _legacy_embed(
         self,
         *,
@@ -192,19 +246,48 @@ class GoogleGeminiTransport(GeminiTransport):
     ) -> list[list[float]]:
         from google.genai import types  # type: ignore
 
-        async def _embed_once(model_name: str):
-            return await asyncio.wait_for(
+        # google-genai SDK note: `embed_content(contents=...)` is overloaded.
+        # Passing `list[str]` is interpreted as the *Parts of a single Content*
+        # and returns ONE embedding. Passing `list[Content]` performs a real
+        # batch call and returns N embeddings — which is what we want.
+        # We chunk into MAX_BATCH-sized requests to stay under per-call limits.
+        MAX_BATCH = 100  # Gemini embedContent batch ceiling
+
+        if not texts:
+            return []
+
+        def _to_contents(chunk: list[str]) -> list:
+            return [
+                types.Content(parts=[types.Part(text=t)]) for t in chunk
+            ]
+
+        async def _embed_chunk(model_name: str, chunk: list[str], use_task_type: bool) -> list[list[float]]:
+            config_kwargs: dict = {
+                "output_dimensionality": settings.gemini.embed_dim,
+            }
+            if use_task_type and task_type:
+                config_kwargs["task_type"] = task_type
+            resp = await asyncio.wait_for(
                 self._client.aio.models.embed_content(  # type: ignore[attr-defined]
                     model=model_name,
-                    contents=texts,
-                    config=types.EmbedContentConfig(
-                        output_dimensionality=settings.gemini.embed_dim,
-                        task_type=task_type,
-                    ),
+                    contents=_to_contents(chunk),
+                    config=types.EmbedContentConfig(**config_kwargs),
                 ),
                 timeout=settings.llm.embed_timeout_s,
             )
+            return [list(emb.values) for emb in resp.embeddings]
 
+        async def _embed_all(model_name: str, use_task_type: bool = True) -> list[list[float]]:
+            chunks = [texts[i : i + MAX_BATCH] for i in range(0, len(texts), MAX_BATCH)]
+            results = await asyncio.gather(
+                *[_embed_chunk(model_name, ch, use_task_type) for ch in chunks]
+            )
+            out: list[list[float]] = []
+            for part in results:
+                out.extend(part)
+            return out
+
+        # Legacy path for text-embedding-004
         if model in _LEGACY_TEXT_EMBED_MODELS:
             if self._text_embedding_004_available is False:
                 log.warning(
@@ -213,8 +296,8 @@ class GoogleGeminiTransport(GeminiTransport):
                     model,
                     _EMBED_FALLBACK_MODEL,
                 )
-                resp = await _embed_once(_EMBED_FALLBACK_MODEL)
-                return [list(e.values) for e in resp.embeddings]
+                is_v2 = _EMBED_FALLBACK_MODEL in _EMBED_V2_MODELS
+                return await _embed_all(_EMBED_FALLBACK_MODEL, use_task_type=not is_v2)
             try:
                 out = await self._legacy_embed(model=model, texts=texts, task_type=task_type)
                 self._text_embedding_004_available = True
@@ -235,11 +318,13 @@ class GoogleGeminiTransport(GeminiTransport):
                     model,
                     _EMBED_FALLBACK_MODEL,
                 )
-                resp = await _embed_once(_EMBED_FALLBACK_MODEL)
-                return [list(e.values) for e in resp.embeddings]
+                is_v2 = _EMBED_FALLBACK_MODEL in _EMBED_V2_MODELS
+                return await _embed_all(_EMBED_FALLBACK_MODEL, use_task_type=not is_v2)
 
+        # genai path — skip task_type for v2 models (they use text prefixes)
+        is_v2 = model in _EMBED_V2_MODELS
         try:
-            resp = await _embed_once(model)
+            return await _embed_all(model, use_task_type=not is_v2)
         except Exception as e:  # noqa: BLE001
             msg = str(e).lower()
             should_fallback = (
@@ -257,6 +342,5 @@ class GoogleGeminiTransport(GeminiTransport):
                 model,
                 _EMBED_FALLBACK_MODEL,
             )
-            resp = await _embed_once(_EMBED_FALLBACK_MODEL)
-
-        return [list(e.values) for e in resp.embeddings]
+            fb_v2 = _EMBED_FALLBACK_MODEL in _EMBED_V2_MODELS
+            return await _embed_all(_EMBED_FALLBACK_MODEL, use_task_type=not fb_v2)

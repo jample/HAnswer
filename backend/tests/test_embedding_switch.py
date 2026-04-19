@@ -20,7 +20,8 @@ class _TaskTypeTransport(FakeTransport):
 
 
 @pytest.mark.asyncio
-async def test_embedding_service_uses_query_and_document_task_types():
+async def test_embedding_service_uses_v2_task_prefixes():
+    """gemini-embedding-2-preview: task_type is None, text gets prefixed."""
     transport = _TaskTypeTransport()
     llm = GeminiClient(transport)
     svc = EmbeddingService(llm=llm)
@@ -28,8 +29,16 @@ async def test_embedding_service_uses_query_and_document_task_types():
     await svc.embed_one("查询文本")
     await svc.embed_many(["文档一", "文档二"])
 
-    assert transport.embed_calls[0]["task_type"] == "RETRIEVAL_QUERY"
-    assert transport.embed_calls[1]["task_type"] == "RETRIEVAL_DOCUMENT"
+    # v2 model: task_type should be None (prefixes are in the text)
+    assert transport.embed_calls[0]["task_type"] is None
+    assert transport.embed_calls[1]["task_type"] is None
+    # Query text should have search prefix
+    assert transport.embed_calls[0]["texts"] == ["task: search result | query: 查询文本"]
+    # Document texts should have document prefix
+    assert transport.embed_calls[1]["texts"] == [
+        "title: none | text: 文档一",
+        "title: none | text: 文档二",
+    ]
 
 
 @pytest.mark.asyncio

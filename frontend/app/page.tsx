@@ -48,6 +48,17 @@ export default function AskPage() {
   const [localImageUrl, setLocalImageUrl] = useState<string | null>(null);
   const [replacementFile, setReplacementFile] = useState<File | null>(null);
   const [replacementImageUrl, setReplacementImageUrl] = useState<string | null>(null);
+  const [recentUploads, setRecentUploads] = useState<{ id: string; text: string }[]>([]);
+
+  useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem('hanswer.recent_uploads');
+      if (raw) {
+        const arr = JSON.parse(raw);
+        if (Array.isArray(arr)) setRecentUploads(arr.slice(0, 10));
+      }
+    } catch { /* noop */ }
+  }, []);
 
   useEffect(() => {
     if (!file) {
@@ -104,6 +115,14 @@ export default function AskPage() {
       setQid(body.question_id);
       setParsed(body.parsed);
       setDeduped(body.deduped);
+      // Save to recent uploads
+      try {
+        const entry = { id: body.question_id, text: body.parsed.question_text?.slice(0, 40) || '(无文本)' };
+        const prev = recentUploads.filter((r) => r.id !== body.question_id);
+        const next = [entry, ...prev].slice(0, 10);
+        setRecentUploads(next);
+        window.localStorage.setItem('hanswer.recent_uploads', JSON.stringify(next));
+      } catch { /* noop */ }
     } catch (e) {
       setError(String(e));
     } finally {
@@ -230,6 +249,48 @@ export default function AskPage() {
             </>
           )}
         </label>
+
+        {/* Camera capture button for mobile */}
+        <label style={{ display: 'inline-block', marginTop: 8, cursor: 'pointer' }}>
+          <input
+            type="file"
+            accept="image/*"
+            capture="environment"
+            style={{ display: 'none' }}
+            onChange={(e) => pickFile(e.target.files?.[0])}
+          />
+          <span style={{ padding: '6px 16px', background: '#f0f0f0', borderRadius: 4, fontSize: 14 }}>
+            📸 拍照上传
+          </span>
+        </label>
+
+        {/* Recent uploads strip */}
+        {recentUploads.length > 0 && (
+          <div style={{ marginTop: 12 }}>
+            <span style={{ fontSize: 12, color: '#888' }}>最近上传</span>
+            <div style={{ display: 'flex', gap: 8, overflowX: 'auto', marginTop: 4 }}>
+              {recentUploads.map((r) => (
+                <a
+                  key={r.id}
+                  href={`/q/${r.id}`}
+                  style={{
+                    flexShrink: 0,
+                    padding: '4px 10px',
+                    background: '#f8f8f8',
+                    border: '1px solid #e0e0e0',
+                    borderRadius: 4,
+                    fontSize: 12,
+                    color: '#0366d6',
+                    textDecoration: 'none',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  #{r.id.slice(0, 8)} {r.text}
+                </a>
+              ))}
+            </div>
+          </div>
+        )}
 
         <div style={{ display: 'flex', alignItems: 'flex-end', gap: 12, marginTop: 16, flexWrap: 'wrap' }}>
           <div style={{ flex: '0 0 auto' }}>

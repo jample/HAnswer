@@ -6,11 +6,15 @@ Flow
                          answer_packages section rows, solution_steps rows)
               → yield SSE events in §6 order.
 
-Stage-1 implementation is **bulk-then-stream**: one LLM call produces the
-full AnswerPackage, then we chunk it into SSE events for the frontend.
-Spec §4 asks for first-token < 2 s; M8 polish will move to incremental
-parsing. Keeping the event names & order contract honored NOW means the
-frontend (this milestone) does not have to change later.
+Streaming behavior
+    When ``[llm].stream_solver_json = true`` (default), the service uses
+    ``GeminiClient.call_structured_streaming`` and an incremental JSON
+    parser, so each top-level field of ``AnswerPackage`` becomes an SSE
+    event the moment it finishes streaming from Gemini. ``solution_steps``
+    arrives as a single JSON array, then is fanned out into one
+    ``solution_step`` event per step. On streaming-parse failure the
+    repair loop falls back to the bulk path and emits all events
+    after the recovered package is validated.
 """
 
 from __future__ import annotations
@@ -34,6 +38,33 @@ from app.services.llm_client import GeminiClient, LLMError
 class SSEEvent:
     name: str
     data: dict
+
+
+# Top-level AnswerPackage fields → SSE event payload-shaping rules.
+# A handler returns the list of SSEEvents to emit for that field.
+def _shape_field(key: str, value: object) -> list[SSEEvent]:
+    """Map one streamed top-level field to ordered SSE events."""
+    if key == "question_understanding":
+        return [SSEEvent("question_understanding", value if isinstance(value, dict) else {})]
+    if key == "key_points_of_question":
+        return [SSEEvent("key_points_of_question", {"items": list(value or [])})]
+    if key == "solution_steps":
+        out: list[SSEEvent] = []
+        for step in value or []:
+            if isinstance(step, dict):
+                out.append(SSEEvent("solution_step", step))
+        return out
+    if key == "key_points_of_answer":
+        return [SSEEvent("key_points_of_answer", {"items": list(value or [])})]
+    if key == "method_pattern":
+        return [SSEEvent("method_pattern", value if isinstance(value, dict) else {})]
+    if key == "similar_questions":
+        return [SSEEvent("similar_questions", {"items": list(value or [])})]
+    if key == "knowledge_points":
+        return [SSEEvent("knowledge_points", {"items": list(value or [])})]
+    if key == "self_check":
+        return [SSEEvent("self_check", {"items": list(value or [])})]
+    return []
 
 
 def _sections(pkg: AnswerPackage) -> list[SSEEvent]:
@@ -114,8 +145,11 @@ async def generate_answer(
 ) -> AsyncIterator[SSEEvent]:
     """Run Solver, persist, and stream SSE events.
 
-    Raises `LLMError` on unrecoverable LLM failures (after repair loop).
-    Caller is responsible for mapping to an SSE `error` event if needed.
+    When streaming is enabled, events are yielded *as they arrive* from
+    Gemini (true incremental delivery). The final ``AnswerPackage`` is
+    persisted once parsing+validation completes.
+
+    Raises ``LLMError`` on unrecoverable LLM failures (after repair loop).
     """
     q = await repo.get_question(session, question_id)
     if q is None:
@@ -141,19 +175,69 @@ async def generate_answer(
             ),
         })
 
+    if not settings.llm.stream_solver_json:
+        # Bulk path — preserved for callers/tests that pin streaming off.
+        try:
+            pkg = await llm.call_structured(
+                template=solver,
+                model=settings.gemini.model_solver,
+                model_cls=AnswerPackage,
+                template_kwargs=kwargs,
+                messages_override=messages_override,
+                timeout_s=settings.llm.solver_timeout_s,
+                stream=False,
+            )
+        except LLMError:
+            raise
+        await _persist(session, question_id, pkg)
+        for ev in _sections(pkg):
+            yield ev
+        return
+
+    # Streaming path — emit events as soon as each top-level field of
+    # AnswerPackage finishes streaming. Track which sections we already
+    # emitted so the post-validation _persist doesn't double-fire.
+    emitted_sections: set[str] = set()
+    pkg: AnswerPackage | None = None
+
     try:
-        pkg = await llm.call_structured(
+        async for item in llm.call_structured_streaming(
             template=solver,
             model=settings.gemini.model_solver,
             model_cls=AnswerPackage,
             template_kwargs=kwargs,
             messages_override=messages_override,
             timeout_s=settings.llm.solver_timeout_s,
-            stream=settings.llm.stream_solver_json,
-        )
+        ):
+            if isinstance(item, AnswerPackage):
+                pkg = item
+                break
+            # (key, value) tuple from the streaming parser.
+            key, value = item
+            for ev in _shape_field(key, value):
+                emitted_sections.add(ev.name)
+                yield ev
     except LLMError:
         raise
 
+    if pkg is None:
+        raise LLMError("solver streaming finished without a validated AnswerPackage")
+
+    # Persist the validated package + all sections (idempotent rewrite).
     await _persist(session, question_id, pkg)
+
+    # Re-emit any sections that the streaming parser missed (e.g. when
+    # streaming-parse failed and the repair loop produced the package
+    # via the bulk path). The frontend deduplicates by section name on
+    # the polling side; for the SSE consumer we simply emit the gap.
     for ev in _sections(pkg):
+        if ev.name == "solution_step":
+            # Steps are emitted individually; identify by step_index.
+            already = any(
+                e == ev.name for e in emitted_sections
+            )
+            if already:
+                continue
+        if ev.name in emitted_sections:
+            continue
         yield ev

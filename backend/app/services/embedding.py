@@ -8,6 +8,10 @@ Two dense-embedding providers share a `DenseEmbedder` protocol:
 Both normalize output to `list[float]` so callers never branch on
 backend. The factory `get_embedding_service()` picks the right one
 based on `settings.retrieval.embedder`.
+
+Note: gemini-embedding-2-preview uses task prefixes in the prompt text
+rather than the task_type API parameter. See
+https://ai.google.dev/gemini-api/docs/embeddings#using-task-types-with-embeddings-2
 """
 
 from __future__ import annotations
@@ -19,12 +23,33 @@ from app.config import settings
 from app.services.bge_m3_runtime import get_bge_m3_model
 from app.services.llm_client import GeminiClient
 
+# Models that use text-prefixed task instructions instead of task_type param
+_V2_EMBED_MODELS = {"gemini-embedding-2-preview"}
+
 
 class DenseEmbedder(Protocol):
     async def embed_one(self, text: str) -> list[float]: ...
     async def embed_many(self, texts: list[str]) -> list[list[float]]: ...
     @property
     def dim(self) -> int: ...
+
+
+def _is_v2_model() -> bool:
+    return settings.gemini.model_embed in _V2_EMBED_MODELS
+
+
+def _prepare_query(text: str) -> str:
+    """Wrap text with retrieval query prefix for v2 embedding models."""
+    if _is_v2_model():
+        return f"task: search result | query: {text}"
+    return text
+
+
+def _prepare_document(text: str) -> str:
+    """Wrap text with document prefix for v2 embedding models."""
+    if _is_v2_model():
+        return f"title: none | text: {text}"
+    return text
 
 
 @dataclass
@@ -35,19 +60,20 @@ class EmbeddingService:
 
     async def embed_one(self, text: str) -> list[float]:
         (vec,) = await self.llm.embed(
-            [text],
+            [_prepare_query(text)],
             model=settings.gemini.model_embed,
-            task_type="RETRIEVAL_QUERY",
+            task_type="RETRIEVAL_QUERY" if not _is_v2_model() else None,
         )
         return list(vec)
 
     async def embed_many(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
+        prepared = [_prepare_document(t) for t in texts]
         vecs = await self.llm.embed(
-            texts,
+            prepared,
             model=settings.gemini.model_embed,
-            task_type="RETRIEVAL_DOCUMENT",
+            task_type="RETRIEVAL_DOCUMENT" if not _is_v2_model() else None,
         )
         return [list(v) for v in vecs]
 

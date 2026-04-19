@@ -10,10 +10,11 @@ model_solver   = "gemini-3.1-pro-preview" # text, ParsedQuestion -> AnswerPackag
 model_vizcoder = "gemini-3.1-pro-preview" # text, AnswerPackage -> visualizations[]
 # Gemini dense-embedding model.
 # Supported in this repo:
-#   - "text-embedding-004"    via legacy google-generativeai path
-#   - "gemini-embedding-001"  via google-genai path
-model_embed    = "text-embedding-004"
-embed_dim      = 768
+#   - "gemini-embedding-2-preview" via google-genai path (recommended, multimodal)
+#   - "gemini-embedding-001"       via google-genai path
+#   - "text-embedding-004"         via legacy google-generativeai path
+model_embed    = "gemini-embedding-2-preview"
+embed_dim      = 768  # model default 3072; 768 recommended for storage efficiency
 
 [postgres]
 dsn = "postgresql+asyncpg://jianbo@localhost:5432/jianbo"
@@ -55,7 +56,7 @@ stream_vizcoder_json = true
 [retrieval]
 # M5 multi-route retrieval with RRF fusion (§3.4).
 # Fast remote mode:
-#   embedder="gemini" + model_embed="text-embedding-004" + sparse_encoder="bm25"
+#   embedder="gemini" + model_embed="gemini-embedding-2-preview" + sparse_encoder="bm25"
 # Strongest local mixed-language recall:
 #   embedder="bge-m3" + sparse_encoder="bge-m3"
 # and install the optional extra: `pip install -e .[retrieval]`.

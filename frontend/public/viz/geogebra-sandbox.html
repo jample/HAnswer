@@ -1,0 +1,585 @@
+<!doctype html>
+<!--
+  HAnswer GeoGebra viz sandbox.
+
+  Loads the GeoGebra Apps API from the official CDN and renders one
+  visualization per page lifecycle. Communicates with the host via the
+  same postMessage protocol as the JSXGraph sandbox:
+
+    Host -> iframe:
+      { type: 'init' }
+      { type: 'render', engine: 'geogebra',
+        ggbCommands: string[], ggbSettings?: object, params?: object }
+      { type: 'update-params', params: object }
+      { type: 'dispose' }
+
+    Iframe -> host:
+      { type: 'ready' }
+      { type: 'error',  message: string }
+      { type: 'metric', renderMs: number }
+
+  Security:
+  - CSP (set in next.config.js) allows scripts only from 'self' and
+    https://www.geogebra.org / https://cdn.geogebra.org.
+  - The sandbox attribute is "allow-scripts allow-same-origin"; the
+    LLM never emits JavaScript here, only GeoGebra command strings
+    interpreted by the GeoGebra runtime.
+-->
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>HAnswer GeoGebra Sandbox</title>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; background: #fff; font-family: system-ui, sans-serif; overflow: hidden; }
+    #ggb-applet { width: 100%; height: 100%; }
+    #err { color: #b00020; padding: 12px; display: none; white-space: pre-wrap; font-size: 13px; }
+    #loading { padding: 12px; color: #666; font-size: 13px; }
+  </style>
+  <script src="https://www.geogebra.org/apps/deployggb.js"></script>
+</head>
+<body>
+  <div id="loading">加载 GeoGebra…</div>
+  <div id="ggb-applet"></div>
+  <pre id="err"></pre>
+
+<script>
+(function () {
+  'use strict';
+
+  var ggbApi = null;          // GeoGebra API handle once applet finishes loading
+  var ggbApp = null;          // GGBApplet instance (so we can dispose it)
+  var currentAppName = null;  // remembers which app surface is mounted
+  var pendingRender = null;   // last render request while applet is still loading
+
+  function postReady() {
+    parent.postMessage({ type: 'ready' }, '*');
+  }
+  function postError(msg) {
+    var el = document.getElementById('err');
+    el.style.display = 'block';
+    el.textContent = String(msg);
+    parent.postMessage({ type: 'error', message: String(msg) }, '*');
+  }
+  function postMetric(renderMs) {
+    parent.postMessage({ type: 'metric', renderMs: renderMs }, '*');
+  }
+  function clearError() {
+    var el = document.getElementById('err');
+    el.style.display = 'none';
+    el.textContent = '';
+  }
+  function hideLoading() {
+    var el = document.getElementById('loading');
+    if (el) el.style.display = 'none';
+  }
+
+  function stripOuterQuotes(text) {
+    var value = String(text || '').trim();
+    if ((value[0] === '"' && value[value.length - 1] === '"')
+      || (value[0] === '\'' && value[value.length - 1] === '\'')) {
+      return value.slice(1, -1);
+    }
+    return value;
+  }
+
+  function parseSimpleArgs(text) {
+    var args = [];
+    var token = '';
+    var depth = 0;
+    var quote = null;
+    var raw = String(text || '');
+    for (var i = 0; i < raw.length; i++) {
+      var ch = raw[i];
+      if (quote) {
+        token += ch;
+        if (ch === quote && raw[i - 1] !== '\\') quote = null;
+        continue;
+      }
+      if (ch === '"' || ch === '\'') {
+        quote = ch;
+        token += ch;
+        continue;
+      }
+      if (ch === '(' || ch === '[' || ch === '{') {
+        depth += 1;
+        token += ch;
+        continue;
+      }
+      if (ch === ')' || ch === ']' || ch === '}') {
+        depth = Math.max(0, depth - 1);
+        token += ch;
+        continue;
+      }
+      if (ch === ',' && depth === 0) {
+        args.push(token.trim());
+        token = '';
+        continue;
+      }
+      token += ch;
+    }
+    if (token.trim()) args.push(token.trim());
+    return args;
+  }
+
+  function parseBoolToken(text) {
+    var value = String(text || '').trim().toLowerCase();
+    if (value === 'true') return true;
+    if (value === 'false') return false;
+    return null;
+  }
+
+  function parseNumberToken(text) {
+    var value = Number(String(text || '').trim());
+    return Number.isFinite(value) ? value : null;
+  }
+
+  function colorTokenToRgb(text) {
+    // Only hex literals are recognised. The backend Pydantic validator
+    // rejects color-name SetColor calls so the prompt is forced to emit
+    // RGB triples; this fallback handles inline `#RRGGBB` if any slip in.
+    var value = stripOuterQuotes(text).trim();
+    if (/^#?[0-9a-fA-F]{6}$/.test(value)) {
+      var hex = value.replace('#', '');
+      return [
+        parseInt(hex.slice(0, 2), 16),
+        parseInt(hex.slice(2, 4), 16),
+        parseInt(hex.slice(4, 6), 16),
+      ];
+    }
+    return null;
+  }
+
+  function isGeometryHeavy(commands) {
+    var geometryPattern = /(Circle|Segment|Polygon|Tangent|Perpendicular|Parallel|Midpoint|Reflect|Rotate|Bisector|Ray|Line|Intersect|Point|Vector)\s*\(/;
+    for (var i = 0; i < (commands || []).length; i++) {
+      if (geometryPattern.test(String(commands[i] || ''))) return true;
+    }
+    return false;
+  }
+
+  function inferAppName(settings, commands) {
+    var explicit = settings && typeof settings.app_name === 'string'
+      ? settings.app_name.trim().toLowerCase()
+      : '';
+    if (explicit === '3d') return '3d';
+    if (explicit === 'geometry' || explicit === 'classic' || explicit === 'suite') return explicit;
+    if (explicit === 'graphing') {
+      return isGeometryHeavy(commands) ? 'classic' : 'graphing';
+    }
+    return isGeometryHeavy(commands) ? 'classic' : 'classic';
+  }
+
+  function inferPerspective(settings, appName) {
+    if (settings && typeof settings.perspective === 'string' && settings.perspective.trim()) {
+      return settings.perspective.trim();
+    }
+    return appName === '3d' ? 'T' : 'G';
+  }
+
+  function maybeApplyApiCommand(cmd) {
+    var match = /^([A-Za-z][A-Za-z0-9]*)\s*\((.*)\)$/.exec(String(cmd || '').trim());
+    if (!match || !ggbApi) return false;
+    var name = match[1];
+    var args = parseSimpleArgs(match[2]);
+    var boolA;
+    var boolB;
+    var numA;
+    var numB;
+
+    if (name === 'SetCoordSystem') {
+      var nums = args.map(parseNumberToken);
+      if (nums.length === 4 && nums.every(function (x) { return x !== null; })) {
+        ggbApi.setCoordSystem(nums[0], nums[1], nums[2], nums[3]);
+        return true;
+      }
+      if (nums.length === 7 && nums.every(function (x) { return x !== null; })) {
+        ggbApi.setCoordSystem(nums[0], nums[1], nums[2], nums[3], nums[4], nums[5], !!nums[6]);
+        return true;
+      }
+      return false;
+    }
+
+    if (name === 'SetAxesVisible') {
+      if (args.length === 2) {
+        boolA = parseBoolToken(args[0]);
+        boolB = parseBoolToken(args[1]);
+        if (boolA !== null && boolB !== null) {
+          ggbApi.setAxesVisible(boolA, boolB);
+          return true;
+        }
+      }
+      if (args.length === 4) {
+        numA = parseNumberToken(args[0]);
+        boolA = parseBoolToken(args[1]);
+        boolB = parseBoolToken(args[2]);
+        var boolC = parseBoolToken(args[3]);
+        if (numA !== null && boolA !== null && boolB !== null && boolC !== null) {
+          ggbApi.setAxesVisible(numA, boolA, boolB, boolC);
+          return true;
+        }
+      }
+      return false;
+    }
+
+    if (name === 'SetGridVisible') {
+      if (args.length === 1) {
+        boolA = parseBoolToken(args[0]);
+        if (boolA !== null) {
+          ggbApi.setGridVisible(boolA);
+          return true;
+        }
+      }
+      if (args.length === 2) {
+        numA = parseNumberToken(args[0]);
+        boolA = parseBoolToken(args[1]);
+        if (numA !== null && boolA !== null) {
+          ggbApi.setGridVisible(numA, boolA);
+          return true;
+        }
+      }
+      return false;
+    }
+
+    if (name === 'SetPerspective' && args.length === 1) {
+      ggbApi.setPerspective(stripOuterQuotes(args[0]));
+      return true;
+    }
+
+    if (name === 'SetAnimating' && args.length === 2) {
+      boolA = parseBoolToken(args[1]);
+      if (boolA !== null) {
+        ggbApi.setAnimating(stripOuterQuotes(args[0]), boolA);
+        return true;
+      }
+      return false;
+    }
+
+    if (name === 'SetAnimationSpeed' && args.length === 2) {
+      numA = parseNumberToken(args[1]);
+      if (numA !== null) {
+        ggbApi.setAnimationSpeed(stripOuterQuotes(args[0]), numA);
+        return true;
+      }
+      return false;
+    }
+
+    if (name === 'StartAnimation' && args.length === 0) {
+      ggbApi.startAnimation();
+      return true;
+    }
+
+    if (name === 'SetTrace' && args.length === 2) {
+      boolA = parseBoolToken(args[1]);
+      if (boolA !== null) {
+        ggbApi.setTrace(stripOuterQuotes(args[0]), boolA);
+        return true;
+      }
+      return false;
+    }
+
+    if (name === 'SetCaption' && args.length === 2) {
+      ggbApi.setCaption(stripOuterQuotes(args[0]), stripOuterQuotes(args[1]));
+      return true;
+    }
+
+    if (name === 'ShowLabel' && args.length === 2) {
+      boolA = parseBoolToken(args[1]);
+      if (boolA !== null) {
+        ggbApi.setLabelVisible(stripOuterQuotes(args[0]), boolA);
+        return true;
+      }
+      return false;
+    }
+
+    if (name === 'SetVisible' && args.length === 2) {
+      boolA = parseBoolToken(args[1]);
+      if (boolA !== null) {
+        ggbApi.setVisible(stripOuterQuotes(args[0]), boolA);
+        return true;
+      }
+      return false;
+    }
+
+    if (name === 'SetLineStyle' && args.length === 2) {
+      numA = parseNumberToken(args[1]);
+      if (numA !== null) {
+        ggbApi.setLineStyle(stripOuterQuotes(args[0]), numA);
+        return true;
+      }
+      return false;
+    }
+
+    if (name === 'SetLineThickness' && args.length === 2) {
+      numA = parseNumberToken(args[1]);
+      if (numA !== null) {
+        ggbApi.setLineThickness(stripOuterQuotes(args[0]), numA);
+        return true;
+      }
+      return false;
+    }
+
+    if (name === 'SetPointSize' && args.length === 2) {
+      numA = parseNumberToken(args[1]);
+      if (numA !== null) {
+        ggbApi.setPointSize(stripOuterQuotes(args[0]), numA);
+        return true;
+      }
+      return false;
+    }
+
+    if (name === 'SetPointStyle' && args.length === 2) {
+      numA = parseNumberToken(args[1]);
+      if (numA !== null) {
+        ggbApi.setPointStyle(stripOuterQuotes(args[0]), numA);
+        return true;
+      }
+      return false;
+    }
+
+    if (name === 'SetFilling' && args.length === 2) {
+      numA = parseNumberToken(args[1]);
+      if (numA !== null) {
+        ggbApi.setFilling(stripOuterQuotes(args[0]), numA);
+        return true;
+      }
+      return false;
+    }
+
+    if (name === 'SetColor') {
+      if (args.length === 4) {
+        var r = parseNumberToken(args[1]);
+        var g = parseNumberToken(args[2]);
+        var b = parseNumberToken(args[3]);
+        if (r !== null && g !== null && b !== null) {
+          ggbApi.setColor(stripOuterQuotes(args[0]), r, g, b);
+          return true;
+        }
+      }
+      if (args.length === 2) {
+        var rgb = colorTokenToRgb(args[1]);
+        if (rgb) {
+          ggbApi.setColor(stripOuterQuotes(args[0]), rgb[0], rgb[1], rgb[2]);
+          return true;
+        }
+      }
+      return false;
+    }
+
+    return false;
+  }
+
+  // ── 1. Bootstrap the GeoGebra applet ───────────────────────────────
+  function bootstrap(settings, commands) {
+    var appName = inferAppName(settings || {}, commands || []);
+    var perspective = inferPerspective(settings || {}, appName);
+    if (ggbApp) {
+      try { if (ggbApi && ggbApi.remove) ggbApi.remove(); } catch (_) {}
+      ggbApp = null;
+      ggbApi = null;
+    }
+    if (typeof GGBApplet !== 'function') {
+      postError('GeoGebra 未加载: window.GGBApplet 不存在 (CDN 被 CSP 拒绝?)');
+      return;
+    }
+    var params = {
+      appName: appName,
+      perspective: perspective,
+      width: window.innerWidth || 600,
+      height: window.innerHeight || 400,
+      showToolBar: false,
+      showAlgebraInput: false,
+      showMenuBar: false,
+      showResetIcon: false,
+      showZoomButtons: false,
+      showAnimationButton: false,
+      showFullscreenButton: false,
+      showSuggestionButtons: false,
+      showStartTooltip: false,
+      allowStyleBar: false,
+      enableUndoRedo: false,
+      enableLabelDrags: false,
+      enableShiftDragZoom: true,
+      enableRightClick: false,
+      errorDialogsActive: false,
+      disableJavaScript: true,
+      borderColor: '#ffffff',
+      preventFocus: true,
+      scaleContainerClass: 'ggb-applet',
+      autoHeight: false,
+      appletOnLoad: function (api) {
+        ggbApi = api;
+        currentAppName = appName;
+        hideLoading();
+        if (pendingRender) {
+          var p = pendingRender; pendingRender = null;
+          renderNow(p);
+        } else {
+          postReady();
+        }
+      },
+    };
+    try {
+      ggbApp = new GGBApplet(params, true);
+      ggbApp.inject('ggb-applet');
+    } catch (e) {
+      postError('GeoGebra 初始化失败: ' + (e && e.message || e));
+    }
+  }
+
+  // ── 2. Render a viz: clear + apply settings + run commands ─────────
+  function applySettings(settings) {
+    if (!settings || !ggbApi) return;
+    try {
+      var perspective = inferPerspective(settings, currentAppName || 'classic');
+      if (perspective) {
+        ggbApi.setPerspective(perspective);
+      }
+      if (Array.isArray(settings.coord_system)) {
+        var cs = settings.coord_system;
+        if (cs.length >= 4) {
+          ggbApi.setCoordSystem(cs[0], cs[1], cs[2], cs[3]);
+        }
+      }
+      if (typeof settings.axes_visible === 'boolean') {
+        ggbApi.setAxesVisible(settings.axes_visible, settings.axes_visible);
+      }
+      if (typeof settings.grid_visible === 'boolean') {
+        ggbApi.setGridVisible(settings.grid_visible);
+      }
+      if (typeof settings.show_algebra_input === 'boolean') {
+        ggbApi.showAlgebraInput(settings.show_algebra_input);
+      }
+      if (typeof settings.show_tool_bar === 'boolean') {
+        ggbApi.showToolBar(settings.show_tool_bar);
+      }
+      if (typeof settings.show_menu_bar === 'boolean') {
+        ggbApi.showMenuBar(settings.show_menu_bar);
+      }
+      if (typeof settings.perspective === 'string' && settings.perspective) {
+        ggbApi.setPerspective(settings.perspective);
+      }
+    } catch (e) {
+      // settings are best-effort; don't kill the render over bad coord_system
+      console.warn('GeoGebra settings warning', e);
+    }
+  }
+
+  function runCommands(commands) {
+    if (!commands || !commands.length) return;
+    var failures = [];
+    for (var i = 0; i < commands.length; i++) {
+      var cmd = String(commands[i] || '').trim();
+      if (!cmd) continue;
+      try {
+        // Some style/view directives must go through the Apps API
+        // (evalCommand doesn't support setCoordSystem etc.). For everything
+        // else we hand the verbatim command to the GeoGebra parser.
+        if (maybeApplyApiCommand(cmd)) continue;
+        var ok = ggbApi.evalCommand(cmd);
+        if (ok === false) failures.push({ index: i, cmd: cmd });
+      } catch (e) {
+        failures.push({ index: i, cmd: cmd, err: String(e && e.message || e) });
+      }
+    }
+    if (failures.length) {
+      var preview = failures.slice(0, 3).map(function (f) {
+        return '#' + f.index + ' "' + f.cmd + '"' + (f.err ? ' (' + f.err + ')' : '');
+      }).join('; ');
+      postError('GeoGebra 命令失败 ' + failures.length + '/' + commands.length + ': ' + preview);
+    }
+  }
+
+  function applyParams(params) {
+    if (!params || !ggbApi) return;
+    Object.keys(params).forEach(function (name) {
+      if (!ggbApi.exists(name)) return;
+      var v = params[name];
+      try {
+        if (typeof v === 'boolean') {
+          ggbApi.setValue(name, v ? 1 : 0);
+        } else if (typeof v === 'number') {
+          ggbApi.setValue(name, v);
+        } else if (typeof v === 'string') {
+          ggbApi.setTextValue(name, v);
+        }
+      } catch (e) {
+        console.warn('setValue failed for', name, e);
+      }
+    });
+  }
+
+  function renderNow(req) {
+    if (!ggbApi) {
+      pendingRender = req;
+      return;
+    }
+    clearError();
+    var t0 = performance.now();
+    try {
+      // Wipe prior construction so re-renders are deterministic.
+      try { ggbApi.reset(); } catch (_) {
+        try { ggbApi.newConstruction(); } catch (_) {}
+      }
+      ggbApi.setRepaintingActive(false);
+      applySettings(req.ggbSettings);
+      runCommands(req.ggbCommands);
+      applyParams(req.params);
+      ggbApi.setRepaintingActive(true);
+      try { ggbApi.showAllObjects && ggbApi.showAllObjects(); } catch (_) {}
+    } catch (e) {
+      postError('渲染异常: ' + (e && e.message || e));
+      return;
+    }
+    postMetric(performance.now() - t0);
+    postReady();
+  }
+
+  // ── 3. Message loop ────────────────────────────────────────────────
+  window.addEventListener('message', function (ev) {
+    var msg = ev.data || {};
+    switch (msg.type) {
+      case 'init':
+        postReady();
+        break;
+      case 'render': {
+        var settings = msg.ggbSettings || {};
+        var appName = inferAppName(settings, msg.ggbCommands || []);
+        var req = {
+          ggbCommands: msg.ggbCommands || [],
+          ggbSettings: settings,
+          params: msg.params || {},
+        };
+        // (Re)bootstrap if no applet yet, or app type changed.
+        if (!ggbApi || currentAppName !== appName) {
+          pendingRender = req;
+          bootstrap(settings, req.ggbCommands);
+        } else {
+          renderNow(req);
+        }
+        break;
+      }
+      case 'update-params':
+        applyParams(msg.params || {});
+        break;
+      case 'dispose':
+        try { if (ggbApi && ggbApi.remove) ggbApi.remove(); } catch (_) {}
+        ggbApi = null; ggbApp = null; currentAppName = null;
+        break;
+    }
+  });
+
+  // Send an early ready so the host can post the first render request.
+  // (Real GeoGebra readiness comes from appletOnLoad; until then we
+  // queue the render in pendingRender.)
+  postReady();
+
+  // Fail-fast if the CDN is unreachable.
+  setTimeout(function () {
+    if (typeof GGBApplet !== 'function') {
+      postError('GeoGebra CDN 加载失败 (5s 超时)。请检查网络或 CSP 设置。');
+    }
+  }, 5000);
+})();
+</script>
+</body>
+</html>

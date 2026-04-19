@@ -33,6 +33,8 @@ from app.services.vector_store import InMemoryVectorStore
 class _CannedEmbedTransport(FakeTransport):
     """Returns a fixed vector per input string.
 
+    Matches by exact key or by substring (to handle v2 task prefixes
+    like ``"task: search result | query: <original>"``).
     Unknown strings map to a unique deterministic random-like vector so
     cosine between distinct inputs is low but nonzero.
     """
@@ -42,12 +44,22 @@ class _CannedEmbedTransport(FakeTransport):
         self.vectors = vectors
         self._fallback_counter = 0
 
+    def _lookup(self, text: str) -> list[float] | None:
+        if text in self.vectors:
+            return list(self.vectors[text])
+        # Substring match for task-prefixed texts (gemini-embedding-2-preview)
+        for key, vec in self.vectors.items():
+            if key in text:
+                return list(vec)
+        return None
+
     async def embed(self, *, model, texts, task_type=None):
         out = []
         dim = settings.gemini.embed_dim
         for t in texts:
-            if t in self.vectors:
-                out.append(list(self.vectors[t]))
+            found = self._lookup(t)
+            if found is not None:
+                out.append(found)
                 continue
             # Deterministic-ish unit vector from hash, ignoring content.
             self._fallback_counter += 1

@@ -117,6 +117,8 @@ async def list_questions(
     method: str | None = None,
     target_type: str | None = None,
     novelty_flag: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
     learning_ready: bool = True,
     sort: Literal["recommended", "recent", "popular"] = "recommended",
     limit: int = 50,
@@ -127,6 +129,10 @@ async def list_questions(
         stmt = stmt.where(models.Question.subject == subject)
     if grade_band:
         stmt = stmt.where(models.Question.grade_band == grade_band)
+    if date_from:
+        stmt = stmt.where(models.Question.created_at >= date_from)
+    if date_to:
+        stmt = stmt.where(models.Question.created_at <= date_to)
     if difficulty_min is not None:
         stmt = stmt.where(models.Question.difficulty >= difficulty_min)
     if difficulty_max is not None:

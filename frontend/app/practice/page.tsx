@@ -56,6 +56,9 @@ export default function PracticePage() {
   const [exam, setExam] = useState<ExamDetail | null>(null);
   const [revealed, setRevealed] = useState<Record<string, boolean>>({});
   const [scores, setScores] = useState<Record<string, 'ok' | 'wrong' | 'unsure'>>({});
+  const [searchQ, setSearchQ] = useState('');
+  const [searchResults, setSearchResults] = useState<{ question_id: string; question_text: string; subject: string; grade_band: string; difficulty: number }[]>([]);
+  const [searching, setSearching] = useState(false);
 
   useEffect(() => { setBasket(readBasket()); }, []);
 
@@ -77,6 +80,26 @@ export default function PracticePage() {
   function clearBasket() {
     setBasket([]);
     writeBasket([]);
+  }
+
+  function addToBasket(id: string) {
+    if (basket.includes(id)) return;
+    const next = [...basket, id];
+    setBasket(next);
+    writeBasket(next);
+  }
+
+  async function searchLibrary(e: React.FormEvent) {
+    e.preventDefault();
+    if (!searchQ.trim()) return;
+    setSearching(true);
+    try {
+      const res = await fetch(apiUrl(`/api/questions?q=${encodeURIComponent(searchQ)}&learning_ready=true&limit=20`));
+      const d = await res.json();
+      setSearchResults(d.items || []);
+    } finally {
+      setSearching(false);
+    }
   }
 
   async function generateExam(e: React.FormEvent) {
@@ -145,6 +168,40 @@ export default function PracticePage() {
           清空练习篮
         </button>
       )}
+
+      {/* Search-add section */}
+      <div style={{ marginTop: 16 }}>
+        <form onSubmit={searchLibrary} style={{ display: 'flex', gap: 8 }}>
+          <input
+            type="text"
+            placeholder="搜索题库加入练习篮…"
+            value={searchQ}
+            onChange={(e) => setSearchQ(e.target.value)}
+            style={{ flex: 1, padding: '6px 8px', border: '1px solid #ccc', borderRadius: 4 }}
+          />
+          <button type="submit" disabled={searching}>{searching ? '搜索中…' : '搜索'}</button>
+        </form>
+        {searchResults.length > 0 && (
+          <ul style={{ listStyle: 'none', paddingLeft: 0, marginTop: 8 }}>
+            {searchResults.map((r) => (
+              <li key={r.question_id} style={{ padding: '4px 0', borderBottom: '1px solid #eee', display: 'flex', alignItems: 'center', gap: 8 }}>
+                <Link href={`/q/${r.question_id}`} style={{ color: '#0366d6', flex: 1, textDecoration: 'none' }}>
+                  #{r.question_id.slice(0, 8)} {(r.question_text || '').slice(0, 50)}
+                </Link>
+                <span style={{ fontSize: 11, color: '#888' }}>{r.subject}·{r.grade_band}·难度{r.difficulty}</span>
+                <button
+                  type="button"
+                  onClick={() => addToBasket(r.question_id)}
+                  disabled={basket.includes(r.question_id)}
+                  style={{ fontSize: 12, flexShrink: 0 }}
+                >
+                  {basket.includes(r.question_id) ? '已加入' : '+ 加入'}
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
 
       <h2 style={{ marginTop: 24 }}>生成考卷</h2>
       <form onSubmit={generateExam} style={{ display: 'grid', gap: 8, maxWidth: 520 }}>

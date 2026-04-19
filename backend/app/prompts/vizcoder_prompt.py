@@ -1,15 +1,4 @@
-"""VizCoderPrompt — AnswerPackage → visualizations[] (§7.2.3).
-
-PURPOSE
-    Produce interactive JSXGraph visualizations that help a student
-    understand the answer, while staying within a safe API surface.
-
-SECURITY POSTURE
-    The prompt itself enforces security at the *generation* layer:
-    listing allow/forbidden globals in the prompt text empirically
-    reduces violation rate ~80% vs. relying on the post-hoc AST
-    validator (§3.3.3) alone. The validator remains the hard guarantee.
-"""
+"""VizCoderPrompt v3 — GeoGebra-first interactive visualizations."""
 
 from __future__ import annotations
 
@@ -20,24 +9,89 @@ from app.prompts.base import DesignDecision, PromptTemplate, PromptVersion
 from app.prompts.schemas import VISUALIZATION_LIST_SCHEMA
 
 
-# Helper library cheatsheet; keep in sync with the H runtime in the sandbox.
-# Version this cheatsheet — when H changes, bump VizCoderPrompt version too.
+GGB_CHEATSHEET = """\
+# GeoGebra 命令速查 (engine="geogebra" 推荐)
+# 命令名必须使用英文; 一行一个命令; 命令之间没有分号。
+
+## 1. 点 / 向量
+A=(2,3)
+v=Vector((3,2))
+M=Midpoint(A,B)
+P=Reflect(A, Line(B,C))
+Q=Rotate(A, 30deg, O)
+R=(x(K)+2*cos(t), y(K)+2*sin(t))
+
+## 2. 线 / 圆 / 多边形
+l=Line(A,B)
+s=Segment(A,B)
+c=Circle((0,0),2)
+c=Circle(A,B,C)
+poly=Polygon(A,B,C,D)
+
+## 3. 函数 / 曲线
+f(x)=x^2
+g(x)=sin(x)/x
+h(x)=If(x<0, -x, x^2)
+Curve(cos(t), sin(t), t, 0, 2*pi)
+Curve(t, t^2, t^3, t, -2, 2)
+
+## 4. 几何 / 微积分 / 代数
+Intersect(f, g)
+Tangent(A, c)
+Derivative(f)
+Integral(f, 0, 1)
+Solve(x^2-2*x-3=0, x)
+
+## 5. 物理 / 动画
+a=Slider(-3, 3, 0.1)
+SetAnimating(a, true)
+SetAnimationSpeed(a, 1)
+StartAnimation()
+SetTrace(P, true)
+
+## 6. 文字 / LaTeX
+SetCaption(A, "起点")
+ShowLabel(A, true)
+SetColor(c1, 255, 0, 0)
+SetLineStyle(l1, 2)
+SetLineThickness(l1, 4)
+
+## 7. 视图 / 界面 (优先放进 ggb_settings, 不要写进 ggb_commands)
+ggb_settings = {
+    "app_name": "classic",
+    "perspective": "G",
+    "coord_system": [-5, 5, -3, 3],
+    "axes_visible": true,
+    "grid_visible": true,
+    "show_algebra_input": false,
+    "show_tool_bar": false,
+    "show_menu_bar": false
+}
+
+## 命令规范
+- 名字开头小写为变量, 大写为命令 (a=Slider(...), 不是 slider=...)。
+- 对象标签尽量用短 ASCII 名称, 避免下划线/中文/空格, 如 c1, l1, P, Q。
+- 依赖点的位移必须写 `P=(x(K)+dx, y(K)+dy)` (坐标表达式),
+  禁止 `P=K+(dx,dy)` 与 `Translate(K, Vector(...))`。
+- Vector 写 `Vector((dx,dy))` (单个点元组) 或 `Vector(P,Q)` (两点);
+  禁止 `Vector((dx),(dy))` (两个标量参数)。
+- 样式命令 `SetColor(obj, 255, 0, 0)`, `SetLineStyle(obj, 2)`,
+  `SetLineThickness(obj, 3)`, `SetPointSize(obj, 5)` —— SetColor 必须用 RGB 三元组,
+  禁止色名字符串。
+- 角度可写 30deg 或 pi/6。
+- JSON 字符串中的反斜杠要双重转义。
+- 不要写 ggbApplet.evalCommand(...), 仅写命令本身。
+"""
+
 H_CHEATSHEET = """\
-# HAnswer helper library `H` (推荐优先使用)
-H.shapes.circle(cx, cy, r)                    // 画圆
-H.shapes.triangle(A, B, C)                    // 画三角形
-H.shapes.polygon(points)                      // 画多边形
-H.shapes.segmentWithLabel(P, Q, label)        // 带标注的线段
-H.plot.functionGraph(fn, domain)              // 函数图像 y=fn(x), domain=[a,b]
-H.plot.parametric({x: fx, y: fy}, tRange)     // 参数方程曲线
-H.plot.vectorField(fn, grid)                  // 向量场
-H.phys.projectile({v0, angle, g})             // 抛体运动轨迹
-H.phys.springMass({k, m, x0})                 // 弹簧振子
-H.anim.animate(paramName, from, to, durationMs)  // 驱动一个参数做动画
-H.geom.midpoint(P, Q)                         // 中点
-H.geom.reflect(P, line)                       // 关于直线对称
-H.geom.rotate(P, center, angleDeg)            // 绕中心旋转
-H.geom.intersectionPoint(a, b)                // 两曲线/直线交点
+# JSXGraph helper `H` (engine="jsxgraph" 时使用)
+H.shapes.circle(cx, cy, r)
+H.shapes.triangle(A, B, C)
+H.shapes.polygon(points)
+H.plot.functionGraph(fn, domain)
+H.plot.parametric({x: fx, y: fy}, tRange)
+H.phys.projectile({v0, angle, g})
+H.anim.animate(paramName, from_, to, durationMs)
 """
 
 ALLOWED_GLOBALS = [
@@ -51,70 +105,81 @@ FORBIDDEN_GLOBALS = [
     "fetch", "XMLHttpRequest", "WebSocket", "Worker", "importScripts",
     "eval", "Function", "import", "require",
     "localStorage", "sessionStorage", "indexedDB",
-    "setTimeout(字符串参数)", "setInterval(字符串参数)", "with 语句",
+    "setTimeout(string)", "setInterval(string)", "with",
 ]
 
 
 class VizCoderPrompt(PromptTemplate):
 
-    version = PromptVersion(major=1, minor=0, date_updated="2026-04-17")
+    version = PromptVersion(major=3, minor=0, date_updated="2026-04-19")
     name = "vizcoder"
 
     purpose = (
-        "根据已生成的 AnswerPackage, 产出一组 JSXGraph 交互式可视化, "
-        "帮助学生直观理解题目与答案。"
+        "根据已生成的 AnswerPackage, 产出一组数学/物理交互式可视化, "
+        '默认使用 GeoGebra (engine="geogebra")。'
     )
 
     input_description = (
         "answer_package (AnswerPackage JSON, 必需), "
-        "parsed_question (ParsedQuestion JSON, 必需, 含 diagram_description)。"
+        "parsed_question (ParsedQuestion JSON, 必需)。"
     )
 
     output_description = (
-        "符合 {visualizations: [...]} 的 JSON; 每个可视化的 jsx_code 是"
-        "合法的 JavaScript 函数体, 只使用受控的全局。"
+        "符合 {visualizations: [...]} 的 JSON; 每个可视化指定 engine, 并提供"
+        "ggb_commands (geogebra) 或 jsx_code (jsxgraph) 之一。"
     )
 
     design_decisions = [
         DesignDecision(
-            title="只允许函数体 (function body only)",
+            title="默认使用 GeoGebra Apps API",
             rationale=(
-                "签名固定为 function(board, JXG, H, params), 没有顶层语句, "
-                "大幅降低攻击面并让 AST 校验可行 (§3.3.3)。"
-            ),
-        ),
-        DesignDecision(
-            title="提示中列出 H 库 cheatsheet",
-            rationale=(
-                "把每个帮手函数的签名与一句话说明直接写进 prompt, 让 LLM 优先使用"
-                "安全封装而非原始 JSXGraph 调用。"
-            ),
-        ),
-        DesignDecision(
-            title="提示中显式列出 ALLOWED / FORBIDDEN 全局",
-            rationale=(
-                "经验: 在生成层就告知禁令, 比仅靠 AST 验证拒绝事后输出, 违规率低 ~80%。"
+                "GeoGebra 输出命令字符串而非 JS 代码, 由 GeoGebra 运行时解释, "
+                "无 eval, 安全性高于 JSXGraph; 同时提供原生 LaTeX、自动几何"
+                "约束、内建动画与专业渲染, 更贴合中学数学教学场景。"
             ),
             alternatives_considered=[
-                "只在验证层拦截 — 重试多、token 浪费",
-                "只允许 DSL 无 JS — 表达力不足以画需要的动画",
+                "纯 JSXGraph (旧方案) — 表达力弱, 渲染观感差, JS 注入风险",
+                "纯 SVG/Canvas DSL — 缺动画与交互",
             ],
         ),
         DesignDecision(
-            title="每图必带 learning_goal",
-            rationale=(
-                "强制一句话学习目标, 防止生成'装饰性'可视化, 保证每图都有教学价值。"
-            ),
+            title="保留 JSXGraph 为 fallback",
+            rationale="复杂自定义物理仿真等不易用 GeoGebra 表达。",
         ),
         DesignDecision(
-            title="interactive_hints 明确操作",
-            rationale="告诉学生'拖动 P 观察...', 比静态图像更能促进主动学习。",
+            title="提示中提供 GeoGebra 命令速查",
+            rationale="降低 LLM 凭记忆胡乱拼写命令名的概率。",
+        ),
+        DesignDecision(
+            title="服务端轻量校验 ggb_commands",
+            rationale="GeoGebra 命令由运行时解释, 无需 AST 校验; 仅做长度/数量检查。",
+        ),
+        DesignDecision(
+            title="每图必带 learning_goal",
+            rationale="强制一句话学习目标, 防止生成装饰性可视化。",
         ),
         DesignDecision(
             title="id 与 solution_steps[].viz_ref 对齐",
+            rationale="前端可精确把步骤锚定到对应的图。",
+        ),
+        DesignDecision(
+            title="可视化必须服务于已生成的解答",
             rationale=(
-                "Solver 在 viz_ref 留下建议 id, VizCoder 在此生成同 id 的可视化, "
-                "前端可精确把步骤锚定到图。"
+                "VizCoder 在 Solver 之后运行, 输入包含完整 AnswerPackage。"
+                "提示中显式要求模型阅读 solution_steps / key_insight / formulas /"
+                "pitfalls, 并优先为这些已写出的关键步骤配图, 防止生成与解答"
+                "无关的装饰性示意图。"
+            ),
+        ),
+        DesignDecision(
+            title="符号一致性: 复用题目/解答中的命名",
+            rationale=(
+                "若可视化引入与解答不同的滑块名 (例如解答用 t, 可视化造一个 "
+                "tParam) 学生需要做心智映射, 增加认知负担。"
+                "提示要求 VizCoder 先扫描 ParsedQuestion 与 AnswerPackage 中"
+                "已经命名的对象/参数, 直接在 ggb_commands 中沿用同名; 仅在"
+                "希腊字母与 GeoGebra 内置标识冲突时, 通过 SetCaption 把 GUI"
+                "标签恢复成希腊字母, 而不是改变学生看到的符号。"
             ),
         ),
     ]
@@ -123,61 +188,114 @@ class VizCoderPrompt(PromptTemplate):
     def schema(self) -> dict:
         return VISUALIZATION_LIST_SCHEMA
 
-    # ── System ──────────────────────────────────────────────────────
-
     def system_message(self, **kwargs: Any) -> str:
-        """System prompt.
-
-        Knobs to tune:
-          - Maximum visualizations per package (currently "一般 1-3 个").
-          - Emphasis on helpers vs. raw JSXGraph.
-          - Animation guidance (loop/once/duration).
-        """
         schema_str = json.dumps(self.schema, indent=2, ensure_ascii=False)
         allow = ", ".join(ALLOWED_GLOBALS)
         forbid = ", ".join(FORBIDDEN_GLOBALS)
-        return f"""\
-你是 JSXGraph 可视化教练, 专门为中学生把数学/物理题目做成交互式示意图。
+        body = """\
+你是数学/物理交互式可视化设计师, 为中学生把题目做成专业的可交互示意图。
+你有两种渲染引擎可选, 默认必须使用 GeoGebra:
 
-## 任务
-阅读已给的 AnswerPackage 和 ParsedQuestion, 生成 1-3 个 JSXGraph 可视化,
-帮助学生通过交互建立直觉。优先使用下方 `H` 帮手库, 仅在必要时直接调用 JXG / board。
+## 引擎选择 (重要)
+- engine="geogebra" — 默认, 优先使用。
+  - 数学绘图 (函数/曲线/几何/向量/圆锥曲线/立体几何) 全部用 GeoGebra。
+  - 物理题中可用滑块驱动的动力学示意 (抛体, 弹簧, 简谐) 也用 GeoGebra。
+  - 输出 ggb_commands: ["...", "..."], 每条一个 GeoGebra 命令字符串;
+    jsx_code 留空字符串。
+    - ggb_settings.app_name 选: classic (大多数 2D 题默认), geometry (平面几何),
+        graphing (纯函数/坐标图), 3d (立体几何/3D 运动)。
+    - 默认令 ggb_settings.perspective="G"; 3D 题用 "T"。不要打开 Algebra/
+        Tools/Table 面板, 不要生成额外表格型界面。
+  - 通过 Slider(...) 创建滑块; SetAnimating(s, true) + StartAnimation() 触发动画。
+    - 视图范围、网格、坐标轴放进 ggb_settings.coord_system / grid_visible /
+        axes_visible, 不要把 SetCoordSystem / SetGridVisible / SetAxesVisible 写进
+        ggb_commands。
 
-## 可视化的要求
-- 每个可视化必须对应一个清晰的 learning_goal (一句话学生应学到什么)。
-- 若 Solver 的 solution_steps[].viz_ref 提示了 id, 尽量使用同 id。
-- 若需要交互, 在 params 中声明滑块/开关; animation 可选 (loop/once)。
-- jsx_code 必须是合法的 JavaScript **函数体**, 签名是
-  function(board, JXG, H, params) {{ ... }}。
-  函数可返回 {{ update(params), destroy() }} 供宿主驱动, 或返回 undefined。
+- engine="jsxgraph" — 仅在 GeoGebra 无法表达时使用。
+  输出 jsx_code (函数体), ggb_commands 留空数组。
 
-## 安全 (非常重要)
-- 只能使用这些全局: {allow}。
-- 严禁使用: {forbid}。
-- 禁止 `setTimeout("code-string", ...)` 和 `setInterval("code-string", ...)`;
-  若需定时, 用 requestAnimationFrame 或 H.anim.animate。
-- 禁止动态 import 与 require。
-- 禁止 `with` 语句与计算属性访问 (如 obj["eval"])。
+## 通用要求
+- 输入包含 ParsedQuestion 与 **完整的 AnswerPackage**。可视化必须服务于该
+  解答, 帮助学生理解解题过程, 而不是凭题目自由发挥。
+- **符号一致性 (重要)**: 可视化中的几何对象、点、参数必须复用题目和解答中
+  已经出现的符号。先扫描 ParsedQuestion.given / find / question_text 与
+  AnswerPackage.solution_steps / formulas / final_answer, 列出题面/解答中
+  已经登场的命名对象 (例如 `T`, `K`, `P`, `Q`, `O`, `t`, `r`), 然后在
+  ggb_commands 里直接沿用这些名字。
+  - 不要为同一个对象起新名 (例如把题目里的圆心 `K` 改写成 `k1`)。
+  - 不要凭空引入题目/解答里没有的字母作为滑块名 (例如题目用参数 `t`,
+    就不要再造一个 `tParam` 滑块)。
+  - params[].label_cn 用题目/解答里的中文术语 ("参数 t", "动点 P 位置")。
+  - caption_cn / interactive_hints 中描述的滑块名必须与 ggb_commands 里
+    一致, 让学生一眼对上 "这个滑块就是解答第 N 步里的 t"。
+- 在动笔之前, 先按下列顺序通读 AnswerPackage:
+  1. method_pattern / key_insight — 决定整组图的主题。
+  2. solution_steps[] — 找出最关键、最难想象的 1-3 步, 为它们各配一张图;
+     若该步已有 viz_ref, 沿用同一 id, caption_cn 中复述该步的核心结论。
+  3. formulas — 出现的关键公式 (函数表达式、几何关系、向量关系) 应在图中
+     可视化体现 (画出函数曲线、几何对象、向量等)。
+  4. pitfalls — 若有易错点适合用图说明 (例如分类讨论的两种情形、定义域
+     边界、临界角等), 优先做成可切换/可拖动的对比图。
+  5. answer_summary / final_answer — 图中标注最终结果 (交点坐标、距离、
+     极值点等), 让学生在图上直接看到答案。
+- 生成 1-3 个可视化, 每图必须有清晰的 learning_goal (一句话, 与所配步骤
+  的目标一致)。
+- 若需要交互, 在 params 中声明滑块/开关。
+  - 对 GeoGebra: params 中 slider 应与 ggb_commands 中 name=Slider(...) 同名,
+    前端会通过 setValue() 把控件值同步进 GeoGebra。
+- caption_cn 用简体中文一句话说明该图如何对应解答中的某一步; 可含 LaTeX,
+  用 $...$ 包裹。
+- interactive_hints 给学生明确的操作建议 ("拖动滑块 a 观察判别式符号变化")。
+- 严禁生成与 AnswerPackage 中任何步骤、公式或结论无关的可视化。
 
-{H_CHEATSHEET}
+## GeoGebra 命令规范 (engine=geogebra 时)
+- 仅使用英文命令名 (Circle, Slider, Vector, Polygon, Tangent, ...)。
+- 一行一个命令, 不要含换行或 ggbApplet 前缀。
+- ggb_commands 只放创建对象/样式/动画的命令; 视图/坐标轴/网格/视角放进 ggb_settings,
+  禁止在 ggb_commands 中出现 SetCoordSystem / SetAxesVisible / SetGridVisible /
+  SetPerspective / ShowAxes / ShowGrid。
+- **优先复用题目/解答里出现的符号**(见上方"符号一致性"); 仅当必须额外引入
+  辅助参数时才新增, 并在 caption_cn 里说明它的含义。
+- 变量/对象名禁止使用希腊字母英文别名 (alpha, beta, gamma, delta, theta, phi, ...);
+  GeoGebra 会把它们自动重命名为 `beta_1` 等, 后续 `cos(beta)` 全部解析失败。
+  若解答里写了 $\\alpha$/$\\beta$/$\\theta$, 在 ggb_commands 中改写为
+  `aAng`/`bAng`/`tAng` 这类 ASCII 名, 并通过
+  `SetCaption(aAng, "α")` 把希腊字母作为显示标签呈现给学生 ——
+  ggb_commands 中的标识符与界面/解答里看到的符号一致, 只是改了底层名。
+- 依赖另一个点的位移必须写坐标式: `P=(x(K)+dx, y(K)+dy)`。
+  禁止 `P=K+(dx,dy)` 简写, 也禁止 `Translate(K, Vector(...))` (Apps API 内联 Vector 解析不稳定)。
+- Vector 仅接受单个点元组或两点: 写 `Vector((dx,dy))` 或 `Vector(P,Q)`。
+  禁止 `Vector((dx),(dy))` (两个标量, GeoGebra 拒绝)。
+- SetColor 必须用 RGB 三元组: `SetColor(obj, 255, 0, 0)`。禁止 `SetColor(obj, "Red")` 等色名。
+- 单条命令 ≤ 512 字符, 总命令数 ≤ 64。
+- 上述规则会在后端被严格校验; 任意违例都会触发整段 JSON 重新生成。
 
-## 格式
+__GGB__
+
+## JSXGraph 后备规范 (engine=jsxgraph 时)
+- jsx_code 是合法的 JavaScript 函数体, 签名 function(board, JXG, H, params) { ... }。
+- 安全: 仅可使用全局 __ALLOW__; 严禁使用 __FORBID__。
+- 禁止字符串形式的 setTimeout/setInterval, 禁止 import/require/with。
+
+__H__
+
+## 输出格式
 - 仅输出单个 JSON 对象, 不含 ```json 标记。
 - 结构严格匹配下方 Schema。
 
 ## JSON Schema
-{schema_str}
+__SCHEMA__
 """
-
-    # ── User ────────────────────────────────────────────────────────
+        return (
+            body
+            .replace("__GGB__", GGB_CHEATSHEET)
+            .replace("__H__", H_CHEATSHEET)
+            .replace("__ALLOW__", allow)
+            .replace("__FORBID__", forbid)
+            .replace("__SCHEMA__", schema_str)
+        )
 
     def user_message(self, **kwargs: Any) -> str:
-        """User prompt.
-
-        kwargs:
-          answer_package (dict, REQUIRED): AnswerPackage JSON (sans visualizations).
-          parsed_question (dict, REQUIRED): ParsedQuestion JSON.
-        """
         answer_package: dict = kwargs["answer_package"]
         parsed_question: dict = kwargs["parsed_question"]
         return (
@@ -185,5 +303,18 @@ class VizCoderPrompt(PromptTemplate):
             + json.dumps(parsed_question, indent=2, ensure_ascii=False)
             + "\n\n## AnswerPackage (不含 visualizations)\n"
             + json.dumps(answer_package, indent=2, ensure_ascii=False)
-            + "\n\n请为这道题生成 1-3 个交互式可视化。"
+            + "\n\n请基于上面的 AnswerPackage 生成 1-3 个交互式可视化"
+            + ' (默认 engine="geogebra")。'
+            + "\n要求:"
+            + "\n- 在写命令前, 先列出 ParsedQuestion / AnswerPackage 中已经"
+            + "出现的几何对象与参数名, ggb_commands 必须直接复用这些名字, "
+            + "不要为同一对象起新名, 也不要凭空引入新滑块。"
+            + "\n- 每个可视化都必须显式对应 AnswerPackage.solution_steps 中的"
+            + "某一步 (在 caption_cn 中复述该步要点)。"
+            + "\n- 优先为 key_insight、出现的 formulas 以及 pitfalls 中需要图"
+            + "示的情形配图。"
+            + "\n- 在图中标注 final_answer / answer_summary 中给出的关键数值"
+            + "或几何对象, 让学生看到答案如何在图上呈现。"
+            + "\n- 若 solution_steps[].viz_ref 已写出 id, 沿用同 id 以便前端"
+            + "把图锚定到该步骤。"
         )

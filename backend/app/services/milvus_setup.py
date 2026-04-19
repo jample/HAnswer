@@ -42,21 +42,21 @@ def _sparse_fields(extra_scalar: list[FieldSchema]) -> list[FieldSchema]:
 COLLECTIONS = {
     "q_emb": CollectionSchema(
         fields=_base_fields([
-            FieldSchema(name="ref_pg_id", dtype=DataType.VARCHAR, max_length=64),
+            FieldSchema(name="ref_pg_id", dtype=DataType.VARCHAR, max_length=128),
             FieldSchema(name="difficulty", dtype=DataType.INT64),
         ]),
         description="Question text embeddings",
     ),
     "question_full_emb": CollectionSchema(
         fields=_base_fields([
-            FieldSchema(name="question_id", dtype=DataType.VARCHAR, max_length=64),
+            FieldSchema(name="question_id", dtype=DataType.VARCHAR, max_length=128),
             FieldSchema(name="difficulty", dtype=DataType.INT64),
         ]),
         description="Whole-question embeddings",
     ),
     "answer_full_emb": CollectionSchema(
         fields=_base_fields([
-            FieldSchema(name="question_id", dtype=DataType.VARCHAR, max_length=64),
+            FieldSchema(name="question_id", dtype=DataType.VARCHAR, max_length=128),
             FieldSchema(name="difficulty", dtype=DataType.INT64),
         ]),
         description="Whole-answer embeddings",
@@ -86,21 +86,21 @@ COLLECTIONS = {
 SPARSE_COLLECTIONS = {
     "q_emb_sparse": CollectionSchema(
         fields=_sparse_fields([
-            FieldSchema(name="ref_pg_id", dtype=DataType.VARCHAR, max_length=64),
+            FieldSchema(name="ref_pg_id", dtype=DataType.VARCHAR, max_length=128),
             FieldSchema(name="difficulty", dtype=DataType.INT64),
         ]),
         description="Question sparse lexical (BM25 / bge-m3)",
     ),
     "question_full_emb_sparse": CollectionSchema(
         fields=_sparse_fields([
-            FieldSchema(name="question_id", dtype=DataType.VARCHAR, max_length=64),
+            FieldSchema(name="question_id", dtype=DataType.VARCHAR, max_length=128),
             FieldSchema(name="difficulty", dtype=DataType.INT64),
         ]),
         description="Whole-question sparse lexical",
     ),
     "answer_full_emb_sparse": CollectionSchema(
         fields=_sparse_fields([
-            FieldSchema(name="question_id", dtype=DataType.VARCHAR, max_length=64),
+            FieldSchema(name="question_id", dtype=DataType.VARCHAR, max_length=128),
             FieldSchema(name="difficulty", dtype=DataType.INT64),
         ]),
         description="Whole-answer sparse lexical",

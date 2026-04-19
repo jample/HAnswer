@@ -271,7 +271,7 @@ select:focus {
   color: var(--primary);
 }
 
-/* ─── Answer page 3-column grid ─────────────────────────────────────── */
+/* ─── Answer page layout ───────────────────────────────────────────── */
 .qpage-grid {
   display: grid;
   gap: 20px;
@@ -304,19 +304,6 @@ select:focus {
     grid-template-columns: minmax(160px, 200px) minmax(0, 1fr);
   }
   .qpage-outline { display: block; }
-  /* viz panel below content at medium width */
-  .qpage-viz {
-    grid-column: 2 / 3;
-  }
-}
-
-@media (min-width: 1100px) {
-  .qpage-grid {
-    grid-template-columns: minmax(160px, 200px) minmax(0, 1fr) minmax(240px, 340px);
-  }
-  .qpage-viz {
-    grid-column: auto;
-  }
 }
 
 /* ─── Dialog page ──────────────────────────────────────────────────── */

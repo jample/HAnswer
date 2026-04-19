@@ -7,9 +7,10 @@ truth: if a field changes here, update `prompts/schemas.py` in lock-step.
 
 from __future__ import annotations
 
+import re
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # ── ParsedQuestion ──────────────────────────────────────────────────
 
@@ -139,7 +140,83 @@ class VizAnimation(BaseModel):
     drives: list[str] = Field(default_factory=list)
 
 
+VizEngine = Literal["jsxgraph", "geogebra"]
+
+
+class GgbSettings(BaseModel):
+    """Per-visualization GeoGebra applet configuration.
+
+    All fields optional; the frontend supplies sensible defaults when
+    omitted. Limited surface area to keep the LLM honest.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    app_name: Literal["graphing", "geometry", "3d", "classic", "suite"] = "graphing"
+    perspective: str | None = None  # see GeoGebra SetPerspective command
+    coord_system: list[float] | None = None  # [xmin,xmax,ymin,ymax] or 6 entries for 3D
+    axes_visible: bool = True
+    grid_visible: bool = True
+    show_algebra_input: bool = False
+    show_tool_bar: bool = False
+    show_menu_bar: bool = False
+
+
+# ── GeoGebra ggb_commands anti-pattern guards ───────────────────────
+# These compile-time constants drive the Pydantic validator below.
+# When a payload trips one of these guards Pydantic raises ValidationError
+# with an actionable message; GeminiClient's repair loop then re-prompts the
+# LLM with the diagnostic until the payload is clean (or attempts exhausted).
+_GGB_VIEW_DIRECTIVES = frozenset({
+    "SetCoordSystem", "SetAxesVisible", "SetGridVisible",
+    "SetPerspective", "ShowAxes", "ShowGrid",
+})
+_GGB_MAX_COMMANDS = 64
+_GGB_MAX_COMMAND_LEN = 512
+_GGB_POINT_PLUS_TUPLE = re.compile(
+    r"^[A-Za-z][A-Za-z0-9_]*\s*=\s*[A-Za-z][A-Za-z0-9_]*\s*[+\-]\s*\("
+)
+_GGB_VECTOR_TWO_SCALARS = re.compile(
+    # Vector( (..) , (..) )  with up to one level of nested parens inside
+    # each bracketed scalar (catches Vector((cos(t)),(sin(t))) etc.).
+    r"Vector\s*\(\s*\((?:[^()]|\([^()]*\))*\)\s*,\s*\((?:[^()]|\([^()]*\))*\)\s*\)"
+)
+_GGB_TRANSLATE_INLINE_VECTOR = re.compile(
+    r"Translate\s*\([^,]+,\s*Vector\s*\("
+)
+_GGB_SETCOLOR_NAMED = re.compile(
+    r"SetColor\s*\([^,]+,\s*[\"\'][A-Za-z]+[\"\']\s*\)"
+)
+# GeoGebra reserves Greek-letter aliases (it auto-renames a `beta=Slider(...)`
+# to `beta_1` because `beta` ↔ β collides with built-ins). Any subsequent
+# `cos(beta)` then fails to resolve. Force ASCII identifiers that don't
+# spell Greek letters.
+_GGB_GREEK_ALIASES = frozenset({
+    "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta",
+    "iota", "kappa", "lambda", "mu", "nu", "xi", "omicron", "pi", "rho",
+    "sigma", "tau", "upsilon", "phi", "chi", "psi", "omega",
+})
+_GGB_LHS_NAME = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*(?:\([^)]*\))?\s*=")
+
+
 class Visualization(BaseModel):
+    """One interactive visualization for an AnswerPackage.
+
+    Two render engines are supported (selected via ``engine``):
+
+    - ``geogebra`` (preferred): the LLM emits a list of GeoGebra command
+      strings (``ggb_commands``) that the GeoGebra Apps API interprets.
+      No JavaScript evaluation involved → safer + math-professional
+      rendering with built-in animation. ``jsx_code`` should be empty.
+    - ``jsxgraph`` (legacy fallback): the LLM emits a JavaScript function
+      body in ``jsx_code`` that runs in the JSXGraph sandbox. For older
+      payloads or niche use cases the GeoGebra command set cannot express.
+
+    For backward compatibility ``engine`` defaults to ``"jsxgraph"`` and
+    ``jsx_code`` defaults to ``""`` so older / partial payloads validate
+    without modification.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
     id: str
@@ -148,9 +225,95 @@ class Visualization(BaseModel):
     learning_goal: str
     interactive_hints: list[str] = Field(default_factory=list)
     helpers_used: list[str] = Field(default_factory=list)
-    jsx_code: str
+    engine: VizEngine = "jsxgraph"
+    jsx_code: str = ""
+    ggb_commands: list[str] = Field(default_factory=list)
+    ggb_settings: GgbSettings | None = None
     params: list[VizParam] = Field(default_factory=list)
     animation: VizAnimation | None = None
+
+    # ── Anti-pattern guards (trigger LLM repair loop on failure) ──────
+    # These catch GeoGebra command shapes that the Apps API's evalCommand
+    # silently rejects, cascading into broken downstream constructions.
+    # Error messages are written to be directly actionable for the LLM.
+
+    @field_validator("ggb_commands")
+    @classmethod
+    def _validate_ggb_command_shapes(cls, commands: list[str]) -> list[str]:
+        problems: list[str] = []
+        if len(commands) > _GGB_MAX_COMMANDS:
+            problems.append(
+                f"too many commands ({len(commands)} > {_GGB_MAX_COMMANDS}); "
+                f"split the visualization or remove redundant lines"
+            )
+        for i, raw in enumerate(commands):
+            if not isinstance(raw, str):
+                problems.append(f"#{i}: not a string")
+                continue
+            cmd = raw.strip()
+            if not cmd:
+                continue
+            if len(cmd) > _GGB_MAX_COMMAND_LEN:
+                problems.append(
+                    f"#{i} ({len(cmd)} chars > {_GGB_MAX_COMMAND_LEN}): "
+                    f"split into smaller commands"
+                )
+                continue
+            if "\n" in cmd or "\r" in cmd:
+                problems.append(f"#{i}: contains newline (split into separate commands)")
+            head = cmd.split("(", 1)[0].strip()
+            if head in _GGB_VIEW_DIRECTIVES:
+                problems.append(
+                    f"#{i} '{cmd[:80]}': view/axes/grid/perspective directive must "
+                    f"go into ggb_settings, not ggb_commands"
+                )
+                continue
+            if _GGB_POINT_PLUS_TUPLE.match(cmd):
+                problems.append(
+                    f"#{i} '{cmd[:80]}': do not use 'P=base+(dx,dy)' shorthand. "
+                    f"Write 'P=(x(base)+dx, y(base)+dy)' instead — coordinate-form "
+                    f"point definitions render reliably with slider-driven expressions."
+                )
+                continue
+            if _GGB_VECTOR_TWO_SCALARS.search(cmd):
+                problems.append(
+                    f"#{i} '{cmd[:80]}': Vector((a),(b)) is invalid — Vector takes "
+                    f"either one point literal Vector((x,y)) or two points Vector(P,Q)."
+                )
+            if _GGB_TRANSLATE_INLINE_VECTOR.search(cmd):
+                problems.append(
+                    f"#{i} '{cmd[:80]}': avoid Translate(point, Vector((...))) — "
+                    f"the GeoGebra Apps API does not reliably parse inline Vector "
+                    f"tuples with slider expressions. Use 'P=(x(base)+dx, y(base)+dy)'."
+                )
+            if _GGB_SETCOLOR_NAMED.search(cmd):
+                problems.append(
+                    f"#{i} '{cmd[:80]}': SetColor expects an RGB triple, e.g. "
+                    f"SetColor(obj, 255, 0, 0). Color names are not portable."
+                )
+            lhs = _GGB_LHS_NAME.match(cmd)
+            if lhs:
+                name = lhs.group(1)
+                if name.lower() in _GGB_GREEK_ALIASES:
+                    problems.append(
+                        f"#{i} '{cmd[:80]}': '{name}' is a Greek-letter alias that "
+                        f"GeoGebra auto-renames to '{name}_1' (collides with built-in "
+                        f"{name}↔Greek). Every later command referencing '{name}' will "
+                        f"fail. Use a non-Greek ASCII name like 'tParam', 'angA', 'k1'."
+                    )
+        if problems:
+            raise ValueError(
+                "ggb_commands contain forms that the GeoGebra Apps API rejects. "
+                "Fix every command listed and re-emit the full visualization JSON:\n  - "
+                + "\n  - ".join(problems)
+            )
+        return commands
+
+    @model_validator(mode="after")
+    def _check_engine_payload(self) -> Visualization:
+        if self.engine == "geogebra" and not self.ggb_commands:
+            raise ValueError("engine='geogebra' requires at least one ggb_command")
+        return self
 
 
 class VisualizationList(BaseModel):

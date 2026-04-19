@@ -62,6 +62,8 @@ export default function LibraryPage() {
   const [method, setMethod] = useState('');
   const [targetType, setTargetType] = useState('');
   const [noveltyFlag, setNoveltyFlag] = useState('');
+  const [dateFrom, setDateFrom] = useState('');
+  const [dateTo, setDateTo] = useState('');
   const [sort, setSort] = useState<'recommended' | 'recent' | 'popular'>('recommended');
   const [learningReadyOnly, setLearningReadyOnly] = useState(true);
   const [searchMode, setSearchMode] = useState<'list' | 'text'>('list');
@@ -82,10 +84,12 @@ export default function LibraryPage() {
     if (method) p.set('method', method);
     if (targetType) p.set('target_type', targetType);
     if (noveltyFlag) p.set('novelty_flag', noveltyFlag);
+    if (dateFrom) p.set('date_from', dateFrom);
+    if (dateTo) p.set('date_to', dateTo);
     p.set('learning_ready', String(learningReadyOnly));
     p.set('sort', sort);
     return p.toString();
-  }, [subject, gradeBand, difficulty, topic, method, targetType, noveltyFlag, learningReadyOnly, sort]);
+  }, [subject, gradeBand, difficulty, topic, method, targetType, noveltyFlag, dateFrom, dateTo, learningReadyOnly, sort]);
 
   useEffect(() => {
     if (searchMode !== 'list') return;
@@ -199,6 +203,12 @@ export default function LibraryPage() {
             <option value="">全部</option>
             {facets.novelty_flags.map((item) => <option key={item} value={item}>{item}</option>)}
           </select>
+        </label>
+        <label>从
+          <input type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} style={{ marginLeft: 4 }} />
+        </label>
+        <label>至
+          <input type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} style={{ marginLeft: 4 }} />
         </label>
       </div>
 

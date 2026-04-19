@@ -111,8 +111,8 @@ export GEMINI_API_KEY="your_key_here"   # never put the key in config.toml
 model_parser   = "gemini-3.1-pro-preview" # image → ParsedQuestion
 model_solver   = "gemini-3.1-pro-preview" # ParsedQuestion → AnswerPackage
 model_vizcoder = "gemini-3.1-pro-preview" # AnswerPackage → visualizations[]
-model_embed    = "text-embedding-004"  # or "gemini-embedding-001"
-embed_dim      = 768
+model_embed    = "gemini-embedding-2-preview"  # or "gemini-embedding-001"
+embed_dim      = 768  # model default 3072; 768 saves storage
 
 [postgres]
 dsn = "postgresql+asyncpg://jianbo@localhost:5432/jianbo"  # asyncpg driver required
@@ -359,12 +359,12 @@ query / anchor ──┼── sparse  (BM25 / bge-m3 lexical over the same four
               PG hydrate + difficulty filters → top-K
 ```
 
-Fast remote mode: Gemini dense (`text-embedding-004`) + BM25 sparse +
+Fast remote mode: Gemini dense (`gemini-embedding-2-preview`) + BM25 sparse +
 structural — no local model load on each query.
 
 ```toml
 [gemini]
-model_embed    = "text-embedding-004"
+model_embed    = "gemini-embedding-2-preview"
 embed_dim      = 768
 
 [retrieval]
@@ -413,9 +413,11 @@ If you switch sparse encoder family (`bge-m3` ↔ `bm25`), use
 `--recreate-sparse` as well so Milvus does not keep stale sparse rows
 from the previous encoder.
 
-When using `text-embedding-004`, the backend deliberately uses
-`RETRIEVAL_QUERY` for query vectors and `RETRIEVAL_DOCUMENT` for indexed
-rows, matching Google's retrieval guidance.
+When using `gemini-embedding-2-preview`, the backend prepends task
+prefixes to the text (`task: search result | query: ...` for queries,
+`title: none | text: ...` for documents), matching Google's Embedding v2
+guidance. Legacy models (`text-embedding-004`, `gemini-embedding-001`)
+continue to use the `task_type` API parameter.
 
 Set `multi_route = false` to fall back to the single-route formula
 `0.5·cos + 0.3·pattern_match + 0.2·kp_overlap` (safe when sparse
@@ -466,7 +468,7 @@ python -m scripts.smoke_parse ../data/samples/q1.jpg --subject math
 | `/api/ingest/image` returns `502 parser LLM failed` | Gemini key empty / invalid / rate-limited | Check `/api/admin/config` (`api_key_configured: false`?); set `export GEMINI_API_KEY=<your_key>` and restart uvicorn |
 | `/api/answer/{id}` stream immediately emits `error` | Solver repair loop exhausted (bad schema) | Tail uvicorn logs for the pydantic `ValidationError`; consider bumping `[llm].max_repair_attempts` |
 | `/api/answer/{id}` background job fails with `TransientLLMError(timeout...)` during `2/4 生成解答` | Solver answer is taking longer than the configured timeout, or Gemini stalled before sending chunks | Raise `[llm].solver_timeout_s`; keep `stream_solver_json=true` so long JSON answers use Gemini structured streaming instead of one large blocking wait |
-| Sediment / indexing crashes with `404 NOT_FOUND` for `text-embedding-004` | The modern `google-genai` endpoint rejected that model | This repo now routes `text-embedding-004` through the legacy `google-generativeai` embedding path; if your environment still rejects it, switch `[gemini].model_embed` to `gemini-embedding-001` and rebuild Milvus |
+| Sediment / indexing crashes with `404 NOT_FOUND` for `text-embedding-004` | The modern `google-genai` endpoint rejected that model | Switch `[gemini].model_embed` to `gemini-embedding-2-preview` (recommended) or `gemini-embedding-001` and rebuild Milvus. The legacy `text-embedding-004` path is still supported if you install `google-generativeai` |
 | `text-embedding-004` is configured but retrieval is still slow | `retrieval.sparse_encoder` is still set to `bge-m3`, so the local model still loads for sparse search | Set `[retrieval].embedder="gemini"` and `[retrieval].sparse_encoder="bm25"`, then rebuild Milvus indexes |
 | `bge-m3` import fails inside `FlagEmbedding` with a `transformers` symbol error | `FlagEmbedding 1.x` was installed alongside an incompatible `transformers` 5.x build | Re-run `cd backend && python -m pip install -e '.[retrieval]'`; the repo now pins `transformers<5` for the retrieval extra |
 | `pytest` fails with `connection refused: 5432` | Postgres not running or DSN wrong | `pg_isready -p 5432`; fix `[postgres].dsn` |

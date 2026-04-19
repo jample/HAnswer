@@ -326,7 +326,7 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
             ?? (running ? '解答生成中…' : '正在启动后台解答任务…')}
         </p>
       )}
-      <GeminiProgress pipeline={pipeline} done={done} />
+      <GeminiProgress pipeline={pipeline} done={done} liveMessage={latestStatus(byName)} />
       <StageRerunBoard
         currentSolutionId={currentSolutionId}
         stageReviews={stageReviews}
@@ -433,7 +433,7 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
             .map((ev, i) => (
               <article key={i} style={{ marginBottom: 12 }}>
                 <h3 style={{ margin: '8px 0' }}>
-                  第 {ev.data.step_index} 步 · {ev.data.statement}
+                  第 {ev.data.step_index} 步 · <RichText text={ev.data.statement} />
                 </h3>
                 <p><strong>原理:</strong> <RichText text={ev.data.rationale} /></p>
                 {ev.data.formula && (
@@ -450,12 +450,6 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
         </>
       )}
 
-      {byName.visualization && (
-        <p style={mutedStyle}>
-          可视化: {byName.visualization.length} 个 (见右侧面板) →
-        </p>
-      )}
-
       {byName.key_points_of_answer && (
         <>
           <h2 id="sec-key-a" style={h2Style}>答案关键点</h2>
@@ -466,6 +460,14 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
           </ul>
         </>
       )}
+
+      <section id="sec-viz" style={{ marginTop: 28, marginBottom: 12 }}>
+        <h2 style={h2Style}>可视化讲解</h2>
+        <div style={{ ...mutedStyle, marginBottom: 10 }}>
+          把题目的关键步骤放到大图里演示，方便结合上面的解答一起看。
+        </div>
+        <VizPanel vizEvents={byName.visualization || []} fullWidth />
+      </section>
 
       {byName.method_pattern && (
         <>
@@ -511,13 +513,6 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
         <ErrorPanel events={byName.error} onRetry={restartAnswer} restarting={restarting} />
       )}
       </article>
-
-      <aside className="qpage-viz" style={{
-        position: 'sticky', top: 12, alignSelf: 'start',
-        maxHeight: 'calc(100vh - 80px)', overflowY: 'auto',
-      }}>
-        <VizPanel vizEvents={byName.visualization || []} />
-      </aside>
     </section>
   );
 }
@@ -607,7 +602,7 @@ function StatusSteps({ currentStage }: { currentStage: string | null }) {
   );
 }
 
-function GeminiProgress({ pipeline, done }: { pipeline: Pipeline | null; done: boolean }) {
+function GeminiProgress({ pipeline, done, liveMessage }: { pipeline: Pipeline | null; done: boolean; liveMessage?: string | null }) {
   if (!pipeline) return null;
   return (
     <div style={{
@@ -657,6 +652,11 @@ function GeminiProgress({ pipeline, done }: { pipeline: Pipeline | null; done: b
                 Gemini {step.call_index}/4 · {step.label}
               </div>
               <div style={{ fontSize: 12, marginTop: 2 }}>{step.description}</div>
+              {step.state === 'active' && liveMessage && (
+                <div style={{ fontSize: 12, marginTop: 4, fontStyle: 'italic' }}>
+                  ↳ {liveMessage}
+                </div>
+              )}
               {step.state === 'review' && (
                 <div style={{ fontSize: 12, marginTop: 4 }}>
                   当前版本 v{step.artifact_version || 0}，等待人工确认。
@@ -1107,6 +1107,7 @@ const OUTLINE_SPEC: { id: string; label: string; evName: SectionName }[] = [
   { id: 'sec-key-q',         label: '题目关键点', evName: 'key_points_of_question' },
   { id: 'sec-steps',         label: '分步解答', evName: 'solution_step' },
   { id: 'sec-key-a',         label: '答案关键点', evName: 'key_points_of_answer' },
+  { id: 'sec-viz',           label: '可视化讲解', evName: 'visualization' },
   { id: 'sec-pattern',       label: '方法模式', evName: 'method_pattern' },
   { id: 'sec-similar',       label: '同类题目', evName: 'similar_questions' },
   { id: 'sec-kp',            label: '知识点', evName: 'knowledge_points' },
@@ -1116,7 +1117,10 @@ const OUTLINE_SPEC: { id: string; label: string; evName: SectionName }[] = [
 function Outline({
   byName, done,
 }: { byName: Partial<Record<SectionName, AnyEv[]>>; done: boolean }) {
-  const filled = OUTLINE_SPEC.filter((s) => byName[s.evName]?.length).length;
+  const filled = OUTLINE_SPEC.filter((s) => {
+    if (s.evName === 'visualization') return true;
+    return !!byName[s.evName]?.length;
+  }).length;
   return (
     <nav>
       <div style={{ fontWeight: 600, marginBottom: 8 }}>
@@ -1124,7 +1128,7 @@ function Outline({
       </div>
       <ul style={{ listStyle: 'none', paddingLeft: 0, margin: 0 }}>
         {OUTLINE_SPEC.map((s) => {
-          const filledNow = !!byName[s.evName]?.length;
+          const filledNow = s.evName === 'visualization' ? true : !!byName[s.evName]?.length;
           return (
             <li key={s.id} style={{ margin: '4px 0' }}>
               <a
@@ -1146,9 +1150,15 @@ function Outline({
 }
 
 
-// ── Right rail: sticky viz panel with tabs per visualization ──────
+// ── Visualization section ─────────────────────────────────────────
 
-function VizPanel({ vizEvents }: { vizEvents: AnyEv[] }) {
+function VizPanel({
+  vizEvents,
+  fullWidth = false,
+}: {
+  vizEvents: AnyEv[];
+  fullWidth?: boolean;
+}) {
   const [activeIdx, setActiveIdx] = useState(0);
   if (vizEvents.length === 0) {
     return (
@@ -1162,15 +1172,21 @@ function VizPanel({ vizEvents }: { vizEvents: AnyEv[] }) {
   }
   const active = vizEvents[Math.min(activeIdx, vizEvents.length - 1)];
   return (
-    <div>
-      <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginBottom: 8 }}>
+    <div style={{
+      border: '1px solid #e5e7eb',
+      borderRadius: 12,
+      background: '#fff',
+      padding: fullWidth ? 16 : 8,
+      boxShadow: fullWidth ? '0 1px 3px rgba(0,0,0,0.04)' : 'none',
+    }}>
+      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 12 }}>
         {vizEvents.map((ev, i) => (
           <button
             key={i}
             type="button"
             onClick={() => setActiveIdx(i)}
             style={{
-              padding: '4px 10px', fontSize: 12,
+              padding: '6px 12px', fontSize: 12,
               border: '1px solid #ddd', borderRadius: 4,
               background: i === activeIdx ? '#eef5ff' : '#fff',
               cursor: 'pointer',
@@ -1181,25 +1197,29 @@ function VizPanel({ vizEvents }: { vizEvents: AnyEv[] }) {
           </button>
         ))}
       </div>
-      <div style={{ padding: 8, border: '1px solid #eee', borderRadius: 6 }}>
-        <div style={{ fontWeight: 600, marginBottom: 4 }}>{active.data.title_cn}</div>
-        <div style={{ ...mutedStyle, marginBottom: 6 }}>
+      <div style={{ padding: fullWidth ? 12 : 8, border: '1px solid #eee', borderRadius: 10 }}>
+        <div style={{ fontWeight: 700, marginBottom: 6, fontSize: fullWidth ? 18 : 16 }}>{active.data.title_cn}</div>
+        <div style={{ ...mutedStyle, marginBottom: 10, fontSize: 13 }}>
           学习目标: <RichText text={active.data.learning_goal || ''} />
         </div>
         <VizSandbox
           key={active.data.id}
           vizId={active.data.id}
+          engine={active.data.engine}
           jsxCode={active.data.jsx_code}
+          ggbCommands={active.data.ggb_commands}
+          ggbSettings={active.data.ggb_settings}
           params={active.data.params}
+          height={fullWidth ? 560 : 420}
         />
         {(active.data.interactive_hints || []).length > 0 && (
-          <ul style={{ ...mutedStyle, marginTop: 6 }}>
+          <ul style={{ ...mutedStyle, marginTop: 10, fontSize: 13 }}>
             {active.data.interactive_hints.map((h: string, j: number) => (
               <li key={j}><RichText text={h} /></li>
             ))}
           </ul>
         )}
-        <div style={{ ...mutedStyle, marginTop: 6 }}>
+        <div style={{ ...mutedStyle, marginTop: 10, fontSize: 13 }}>
           <RichText text={active.data.caption_cn || ''} />
         </div>
       </div>

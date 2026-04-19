@@ -43,6 +43,22 @@ type PatternAgg = {
   weight_sum: number;
 };
 
+type PatternDetail = {
+  pattern: {
+    id: string;
+    name_cn: string;
+    subject: string;
+    grade_band: string;
+    when_to_use: string;
+    procedure: string[] | null;
+    pitfalls: string[] | null;
+    status: string;
+    seen_count: number;
+  };
+  questions: QuestionHit[];
+  pitfalls_linked: { id: string; name_cn: string; description: string }[];
+};
+
 type KpDetail = {
   kp: KPNode;
   questions: QuestionHit[];
@@ -62,6 +78,8 @@ export default function KnowledgePage() {
   const [prompts, setPrompts] = useState<any[]>([]);
   const [selectedKpId, setSelectedKpId] = useState<string | null>(null);
   const [kpDetail, setKpDetail] = useState<KpDetail | null>(null);
+  const [selectedPatternId, setSelectedPatternId] = useState<string | null>(null);
+  const [patternDetail, setPatternDetail] = useState<PatternDetail | null>(null);
   const [mergeChoice, setMergeChoice] = useState<Record<string, string>>({});
 
   const reloadTree = useCallback(() => {
@@ -100,6 +118,14 @@ export default function KnowledgePage() {
       .then((d) => setKpDetail(d.kp ? d as KpDetail : null))
       .catch(() => setKpDetail(null));
   }, [selectedKpId]);
+
+  useEffect(() => {
+    if (!selectedPatternId) { setPatternDetail(null); return; }
+    fetch(apiUrl(`/api/knowledge/pattern/${selectedPatternId}/detail`))
+      .then((r) => r.json())
+      .then((d) => setPatternDetail(d.pattern ? d as PatternDetail : null))
+      .catch(() => setPatternDetail(null));
+  }, [selectedPatternId]);
 
   async function act(kind: 'kp' | 'pattern', id: string, action: 'promote' | 'reject') {
     const res = await fetch(apiUrl(`/api/knowledge/${action}`), {
@@ -173,11 +199,21 @@ export default function KnowledgePage() {
               <TreeView
                 nodes={nodes} grouped={grouped}
                 selectedId={selectedKpId}
-                onSelect={setSelectedKpId}
+                onSelect={(id) => { setSelectedKpId(id); setSelectedPatternId(null); }}
               />
             </div>
             <div>
-              <DetailPanel detail={kpDetail} />
+              {selectedPatternId && patternDetail ? (
+                <PatternDetailPanel
+                  detail={patternDetail}
+                  onBack={() => setSelectedPatternId(null)}
+                />
+              ) : (
+                <DetailPanel
+                  detail={kpDetail}
+                  onSelectPattern={(id) => setSelectedPatternId(id)}
+                />
+              )}
             </div>
           </div>
         </>
@@ -380,7 +416,7 @@ function NodeList({ parent, grouped, depth, selectedId, onSelect }: {
   );
 }
 
-function DetailPanel({ detail }: { detail: KpDetail | null }) {
+function DetailPanel({ detail, onSelectPattern }: { detail: KpDetail | null; onSelectPattern: (id: string) => void }) {
   if (!detail) {
     return <p style={muted}>选择左侧一个知识点以查看相关题目与方法模式。</p>;
   }
@@ -419,12 +455,87 @@ function DetailPanel({ detail }: { detail: KpDetail | null }) {
         <ul style={{ listStyle: 'none', paddingLeft: 0 }}>
           {detail.patterns.map((p) => (
             <li key={p.id} style={{ padding: '4px 0' }}>
-              <strong style={{ color: p.status === 'live' ? '#0a7c3b' : '#b07c00' }}>
+              <button
+                type="button"
+                onClick={() => onSelectPattern(p.id)}
+                style={{
+                  background: 'none', border: 'none', cursor: 'pointer', padding: 0,
+                  color: '#0366d6', textDecoration: 'underline',
+                  fontWeight: p.status === 'live' ? 600 : 400,
+                }}
+              >
                 {p.name_cn}
-              </strong>
+              </button>
               <span style={muted}>
                 {' · '}{p.subject}·{p.grade_band} · 共现 {p.co_occurrence} 题
               </span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function PatternDetailPanel({ detail, onBack }: { detail: PatternDetail; onBack: () => void }) {
+  const pat = detail.pattern;
+  return (
+    <div>
+      <button type="button" onClick={onBack} style={{ marginBottom: 8, fontSize: 12 }}>← 返回知识点</button>
+      <h2 style={{ marginTop: 0 }}>{pat.name_cn}</h2>
+      <p style={muted}>
+        {pat.subject} · {pat.grade_band} · {pat.status} · 出现 {pat.seen_count} 次
+      </p>
+      {pat.when_to_use && (
+        <div style={{ margin: '8px 0' }}>
+          <strong>适用场景：</strong> {pat.when_to_use}
+        </div>
+      )}
+      {pat.procedure && pat.procedure.length > 0 && (
+        <div style={{ margin: '8px 0' }}>
+          <strong>步骤：</strong>
+          <ol style={{ paddingLeft: 20 }}>
+            {pat.procedure.map((step, i) => <li key={i}>{step}</li>)}
+          </ol>
+        </div>
+      )}
+      {pat.pitfalls && pat.pitfalls.length > 0 && (
+        <div style={{ margin: '8px 0' }}>
+          <strong>常见易错点（内联）：</strong>
+          <ul style={{ paddingLeft: 20 }}>
+            {pat.pitfalls.map((pit, i) => <li key={i} style={{ color: '#c00' }}>{pit}</li>)}
+          </ul>
+        </div>
+      )}
+
+      {detail.pitfalls_linked.length > 0 && (
+        <>
+          <h3>关联易错点 ({detail.pitfalls_linked.length})</h3>
+          <ul style={{ listStyle: 'none', paddingLeft: 0 }}>
+            {detail.pitfalls_linked.map((p) => (
+              <li key={p.id} style={{ padding: '4px 0', borderBottom: '1px solid #eee' }}>
+                <strong style={{ color: '#c00' }}>{p.name_cn}</strong>
+                <div style={muted}>{p.description}</div>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+
+      <h3>相关题目 ({detail.questions.length})</h3>
+      {detail.questions.length === 0 ? (
+        <p style={muted}>暂无关联题目。</p>
+      ) : (
+        <ul style={{ listStyle: 'none', paddingLeft: 0 }}>
+          {detail.questions.map((q) => (
+            <li key={q.question_id} style={{ padding: '4px 0', borderBottom: '1px solid #eee' }}>
+              <Link href={`/q/${q.question_id}`} style={{ color: '#0366d6', textDecoration: 'none' }}>
+                {q.question_text.slice(0, 60) || '(无文本)'}
+                {q.question_text.length > 60 && '…'}
+              </Link>
+              <div style={muted}>
+                {q.subject}·{q.grade_band} · 难度 {q.difficulty}
+              </div>
             </li>
           ))}
         </ul>

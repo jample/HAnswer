@@ -125,10 +125,10 @@ async def test_build_exam_bank_only(session):
 
 @pytest.mark.asyncio
 async def test_build_exam_synthesizes_when_short(session):
-    _seed_q(session, statement="仅有的题", difficulty=2)
+    _seed_q(session, statement="仅有的题", difficulty=2, subject="physics")
     await session.flush()
 
-    cfg = ExamConfig(count=3, allow_synthesis=True, seed=1)
+    cfg = ExamConfig(count=3, allow_synthesis=True, seed=1, subjects=["physics"])
     exam = await build_exam(session, cfg=cfg, llm=_fake_llm_with_variants(2))
 
     items = (await session.execute(
@@ -167,6 +167,6 @@ async def test_get_exam_detail_hydrates_statements(session):
 
 @pytest.mark.asyncio
 async def test_build_exam_rejects_empty_bank(session):
-    cfg = ExamConfig(count=3, allow_synthesis=True)
+    cfg = ExamConfig(count=3, allow_synthesis=True, subjects=["physics"], grade_bands=["junior"])
     with pytest.raises(ValueError):
         await build_exam(session, cfg=cfg, llm=_fake_llm_with_variants(3))

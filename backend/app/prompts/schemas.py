@@ -213,7 +213,7 @@ CONVERSATION_TURN_RESULT_SCHEMA: dict = {
 
 VISUALIZATION_SCHEMA: dict = {
     "type": "object",
-    "required": ["id", "title_cn", "caption_cn", "learning_goal", "jsx_code"],
+    "required": ["id", "title_cn", "caption_cn", "learning_goal", "engine"],
     "properties": {
         "id": {"type": "string"},
         "title_cn": {"type": "string"},
@@ -221,10 +221,62 @@ VISUALIZATION_SCHEMA: dict = {
         "learning_goal": {"type": "string"},
         "interactive_hints": {"type": "array", "items": {"type": "string"}},
         "helpers_used": {"type": "array", "items": {"type": "string"}},
+        "engine": {
+            "type": "string",
+            "enum": ["geogebra", "jsxgraph"],
+            "description": (
+                "渲染引擎。优先使用 'geogebra' (GeoGebra Apps API), 仅在"
+                "GeoGebra 命令无法表达时退回到 'jsxgraph'。"
+            ),
+        },
+        "ggb_commands": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "GeoGebra 命令字符串列表 (engine=geogebra 时必须), 按顺序传给"
+                "ggbApplet.evalCommand()。每条一个完整命令, 例如:"
+                " 'f(x)=x^2', 'A=(1,2)', 'C=Circle((0,0),1)',"
+                " 'a=Slider(-3,3,0.1)', 'SetAnimating(a,true)',"
+                " 'StartAnimation()'。命令名必须是英文。"
+                " 这里只放创建对象/样式/动画命令; SetCoordSystem /"
+                " SetGridVisible / SetAxesVisible / SetPerspective 这类视图或"
+                " 布局控制应写入 ggb_settings。对象标签尽量使用简短 ASCII 名称,"
+                " 避免下划线和中文。"
+                "禁止换行符 (一行一个命令); 单条命令最长 512 字符; 总数 ≤ 64。"
+            ),
+        },
+        "ggb_settings": {
+            "type": "object",
+            "description": "GeoGebra applet 配置 (engine=geogebra 时可选)。",
+            "properties": {
+                "app_name": {
+                    "type": "string",
+                    "enum": ["graphing", "geometry", "3d", "classic", "suite"],
+                    "description": (
+                        "选哪个 GeoGebra app: classic=大多数 2D 题推荐默认值,"
+                        " geometry=平面几何作图, graphing=纯函数/坐标图,"
+                        " 3d=立体几何/3D 物理, suite=多视图。"
+                    ),
+                },
+                "perspective": {"type": "string"},
+                "coord_system": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "description": "可视区: 2D 给 [xmin,xmax,ymin,ymax], 3D 给 6 个数。",
+                },
+                "axes_visible": {"type": "boolean"},
+                "grid_visible": {"type": "boolean"},
+                "show_algebra_input": {"type": "boolean"},
+                "show_tool_bar": {"type": "boolean"},
+                "show_menu_bar": {"type": "boolean"},
+            },
+            "additionalProperties": False,
+        },
         "jsx_code": {
             "type": "string",
             "description": (
-                "JSXGraph 渲染函数体。签名: function(board, JXG, H, params) { ... }。"
+                "JSXGraph 渲染函数体 (engine=jsxgraph 时必须, 否则留空字符串)。"
+                "签名: function(board, JXG, H, params) { ... }。"
                 "仅可用: board, JXG, H, params, Math, Number, Array, Object, "
                 "Boolean, String, JSON, console, requestAnimationFrame, cancelAnimationFrame。"
                 "禁止: window, document, fetch, XMLHttpRequest, WebSocket, Worker, "

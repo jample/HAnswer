@@ -24,10 +24,11 @@ class GeminiSettings(BaseModel):
     model_solver: str = "gemini-3.1-pro-preview"
     model_vizcoder: str = "gemini-3.1-pro-preview"
     # Supported in this repo:
-    #   - text-embedding-004 (legacy google-generativeai path)
+    #   - gemini-embedding-2-preview (google-genai path, recommended)
     #   - gemini-embedding-001 (google-genai path)
-    model_embed: str = "text-embedding-004"
-    embed_dim: int = 768
+    #   - text-embedding-004 (legacy google-generativeai path)
+    model_embed: str = "gemini-embedding-2-preview"
+    embed_dim: int = 768  # model default 3072; 768 recommended for storage
 
 
 class PostgresSettings(BaseModel):
@@ -76,8 +77,9 @@ class RetrievalSettings(BaseModel):
     """M5 hybrid retrieval knobs (§3.4).
 
     `embedder`  — dense-vector provider. "gemini" (default) uses the
-                  configured Gemini embedding model (`text-embedding-004`
-                  or `gemini-embedding-001`). "bge-m3" loads a local
+                  configured Gemini embedding model (`gemini-embedding-2-preview`,
+                  `gemini-embedding-001`, or legacy `text-embedding-004`).
+                  "bge-m3" loads a local
                   BAAI/bge-m3 model via FlagEmbedding (optional
                   dependency, lazy-imported).
     `multi_route` — when True, similar-question retrieval runs three
