@@ -11,6 +11,7 @@ import uuid
 from pathlib import Path
 
 from sqlalchemy import delete
+from sqlalchemy import func
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -203,3 +204,93 @@ async def clear_generated_content(
     await session.execute(
         delete(QuestionSolution).where(QuestionSolution.question_id == question_id),
     )
+
+
+async def delete_question(
+    session: AsyncSession,
+    *,
+    question_id: uuid.UUID,
+) -> dict:
+    """Delete a question and all its cascade children.
+
+    Returns counts of deleted entities for audit trail.
+    """
+    q = await session.get(Question, question_id)
+    if q is None:
+        raise KeyError(f"question {question_id} not found")
+
+    solutions_count = await session.scalar(
+        select(func.count()).select_from(QuestionSolution)
+        .where(QuestionSolution.question_id == question_id)
+    )
+    viz_count = await session.scalar(
+        select(func.count()).select_from(VisualizationRow)
+        .where(VisualizationRow.question_id == question_id)
+    )
+    retrieval_units_count = await session.scalar(
+        select(func.count()).select_from(RetrievalUnitRow)
+        .where(RetrievalUnitRow.question_id == question_id)
+    )
+
+    await session.delete(q)
+    await session.flush()
+
+    return {
+        "solutions_deleted": solutions_count or 0,
+        "visualizations_deleted": viz_count or 0,
+        "retrieval_units_deleted": retrieval_units_count or 0,
+    }
+
+
+async def delete_solution(
+    session: AsyncSession,
+    *,
+    question_id: uuid.UUID,
+    solution_id: uuid.UUID,
+) -> dict:
+    """Delete a specific solution.
+
+    Returns counts of deleted entities.
+    Raises ValueError if this is the last solution.
+    """
+    solution = await session.get(QuestionSolution, solution_id)
+    if solution is None or solution.question_id != question_id:
+        raise KeyError(f"solution {solution_id} not found for question {question_id}")
+
+    remaining_count = await session.scalar(
+        select(func.count()).select_from(QuestionSolution)
+        .where(QuestionSolution.question_id == question_id)
+        .where(QuestionSolution.id != solution_id)
+    )
+    if remaining_count == 0:
+        raise ValueError("cannot delete the last solution")
+
+    viz_count = len(solution.visualizations_json or [])
+    retrieval_units_count = await session.scalar(
+        select(func.count()).select_from(RetrievalUnitRow)
+        .where(RetrievalUnitRow.solution_id == solution_id)
+    )
+    retrieval_profiles_count = await session.scalar(
+        select(func.count()).select_from(QuestionRetrievalProfile)
+        .where(QuestionRetrievalProfile.solution_id == solution_id)
+    )
+
+    if solution.is_current:
+        next_solution = await session.scalar(
+            select(QuestionSolution)
+            .where(QuestionSolution.question_id == question_id)
+            .where(QuestionSolution.id != solution_id)
+            .order_by(QuestionSolution.ordinal)
+            .limit(1)
+        )
+        if next_solution:
+            next_solution.is_current = True
+
+    await session.delete(solution)
+    await session.flush()
+
+    return {
+        "visualizations_deleted": viz_count,
+        "retrieval_units_deleted": retrieval_units_count or 0,
+        "retrieval_profiles_deleted": retrieval_profiles_count or 0,
+    }

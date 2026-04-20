@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from app.services.cost_ledger import PgCostLedger
 from app.services.gemini_transport import GoogleGeminiTransport
-from app.services.llm_client import GeminiClient
+from app.services.llm_client import GeminiClient, JsonlPromptLogger
 
 _client: GeminiClient | None = None
 
@@ -16,7 +16,11 @@ _client: GeminiClient | None = None
 def get_llm_client() -> GeminiClient:
     global _client
     if _client is None:
-        _client = GeminiClient(GoogleGeminiTransport(), ledger=PgCostLedger())
+        _client = GeminiClient(
+            GoogleGeminiTransport(),
+            ledger=PgCostLedger(),
+            prompt_logger=JsonlPromptLogger(),
+        )
     return _client
 
 

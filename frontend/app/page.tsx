@@ -55,9 +55,33 @@ export default function AskPage() {
       const raw = window.localStorage.getItem('hanswer.recent_uploads');
       if (raw) {
         const arr = JSON.parse(raw);
-        if (Array.isArray(arr)) setRecentUploads(arr.slice(0, 10));
+        if (Array.isArray(arr)) {
+          const next = arr.slice(0, 10);
+          setRecentUploads(next);
+          void pruneMissingRecentUploads(next);
+        }
       }
     } catch { /* noop */ }
+  }, []);
+
+  const pruneMissingRecentUploads = useCallback(async (items: { id: string; text: string }[]) => {
+    const checked = await Promise.all(items.map(async (item) => {
+      try {
+        const res = await fetch(apiUrl(`/api/questions/${item.id}`));
+        return res.status === 404 ? null : item;
+      } catch {
+        return item;
+      }
+    }));
+    const next = checked.filter((item): item is { id: string; text: string } => item !== null);
+    if (next.length !== items.length) {
+      setRecentUploads(next);
+      try {
+        window.localStorage.setItem('hanswer.recent_uploads', JSON.stringify(next));
+      } catch {
+        /* noop */
+      }
+    }
   }, []);
 
   useEffect(() => {

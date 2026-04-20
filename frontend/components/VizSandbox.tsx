@@ -18,8 +18,8 @@ type Props = {
  * Dispatcher for visualization rendering.
  *
  * Picks the runtime based on the persisted ``engine`` discriminator:
- * - "geogebra"  → GeoGebraSandbox (preferred, math-professional)
- * - "jsxgraph"  → JsxgraphSandbox (legacy fallback)
+ * - "jsxgraph"  → JsxgraphSandbox
+ * - "geogebra"  → GeoGebraSandbox
  *
  * Older payloads without an explicit engine default to "jsxgraph"
  * for backward compatibility with already-confirmed visualizations.

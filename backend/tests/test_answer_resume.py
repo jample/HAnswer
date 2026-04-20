@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import uuid
 
 import pytest
@@ -12,8 +13,48 @@ from sqlalchemy import select
 
 from app.db import models
 from app.db.session import session_scope
-from app.main import app
+from app.main import _ResumePollingAccessFilter, app
 from app.services import answer_job_service
+
+
+def test_resume_access_filter_drops_successful_resume_polls():
+    filt = _ResumePollingAccessFilter()
+    record = logging.LogRecord(
+        name="uvicorn.access",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=0,
+        msg='%s - "%s %s HTTP/%s" %d',
+        args=(
+            "127.0.0.1:58870",
+            "GET",
+            "/api/answer/abc/resume?solution_id=def",
+            "1.1",
+            200,
+        ),
+        exc_info=None,
+    )
+    assert filt.filter(record) is False
+
+
+def test_resume_access_filter_keeps_other_access_logs():
+    filt = _ResumePollingAccessFilter()
+    record = logging.LogRecord(
+        name="uvicorn.access",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=0,
+        msg='%s - "%s %s HTTP/%s" %d',
+        args=(
+            "127.0.0.1:58870",
+            "GET",
+            "/api/answer/abc/start",
+            "1.1",
+            200,
+        ),
+        exc_info=None,
+    )
+    assert filt.filter(record) is True
 
 
 @pytest.mark.asyncio
@@ -94,6 +135,83 @@ async def test_resume_404_on_missing_question():
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         r = await c.get(f"/api/answer/{uuid.uuid4()}/resume")
         assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_resume_returns_storyboard_from_current_solution():
+    marker = f"resume-storyboard-{uuid.uuid4().hex[:8]}"
+
+    async with session_scope() as s:
+        q = models.Question(
+            parsed_json={
+                "subject": "math",
+                "grade_band": "senior",
+                "topic_path": [],
+                "question_text": marker,
+                "given": [],
+                "find": [],
+                "diagram_description": "",
+                "difficulty": 2,
+                "tags": [],
+                "confidence": 0.9,
+            },
+            answer_package_json={"method_pattern": {"name_cn": "图像法"}},
+            subject="math", grade_band="senior", difficulty=2,
+            dedup_hash=hashlib.sha1(marker.encode()).hexdigest(),
+            seen_count=1, status="review_viz",
+        )
+        s.add(q)
+        await s.flush()
+        qid = q.id
+        storyboard = {
+            "theme_cn": "从交点到最值",
+            "selection_rationale_cn": "选择关键跳跃",
+            "sequence": ["viz-1", "viz-2", "viz-3"],
+            "items": [{"id": "viz-1"}, {"id": "viz-2"}, {"id": "viz-3"}],
+        }
+        s.add(models.QuestionSolution(
+            question_id=qid,
+            ordinal=1,
+            title="解法 1",
+            is_current=True,
+            status="review_viz",
+            answer_package_json={"method_pattern": {"name_cn": "图像法"}},
+            visualizations_json=[{"id": "viz-1", "title_cn": "交点示意"}],
+            sediment_json=None,
+            stage_reviews_json={
+                "visualizing": {
+                    "stage": "visualizing",
+                    "review_status": "pending",
+                    "artifact_version": 1,
+                    "run_count": 1,
+                    "summary": {"visualization_count": 1},
+                    "refs": {"storyboard": storyboard},
+                    "review_note": "",
+                    "reviewed_at": None,
+                    "updated_at": None,
+                }
+            },
+        ))
+
+    try:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as c:
+            r = await c.get(f"/api/answer/{qid}/resume")
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert body["storyboard"]["theme_cn"] == "从交点到最值"
+            assert body["storyboard"]["sequence"] == ["viz-1", "viz-2", "viz-3"]
+    finally:
+        async with session_scope() as s:
+            await s.execute(
+                delete(models.QuestionSolution).where(models.QuestionSolution.question_id == qid)
+            )
+            await s.execute(
+                delete(models.QuestionStageReview)
+                .where(models.QuestionStageReview.question_id == qid)
+            )
+            await s.execute(delete(models.Question).where(models.Question.id == qid))
+            await s.commit()
 
 
 @pytest.mark.asyncio

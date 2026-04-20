@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -37,7 +37,7 @@ QUESTION_STATUS_BY_REVIEW_STAGE = {
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def review_question_status(stage: str) -> str:
@@ -282,6 +282,62 @@ async def _delete_question_level_vectors(
     ref_id = encode_solution_ref(question_id=question_id, solution_id=solution_id)
     for collection in ("question_full_emb", "answer_full_emb"):
         await vector_store.delete(collection, ref_id=ref_id)
+
+
+async def delete_question_vectors(
+    *,
+    vector_store: VectorStore | None,
+    question_id: uuid.UUID,
+    retrieval_units: list[RetrievalUnitRow],
+    solution_ids: list[uuid.UUID] | None = None,
+) -> list[str]:
+    """Delete all Milvus vectors for a question (all collections)."""
+    if vector_store is None:
+        return []
+    collections_cleaned: list[str] = []
+    ref_ids = {
+        encode_solution_ref(question_id=question_id, solution_id=None),
+        *[
+            encode_solution_ref(question_id=question_id, solution_id=solution_id)
+            for solution_id in (solution_ids or [])
+        ],
+        *[
+            encode_solution_ref(question_id=question_id, solution_id=row.solution_id)
+            for row in retrieval_units
+        ],
+    }
+    for collection in ("question_full_emb", "answer_full_emb"):
+        for ref_id in ref_ids:
+            await vector_store.delete(collection, ref_id=ref_id)
+        if ref_ids:
+            collections_cleaned.append(collection)
+    for row in retrieval_units:
+        await vector_store.delete("retrieval_unit_emb", ref_id=str(row.id))
+    if retrieval_units:
+        collections_cleaned.append("retrieval_unit_emb")
+    return collections_cleaned
+
+
+async def delete_solution_vectors(
+    *,
+    vector_store: VectorStore | None,
+    question_id: uuid.UUID,
+    solution_id: uuid.UUID,
+    retrieval_units: list[RetrievalUnitRow],
+) -> list[str]:
+    """Delete Milvus vectors for a specific solution."""
+    if vector_store is None:
+        return []
+    collections_cleaned: list[str] = []
+    ref_id = encode_solution_ref(question_id=question_id, solution_id=solution_id)
+    for collection in ("question_full_emb", "answer_full_emb"):
+        await vector_store.delete(collection, ref_id=ref_id)
+        collections_cleaned.append(collection)
+    for row in retrieval_units:
+        await vector_store.delete("retrieval_unit_emb", ref_id=str(row.id))
+    if retrieval_units:
+        collections_cleaned.append("retrieval_unit_emb")
+    return collections_cleaned
 
 
 async def clear_stage_outputs(

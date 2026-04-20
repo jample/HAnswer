@@ -141,6 +141,112 @@ class VizAnimation(BaseModel):
 
 
 VizEngine = Literal["jsxgraph", "geogebra"]
+StoryboardAnchorKind = Literal[
+    "question_given",
+    "solution_step",
+    "formula",
+    "pitfall",
+    "final_answer",
+    "method_pattern",
+]
+StoryboardRisk = Literal["low", "medium", "high"]
+
+
+class VisualizationAnchorRef(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: StoryboardAnchorKind
+    ref: str
+    excerpt_cn: str = ""
+
+
+class StoryboardSymbol(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    symbol: str
+    meaning_cn: str
+    source_ref: str = ""
+
+
+class StoryboardCoverageEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    item_id: str
+    summary_cn: str
+    anchor_refs: list[VisualizationAnchorRef] = Field(default_factory=list)
+
+
+class VisualizationStoryboardItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    title_cn: str
+    anchor_refs: list[VisualizationAnchorRef] = Field(min_length=1)
+    difficulty_reason_cn: str
+    student_confusion_risk: StoryboardRisk
+    conceptual_jump_cn: str
+    why_visualization_needed_cn: str
+    learning_goal_cn: str
+    engine: VizEngine = "geogebra"
+    shared_symbols: list[str] = Field(default_factory=list)
+    shared_params: list[str] = Field(default_factory=list)
+    depends_on: list[str] = Field(default_factory=list)
+    relation_to_prev_cn: str = ""
+    relation_to_next_cn: str = ""
+    caption_outline_cn: str
+    geo_target_cn: str
+
+
+class VisualizationStoryboard(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    theme_cn: str
+    selection_rationale_cn: str
+    symbol_map: list[StoryboardSymbol] = Field(default_factory=list)
+    shared_params: list[VizParam] = Field(default_factory=list)
+    coverage_summary: list[StoryboardCoverageEntry] = Field(default_factory=list)
+    sequence: list[str] = Field(min_length=3, max_length=4)
+    items: list[VisualizationStoryboardItem] = Field(min_length=3, max_length=4)
+
+    @model_validator(mode="after")
+    def _check_storyboard_integrity(self) -> VisualizationStoryboard:
+        item_ids = [item.id for item in self.items]
+        if len(set(item_ids)) != len(item_ids):
+            raise ValueError("storyboard item ids must be unique")
+        if set(self.sequence) != set(item_ids) or len(self.sequence) != len(item_ids):
+            raise ValueError("sequence must contain every storyboard item id exactly once")
+
+        sequence_pos = {item_id: idx for idx, item_id in enumerate(self.sequence)}
+        known_symbols = {item.symbol for item in self.symbol_map}
+        known_params = {param.name for param in self.shared_params}
+        known_items = set(item_ids)
+
+        for item in self.items:
+            for dependency in item.depends_on:
+                if dependency not in known_items:
+                    raise ValueError(f"storyboard item '{item.id}' depends on unknown id '{dependency}'")
+                if sequence_pos[dependency] >= sequence_pos[item.id]:
+                    raise ValueError(
+                        f"storyboard item '{item.id}' depends on '{dependency}' which must appear earlier in sequence"
+                    )
+            missing_symbols = [symbol for symbol in item.shared_symbols if symbol not in known_symbols]
+            if missing_symbols:
+                raise ValueError(
+                    f"storyboard item '{item.id}' references unknown shared symbols: {missing_symbols}"
+                )
+            missing_params = [param for param in item.shared_params if param not in known_params]
+            if missing_params:
+                raise ValueError(
+                    f"storyboard item '{item.id}' references unknown shared params: {missing_params}"
+                )
+
+        for coverage in self.coverage_summary:
+            if coverage.item_id not in known_items:
+                raise ValueError(
+                    f"coverage_summary references unknown storyboard item '{coverage.item_id}'"
+                )
+
+        return self
 
 
 class GgbSettings(BaseModel):
@@ -216,13 +322,14 @@ class Visualization(BaseModel):
 
     Two render engines are supported (selected via ``engine``):
 
-    - ``geogebra`` (preferred): the LLM emits a list of GeoGebra command
+    - ``geogebra``: the LLM emits a list of GeoGebra command
       strings (``ggb_commands``) that the GeoGebra Apps API interprets.
       No JavaScript evaluation involved → safer + math-professional
       rendering with built-in animation. ``jsx_code`` should be empty.
-    - ``jsxgraph`` (legacy fallback): the LLM emits a JavaScript function
+    - ``jsxgraph``: the LLM emits a JavaScript function
       body in ``jsx_code`` that runs in the JSXGraph sandbox. For older
-      payloads or niche use cases the GeoGebra command set cannot express.
+      payloads or animation-heavy / custom cases the GeoGebra command set
+      cannot express cleanly.
 
     For backward compatibility ``engine`` defaults to ``"jsxgraph"`` and
     ``jsx_code`` defaults to ``""`` so older / partial payloads validate
@@ -356,6 +463,8 @@ class Visualization(BaseModel):
     def _check_engine_payload(self) -> Visualization:
         if self.engine == "geogebra" and not self.ggb_commands:
             raise ValueError("engine='geogebra' requires at least one ggb_command")
+        if self.engine == "jsxgraph" and not self.jsx_code.strip():
+            raise ValueError("engine='jsxgraph' requires non-empty jsx_code")
         return self
 
 

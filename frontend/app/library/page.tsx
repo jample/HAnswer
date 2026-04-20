@@ -73,6 +73,33 @@ export default function LibraryPage() {
   const [loading, setLoading] = useState(false);
   const [facets, setFacets] = useState<Facets>({ methods: [], topics: [], target_types: [], novelty_flags: [] });
 
+  function purgeQuestionLocalRefs(questionId: string) {
+    try {
+      const rawRecent = window.localStorage.getItem('hanswer.recent_uploads');
+      if (rawRecent) {
+        const parsed = JSON.parse(rawRecent);
+        if (Array.isArray(parsed)) {
+          window.localStorage.setItem(
+            'hanswer.recent_uploads',
+            JSON.stringify(parsed.filter((item: { id?: string }) => item?.id !== questionId)),
+          );
+        }
+      }
+      const rawBasket = window.localStorage.getItem('hanswer.practice.basket');
+      if (rawBasket) {
+        const parsed = JSON.parse(rawBasket);
+        if (Array.isArray(parsed)) {
+          window.localStorage.setItem(
+            'hanswer.practice.basket',
+            JSON.stringify(parsed.filter((item: string) => item !== questionId)),
+          );
+        }
+      }
+    } catch {
+      /* noop */
+    }
+  }
+
   const qs = useMemo(() => {
     const p = new URLSearchParams();
     if (subject) p.set('subject', subject);
@@ -136,6 +163,18 @@ export default function LibraryPage() {
     setTextQ('');
     setTextResults([]);
     setStrategy(null);
+  }
+
+  async function handleDeleteQuestion(questionId: string) {
+    if (!confirm(`确定删除题目 #${questionId.slice(0, 8)} 及所有相关数据？此操作不可恢复。`)) return;
+    try {
+      const res = await fetch(apiUrl(`/api/questions/${questionId}/delete`), { method: 'POST' });
+      if (!res.ok) throw new Error(await res.text());
+      purgeQuestionLocalRefs(questionId);
+      setItems((prev) => prev.filter((it) => it.question_id !== questionId));
+    } catch (e) {
+      alert(`删除失败: ${e}`);
+    }
   }
 
   return (
@@ -233,13 +272,22 @@ export default function LibraryPage() {
         <ul style={{ listStyle: 'none', paddingLeft: 0, marginTop: 16 }}>
           {items.map((it) => (
             <li key={it.question_id} style={rowStyle}>
-              <Link href={`/q/${it.question_id}`} style={{ color: '#0366d6', textDecoration: 'none' }}>
-                <strong>#{it.question_id.slice(0, 8)}</strong>
-                {' · '}
-                <div className="q-text-preview">
-                  <RichText text={it.question_text || '(无文本)'} />
-                </div>
-              </Link>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                <Link href={`/q/${it.question_id}`} style={{ color: '#0366d6', textDecoration: 'none', flex: 1 }}>
+                  <strong>#{it.question_id.slice(0, 8)}</strong>
+                  {' · '}
+                  <div className="q-text-preview">
+                    <RichText text={it.question_text || '(无文本)'} />
+                  </div>
+                </Link>
+                <button
+                  type="button"
+                  onClick={() => handleDeleteQuestion(it.question_id)}
+                  style={{ marginLeft: 8, fontSize: 12, color: '#b42318', cursor: 'pointer' }}
+                >
+                  删除
+                </button>
+              </div>
               <div style={muted}>
                 {it.subject} · {it.grade_band} · 难度 {it.difficulty}
                 {it.pattern_name && <> · 模式 <code>{it.pattern_name}</code></>}

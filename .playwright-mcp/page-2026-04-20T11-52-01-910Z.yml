@@ -1,0 +1,91 @@
+- generic [active] [ref=e1]:
+  - banner [ref=e2]:
+    - link "HAnswer" [ref=e3] [cursor=pointer]:
+      - /url: /
+    - generic [ref=e4]: 学习伙伴
+    - navigation [ref=e5]:
+      - link "提问" [ref=e6] [cursor=pointer]:
+        - /url: /
+      - link "题库" [ref=e7] [cursor=pointer]:
+        - /url: /library
+      - link "练习" [ref=e8] [cursor=pointer]:
+        - /url: /practice
+      - link "知识" [ref=e9] [cursor=pointer]:
+        - /url: /knowledge
+      - link "设置" [ref=e10] [cursor=pointer]:
+        - /url: /settings
+  - main [ref=e11]:
+    - generic [ref=e12]:
+      - complementary [ref=e13]:
+        - navigation [ref=e14]:
+          - generic [ref=e15]: 大纲 · 1/9
+          - list [ref=e16]:
+            - listitem [ref=e17]:
+              - link "○题目理解" [ref=e18] [cursor=pointer]:
+                - /url: "#sec-understanding"
+            - listitem [ref=e19]:
+              - link "○题目关键点" [ref=e20] [cursor=pointer]:
+                - /url: "#sec-key-q"
+            - listitem [ref=e21]:
+              - link "○分步解答" [ref=e22] [cursor=pointer]:
+                - /url: "#sec-steps"
+            - listitem [ref=e23]:
+              - link "○答案关键点" [ref=e24] [cursor=pointer]:
+                - /url: "#sec-key-a"
+            - listitem [ref=e25]:
+              - link "●可视化讲解" [ref=e26] [cursor=pointer]:
+                - /url: "#sec-viz"
+            - listitem [ref=e27]:
+              - link "○方法模式" [ref=e28] [cursor=pointer]:
+                - /url: "#sec-pattern"
+            - listitem [ref=e29]:
+              - link "○同类题目" [ref=e30] [cursor=pointer]:
+                - /url: "#sec-similar"
+            - listitem [ref=e31]:
+              - link "○知识点" [ref=e32] [cursor=pointer]:
+                - /url: "#sec-kp"
+            - listitem [ref=e33]:
+              - link "○自我检查" [ref=e34] [cursor=pointer]:
+                - /url: "#sec-check"
+      - article [ref=e35]:
+        - 'heading "题目 #5da3956c" [level=1] [ref=e36]'
+        - button "加入练习篮" [ref=e37]
+        - generic [ref=e38]: 完成“生成解答”后, 才能进入基于答案的多轮对话。
+        - generic [ref=e40]:
+          - generic [ref=e41]: 解法版本
+          - button "新建解法" [ref=e42] [cursor=pointer]
+        - paragraph [ref=e43]: 正在启动后台解答任务…
+        - generic [ref=e44]:
+          - generic [ref=e45]: 阶段重跑
+          - generic [ref=e46]:
+            - generic [ref=e47]:
+              - generic [ref=e48]:
+                - generic [ref=e49]: 解析题面
+                - generic [ref=e50]: 尚未生成
+              - textbox "补充重跑要求，例如：用更适合初中生理解的方式。" [ref=e51]
+              - button "重跑解析题面" [ref=e53] [cursor=pointer]
+            - generic [ref=e54]:
+              - generic [ref=e55]:
+                - generic [ref=e56]: 生成解答
+                - generic [ref=e57]: 尚未生成
+              - textbox "补充重跑要求，例如：用更适合初中生理解的方式。" [ref=e58]
+              - button "重跑生成解答" [disabled] [ref=e60]
+            - generic [ref=e61]:
+              - generic [ref=e62]:
+                - generic [ref=e63]: 生成可视化
+                - generic [ref=e64]: 尚未生成
+              - textbox "补充重跑要求，例如：用更适合初中生理解的方式。" [ref=e65]
+              - button "重跑生成可视化" [disabled] [ref=e67]
+            - generic [ref=e68]:
+              - generic [ref=e69]:
+                - generic [ref=e70]: 建立索引
+                - generic [ref=e71]: 尚未生成
+              - textbox "补充重跑要求，例如：用更适合初中生理解的方式。" [ref=e72]
+              - button "重跑建立索引" [disabled] [ref=e74]
+              - generic [ref=e75]: 清除索引将删除检索单元和向量，可重新建立索引。
+        - generic [ref=e76]:
+          - heading "可视化讲解" [level=2] [ref=e77]
+          - generic [ref=e78]: 把题目的关键步骤放到大图里演示，方便结合上面的解答一起看。
+          - generic [ref=e79]: 暂无可视化。生成中…
+  - button "Open Next.js Dev Tools" [ref=e85] [cursor=pointer]:
+    - img [ref=e86]

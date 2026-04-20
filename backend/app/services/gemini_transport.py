@@ -7,8 +7,11 @@ depending on the network.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
+import re
+from contextlib import asynccontextmanager
 
 from app.config import settings
 from app.services.llm_client import GeminiTransport, StreamChunk, TransientLLMError
@@ -18,6 +21,42 @@ _EMBED_FALLBACK_MODEL = "gemini-embedding-2-preview"
 _LEGACY_TEXT_EMBED_MODELS = {"text-embedding-004", "models/text-embedding-004"}
 # gemini-embedding-2-preview uses task prefixes in prompt text, NOT task_type param
 _EMBED_V2_MODELS = {"gemini-embedding-2-preview"}
+_gemini_call_limiter: asyncio.Semaphore | None = None
+_gemini_call_limiter_limit: int | None = None
+
+_TRANSIENT_MARKERS = ("timeout", "unavailable", "429", "503", "deadline", "high demand")
+
+
+def _looks_transient_error(err: Exception) -> bool:
+    msg = str(err).lower()
+    return isinstance(err, TimeoutError) or any(k in msg for k in _TRANSIENT_MARKERS)
+
+
+def _extract_transient_message(err: Exception) -> str:
+    raw = str(err)
+    code_match = re.search(r"\b(429|503)\b", raw)
+    code = code_match.group(1) if code_match else None
+
+    message_match = re.search(r'"message"\s*:\s*"([^"]+)"', raw)
+    status_match = re.search(r'"status"\s*:\s*"([^"]+)"', raw)
+    if message_match:
+        parts = []
+        if code:
+            parts.append(code)
+        if status_match:
+            parts.append(status_match.group(1))
+        parts.append(message_match.group(1))
+        return " ".join(parts)
+
+    # Fallback: flatten bulky JSON-ish payloads into one readable line.
+    collapsed = " ".join(raw.split())
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+    except Exception:  # noqa: BLE001
+        pass
+    return collapsed
 
 
 def _l2_renormalize(vec: list[float]) -> list[float]:
@@ -25,6 +64,25 @@ def _l2_renormalize(vec: list[float]) -> list[float]:
     if norm <= 0.0:
         return vec
     return [v / norm for v in vec]
+
+
+def _get_gemini_call_limiter() -> asyncio.Semaphore:
+    global _gemini_call_limiter, _gemini_call_limiter_limit
+    limit = settings.llm.max_parallel_gemini_calls
+    if _gemini_call_limiter is None or _gemini_call_limiter_limit != limit:
+        _gemini_call_limiter = asyncio.Semaphore(limit)
+        _gemini_call_limiter_limit = limit
+    return _gemini_call_limiter
+
+
+@asynccontextmanager
+async def _acquire_gemini_call_slot():
+    limiter = _get_gemini_call_limiter()
+    await limiter.acquire()
+    try:
+        yield
+    finally:
+        limiter.release()
 
 
 def _flatten_messages(messages: list[dict]) -> tuple[str, list[dict]]:
@@ -97,19 +155,19 @@ class GoogleGeminiTransport(GeminiTransport):
             response_json_schema=response_schema,
         )
         try:
-            resp = await asyncio.wait_for(
-                self._client.aio.models.generate_content(  # type: ignore[attr-defined]
-                    model=model,
-                    contents=contents,
-                    config=cfg,
-                ),
-                timeout=timeout_s,
-            )
+            async with _acquire_gemini_call_slot():
+                resp = await asyncio.wait_for(
+                    self._client.aio.models.generate_content(  # type: ignore[attr-defined]
+                        model=model,
+                        contents=contents,
+                        config=cfg,
+                    ),
+                    timeout=timeout_s,
+                )
         except Exception as e:  # noqa: BLE001
             # Classify a handful of transient errors; everything else is fatal.
-            msg = str(e).lower()
-            if any(k in msg for k in ("timeout", "unavailable", "429", "503", "deadline")):
-                raise TransientLLMError(str(e)) from e
+            if _looks_transient_error(e):
+                raise TransientLLMError(_extract_transient_message(e)) from e
             raise
 
         raw = resp.text or ""
@@ -133,36 +191,34 @@ class GoogleGeminiTransport(GeminiTransport):
             response_json_schema=response_schema,
         )
         try:
-            stream = await asyncio.wait_for(
-                self._client.aio.models.generate_content_stream(  # type: ignore[attr-defined]
-                    model=model,
-                    contents=contents,
-                    config=cfg,
-                ),
-                timeout=timeout_s,
-            )
-            parts: list[str] = []
-            ptok = ctok = 0
-            while True:
-                try:
-                    chunk = await asyncio.wait_for(stream.__anext__(), timeout=timeout_s)
-                except StopAsyncIteration:
-                    break
-                chunk_text = getattr(chunk, "text", None)
-                if chunk_text:
-                    parts.append(str(chunk_text))
-                chunk_ptok, chunk_ctok = self._usage_counts(chunk)
-                if chunk_ptok:
-                    ptok = chunk_ptok
-                if chunk_ctok:
-                    ctok = chunk_ctok
-            return "".join(parts), ptok, ctok
+            async with _acquire_gemini_call_slot():
+                stream = await asyncio.wait_for(
+                    self._client.aio.models.generate_content_stream(  # type: ignore[attr-defined]
+                        model=model,
+                        contents=contents,
+                        config=cfg,
+                    ),
+                    timeout=timeout_s,
+                )
+                parts: list[str] = []
+                ptok = ctok = 0
+                while True:
+                    try:
+                        chunk = await asyncio.wait_for(stream.__anext__(), timeout=timeout_s)
+                    except StopAsyncIteration:
+                        break
+                    chunk_text = getattr(chunk, "text", None)
+                    if chunk_text:
+                        parts.append(str(chunk_text))
+                    chunk_ptok, chunk_ctok = self._usage_counts(chunk)
+                    if chunk_ptok:
+                        ptok = chunk_ptok
+                    if chunk_ctok:
+                        ctok = chunk_ctok
+                return "".join(parts), ptok, ctok
         except Exception as e:  # noqa: BLE001
-            msg = str(e).lower()
-            if isinstance(e, TimeoutError) or any(
-                k in msg for k in ("timeout", "unavailable", "429", "503", "deadline")
-            ):
-                raise TransientLLMError(str(e)) from e
+            if _looks_transient_error(e):
+                raise TransientLLMError(_extract_transient_message(e)) from e
             raise
 
     async def generate_json_stream_iter(
@@ -192,53 +248,41 @@ class GoogleGeminiTransport(GeminiTransport):
             response_json_schema=response_schema,
         )
 
-        max_stream_retries = 3
+        max_stream_retries = settings.llm.max_retries
         for attempt in range(max_stream_retries + 1):
             try:
-                stream = await asyncio.wait_for(
-                    self._client.aio.models.generate_content_stream(  # type: ignore[attr-defined]
-                        model=model,
-                        contents=contents,
-                        config=cfg,
-                    ),
-                    timeout=timeout_s,
-                )
-                break
+                async with _acquire_gemini_call_slot():
+                    stream = await asyncio.wait_for(
+                        self._client.aio.models.generate_content_stream(  # type: ignore[attr-defined]
+                            model=model,
+                            contents=contents,
+                            config=cfg,
+                        ),
+                        timeout=timeout_s,
+                    )
+                    while True:
+                        try:
+                            chunk = await asyncio.wait_for(
+                                stream.__anext__(), timeout=timeout_s
+                            )
+                        except StopAsyncIteration:
+                            return
+                        text = getattr(chunk, "text", None) or ""
+                        ptok, ctok = self._usage_counts(chunk)
+                        yield StreamChunk(
+                            text=str(text), prompt_tokens=ptok, completion_tokens=ctok,
+                        )
+                return
             except Exception as e:  # noqa: BLE001
-                msg = str(e).lower()
-                is_transient = isinstance(e, TimeoutError) or any(
-                    k in msg for k in ("timeout", "unavailable", "429", "503", "deadline")
-                )
+                is_transient = _looks_transient_error(e)
                 if not is_transient or attempt >= max_stream_retries:
-                    raise TransientLLMError(str(e)) from e
+                    raise TransientLLMError(_extract_transient_message(e)) from e
                 wait_s = 2 ** attempt
-                import logging
                 logging.getLogger(__name__).warning(
                     "stream connection retry %d/%d after %.1fs: %s",
-                    attempt + 1, max_stream_retries, wait_s, msg,
+                    attempt + 1, max_stream_retries, wait_s, _extract_transient_message(e),
                 )
                 await asyncio.sleep(wait_s)
-
-        try:
-            while True:
-                try:
-                    chunk = await asyncio.wait_for(
-                        stream.__anext__(), timeout=timeout_s
-                    )
-                except StopAsyncIteration:
-                    return
-                text = getattr(chunk, "text", None) or ""
-                ptok, ctok = self._usage_counts(chunk)
-                yield StreamChunk(
-                    text=str(text), prompt_tokens=ptok, completion_tokens=ctok,
-                )
-        except Exception as e:  # noqa: BLE001
-            msg = str(e).lower()
-            if isinstance(e, TimeoutError) or any(
-                k in msg for k in ("timeout", "unavailable", "429", "503", "deadline")
-            ):
-                raise TransientLLMError(str(e)) from e
-            raise
 
     async def _legacy_embed(
         self,
@@ -266,7 +310,8 @@ class GoogleGeminiTransport(GeminiTransport):
                 return [list(map(float, raw))]
             return [list(map(float, row)) for row in raw]
 
-        return await asyncio.to_thread(_run)
+        async with _acquire_gemini_call_slot():
+            return await asyncio.to_thread(_run)
 
     async def embed(
         self,
@@ -298,14 +343,15 @@ class GoogleGeminiTransport(GeminiTransport):
             }
             if use_task_type and task_type:
                 config_kwargs["task_type"] = task_type
-            resp = await asyncio.wait_for(
-                self._client.aio.models.embed_content(  # type: ignore[attr-defined]
-                    model=model_name,
-                    contents=_to_contents(chunk),
-                    config=types.EmbedContentConfig(**config_kwargs),
-                ),
-                timeout=settings.llm.embed_timeout_s,
-            )
+            async with _acquire_gemini_call_slot():
+                resp = await asyncio.wait_for(
+                    self._client.aio.models.embed_content(  # type: ignore[attr-defined]
+                        model=model_name,
+                        contents=_to_contents(chunk),
+                        config=types.EmbedContentConfig(**config_kwargs),
+                    ),
+                    timeout=settings.llm.embed_timeout_s,
+                )
             # Matryoshka note: when ``output_dimensionality`` is anything
             # other than the model's native dim (3072 for v2-preview), the
             # server returns the truncated prefix WITHOUT renormalizing.

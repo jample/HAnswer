@@ -39,7 +39,7 @@ from typing import Literal, Protocol
 
 from app.config import settings
 from app.services.bge_m3_runtime import get_bge_m3_model
-from app.services.llm_client import GeminiClient
+from app.services.llm_client import GeminiClient, PromptLogContext
 
 log = logging.getLogger(__name__)
 
@@ -227,6 +227,7 @@ class EmbeddingService:
     """
 
     llm: GeminiClient
+    prompt_context: PromptLogContext | None = None
     _max_chars: int = _MAX_CHARS_PER_CALL
 
     async def embed_one(self, text: str) -> list[float]:
@@ -287,6 +288,7 @@ class EmbeddingService:
                 payloads,
                 model=settings.gemini.model_embed,
                 task_type=None if v2 else kind,
+                prompt_context=self.prompt_context,
             )
             for (global_idx, _payload), vec in zip(entries, vecs, strict=True):
                 chunk_vecs[global_idx] = list(vec)
@@ -374,11 +376,15 @@ class BGEM3DenseEmbedder:
         return settings.retrieval.bge_m3_dense_dim
 
 
-def build_dense_embedder(llm: GeminiClient) -> DenseEmbedder:
+def build_dense_embedder(
+    llm: GeminiClient,
+    *,
+    prompt_context: PromptLogContext | None = None,
+) -> DenseEmbedder:
     """Factory used by routers; picks provider per `retrieval.embedder`."""
     if settings.retrieval.embedder == "bge-m3":
         return BGEM3DenseEmbedder()
-    return EmbeddingService(llm=llm)
+    return EmbeddingService(llm=llm, prompt_context=prompt_context)
 
 
 __all__ = [

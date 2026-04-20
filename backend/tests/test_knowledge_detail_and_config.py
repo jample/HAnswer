@@ -86,3 +86,6 @@ async def test_admin_config_masks_secrets():
         r_cfg = body["retrieval"]
         for k in ("embedder", "sparse_encoder", "multi_route", "rrf_k", "active_dense_dim"):
             assert k in r_cfg
+
+        viz_cfg = body["viz"]
+        assert viz_cfg["default_engine"] in {"jsxgraph", "geogebra"}

@@ -66,6 +66,7 @@ async def read_config() -> dict:
             **settings.retrieval.model_dump(),
             "active_dense_dim": settings.retrieval_dense_dim,
         },
+        "viz": settings.viz.model_dump(),
         "llm": settings.llm.model_dump(),
         "dialog": settings.dialog.model_dump(),
         "server": {

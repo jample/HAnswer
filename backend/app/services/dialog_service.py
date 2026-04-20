@@ -20,7 +20,7 @@ from app.db.models import (
 from app.db.session import session_scope
 from app.prompts import PromptRegistry
 from app.schemas import AnswerPackage, ConversationTurnResult
-from app.services.llm_client import GeminiClient
+from app.services.llm_client import GeminiClient, PromptLogContext
 from app.services.question_solution_service import (
     ensure_current_solution,
     get_current_solution,
@@ -434,6 +434,12 @@ async def append_message(
                 ],
                 "user_message": user_content,
             },
+            prompt_context=PromptLogContext(
+                phase_description="对话生成",
+                question_id=str(question_id) if question_id else None,
+                solution_id=str(solution_id) if solution_id else None,
+                conversation_id=str(conversation_id),
+            ),
             timeout_s=settings.llm.dialog_timeout_s,
         )
     except Exception as exc:

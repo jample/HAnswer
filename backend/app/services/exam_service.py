@@ -34,7 +34,7 @@ from app.db.models import (
 )
 from app.prompts import VariantSynthPrompt
 from app.schemas import AnswerPackage, VariantList, VariantQuestion
-from app.services.llm_client import GeminiClient
+from app.services.llm_client import GeminiClient, PromptLogContext
 
 log = logging.getLogger(__name__)
 
@@ -185,6 +185,11 @@ async def _synthesize_variants(
             "count": count,
             "difficulty_target": difficulty_target,
         },
+        prompt_context=PromptLogContext(
+            phase_description="生成练习变式",
+            question_id=str(source.id),
+            related={"difficulty_target": difficulty_target, "count": count},
+        ),
         timeout_s=settings.llm.solver_timeout_s,
     )
     # Keep only same_pattern=true items — hard constraint.

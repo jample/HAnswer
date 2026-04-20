@@ -17,7 +17,7 @@ type Props = {
  *
  * The iframe is served from `/viz/geogebra-sandbox.html`, loads the
  * GeoGebra Apps API from the official CDN, and exposes the same
- * postMessage protocol as the legacy JSXGraph sandbox so the host
+ * postMessage protocol as the JSXGraph sandbox so the host
  * doesn't care which engine renders.
  *
  * The GeoGebra sandbox needs `allow-same-origin` because deployggb's

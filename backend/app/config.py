@@ -11,6 +11,7 @@ import os
 import tomllib
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -67,12 +68,15 @@ class ServerSettings(BaseModel):
 
 class StorageSettings(BaseModel):
     image_dir: str = "./data/images"
+    llm_prompt_log_file: str = "./data/logs/llm_prompts.jsonl"
 
 
 class LLMSettings(BaseModel):
-    max_retries: int = 4
-    max_repair_attempts: int = 2
+    max_retries: int = 0
+    max_repair_attempts: int = 0
+    max_parallel_gemini_calls: int = Field(default=1, ge=1)
     request_timeout_s: int = 90
+    stream_parser_json: bool = True
     parser_timeout_s: int = 120
     solver_timeout_s: int = 300
     vizcoder_timeout_s: int = 240
@@ -127,6 +131,17 @@ class DialogSettings(BaseModel):
     max_open_questions: int = 8
 
 
+class VizSettings(BaseModel):
+    """Visualization-generation policy.
+
+    `default_engine` controls which rendering engine VizCoder should
+    prefer when creating *new* visualizations. Both engines remain
+    supported at runtime; this setting only changes the generation bias.
+    """
+
+    default_engine: Literal["jsxgraph", "geogebra"] = "geogebra"
+
+
 class Settings(BaseModel):
     gemini: GeminiSettings = Field(default_factory=GeminiSettings)
     postgres: PostgresSettings = Field(default_factory=PostgresSettings)
@@ -136,6 +151,7 @@ class Settings(BaseModel):
     llm: LLMSettings = Field(default_factory=LLMSettings)
     retrieval: RetrievalSettings = Field(default_factory=RetrievalSettings)
     dialog: DialogSettings = Field(default_factory=DialogSettings)
+    viz: VizSettings = Field(default_factory=VizSettings)
 
     @property
     def retrieval_dense_dim(self) -> int:

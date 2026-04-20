@@ -24,6 +24,37 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s - %(messa
 log = logging.getLogger(__name__)
 
 
+class _ResumePollingAccessFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.name != "uvicorn.access":
+            return True
+        args = getattr(record, "args", ())
+        if not isinstance(args, tuple) or len(args) < 5:
+            return True
+        method = str(args[1])
+        path = str(args[2])
+        try:
+            status_code = int(args[4])
+        except (TypeError, ValueError):
+            return True
+        return not (
+            method == "GET"
+            and status_code == 200
+            and "/api/answer/" in path
+            and "/resume" in path
+        )
+
+
+def _install_access_log_filters() -> None:
+    access_logger = logging.getLogger("uvicorn.access")
+    if any(isinstance(f, _ResumePollingAccessFilter) for f in access_logger.filters):
+        return
+    access_logger.addFilter(_ResumePollingAccessFilter())
+
+
+_install_access_log_filters()
+
+
 def _should_rebuild_retrieval(bootstrap: BootstrapReport | None) -> bool:
     if bootstrap is None:
         return False

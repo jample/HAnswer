@@ -76,7 +76,40 @@ const mutedStyle: React.CSSProperties = { color: '#888', fontSize: 12 };
 
 export default function QuestionPage({ params: paramsPromise }: { params: Promise<{ id: string }> }) {
   const params = use(paramsPromise);
+  const purgeQuestionLocalRefs = useCallback((questionId: string) => {
+    try {
+      const rawRecent = window.localStorage.getItem('hanswer.recent_uploads');
+      if (rawRecent) {
+        const parsed = JSON.parse(rawRecent);
+        if (Array.isArray(parsed)) {
+          window.localStorage.setItem(
+            'hanswer.recent_uploads',
+            JSON.stringify(parsed.filter((item: { id?: string }) => item?.id !== questionId)),
+          );
+        }
+      }
+      const rawBasket = window.localStorage.getItem('hanswer.practice.basket');
+      if (rawBasket) {
+        const parsed = JSON.parse(rawBasket);
+        if (Array.isArray(parsed)) {
+          window.localStorage.setItem(
+            'hanswer.practice.basket',
+            JSON.stringify(parsed.filter((item: string) => item !== questionId)),
+          );
+        }
+      }
+    } catch {
+      /* noop */
+    }
+  }, []);
+  const redirectToLibrary = useCallback(() => {
+    purgeQuestionLocalRefs(params.id);
+    window.location.replace('/library');
+  }, [params.id, purgeQuestionLocalRefs]);
   const dialogResizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
+  const latestResumeRef = useRef<{ key: string; body: any } | null>(null);
+  const lastResumeFingerprintRef = useRef('');
+  const unchangedPollCountRef = useRef(0);
   const [events, setEvents] = useState<AnyEv[]>([]);
   const [done, setDone] = useState(false);
   const [initial, setInitial] = useState<any | null>(null);
@@ -93,23 +126,46 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
   const [stageNoteDrafts, setStageNoteDrafts] = useState<Record<string, string>>({});
   const [dialogCollapsed, setDialogCollapsed] = useState(false);
   const [dialogPanelWidth, setDialogPanelWidth] = useState(380);
+  const [toast, setToast] = useState<{ message: string; kind: 'info' | 'success' | 'error' } | null>(null);
+  const [deletingQuestion, setDeletingQuestion] = useState(false);
+
+  const showToast = useCallback((message: string, kind: 'info' | 'success' | 'error' = 'info') => {
+    setToast({ message, kind });
+  }, []);
+  const dismissToast = useCallback(() => setToast(null), []);
+
+  useEffect(() => {
+    if (!toast) return;
+    const timer = setTimeout(dismissToast, 5000);
+    return () => clearTimeout(timer);
+  }, [toast, dismissToast]);
 
   const withSolution = useCallback((path: string, solutionId?: string | null) => {
     if (!solutionId) return path;
     const sep = path.includes('?') ? '&' : '?';
     return `${path}${sep}solution_id=${encodeURIComponent(solutionId)}`;
   }, []);
+  const resumeKey = `${params.id}:${currentSolutionId ?? 'current'}`;
 
   useEffect(() => {
+    if (deletingQuestion) return;
     const target = withSolution(`/api/questions/${params.id}`, currentSolutionId);
-    fetch(apiUrl(target)).then((r) => r.json()).then((body) => {
+    fetch(apiUrl(target)).then(async (r) => {
+      if (r.status === 404) {
+        redirectToLibrary();
+        return null;
+      }
+      if (!r.ok) throw new Error(await r.text());
+      return r.json();
+    }).then((body) => {
+      if (!body) return;
       setInitial(body);
       setSolutions(Array.isArray(body?.solutions) ? body.solutions : []);
       if (typeof body?.current_solution_id === 'string') {
         setCurrentSolutionId((prev) => prev ?? body.current_solution_id);
       }
     }).catch(() => {});
-  }, [currentSolutionId, params.id, withSolution]);
+  }, [currentSolutionId, deletingQuestion, params.id, redirectToLibrary, withSolution]);
 
   useEffect(() => {
     try {
@@ -137,9 +193,15 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
   }, [dialogCollapsed, dialogPanelWidth]);
 
   const loadResume = useCallback(async () => {
+    if (deletingQuestion) return null;
     const res = await fetch(apiUrl(withSolution(`/api/answer/${params.id}/resume`, currentSolutionId)));
+    if (res.status === 404) {
+      redirectToLibrary();
+      return null;
+    }
     if (!res.ok) return null;
     const body = await res.json();
+    latestResumeRef.current = { key: resumeKey, body };
     const replay = resumeToEvents(body);
     setEvents(replay);
     // Check both body.status AND job.error/job.done — the latter catches
@@ -156,7 +218,13 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
       setCurrentSolutionId((prev) => prev ?? body.current_solution_id);
     }
     return body;
-  }, [currentSolutionId, params.id, withSolution]);
+  }, [currentSolutionId, deletingQuestion, params.id, redirectToLibrary, resumeKey, withSolution]);
+
+  useEffect(() => {
+    latestResumeRef.current = null;
+    lastResumeFingerprintRef.current = '';
+    unchangedPollCountRef.current = 0;
+  }, [resumeKey]);
 
   useEffect(() => {
     let cancelled = false;
@@ -170,12 +238,17 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
 
   const autoStartedRef = useRef(false);
   useEffect(() => {
+    autoStartedRef.current = false;
+  }, [resumeKey]);
+
+  useEffect(() => {
     if (!resumeReady || done || autoStartedRef.current) return;
     let cancelled = false;
 
     (async () => {
       try {
-        const first = await loadResume();
+        const cached = latestResumeRef.current?.key === resumeKey ? latestResumeRef.current.body : null;
+        const first = cached ?? await loadResume();
         if (cancelled || first?.complete || first?.status === 'error') return;
         if (hasPendingStageReview(first?.stage_reviews)) return;
         if (first?.job?.running || ['solving', 'visualizing', 'indexing'].includes(first?.status)) return;
@@ -196,20 +269,41 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
     return () => {
       cancelled = true;
     };
-  }, [currentSolutionId, done, loadResume, params.id, resumeReady, withSolution]);
+  }, [currentSolutionId, done, loadResume, params.id, resumeKey, resumeReady, withSolution]);
 
   useEffect(() => {
     if (!resumeReady || done || !running) return;
     let cancelled = false;
     let timeoutId: ReturnType<typeof setTimeout>;
+
+    const scheduleNext = (body: any | null) => {
+      const fingerprint = body ? buildResumeFingerprint(body) : '';
+      if (fingerprint && fingerprint === lastResumeFingerprintRef.current) {
+        unchangedPollCountRef.current += 1;
+      } else {
+        lastResumeFingerprintRef.current = fingerprint;
+        unchangedPollCountRef.current = 0;
+      }
+      if (!cancelled) {
+        timeoutId = setTimeout(
+          poll,
+          nextResumePollDelay(body, unchangedPollCountRef.current),
+        );
+      }
+    };
+
     const poll = () => {
-      loadResume().catch(() => {}).finally(() => {
-        if (!cancelled) timeoutId = setTimeout(poll, 1500);
+      loadResume().then((body) => {
+        scheduleNext(body);
+      }).catch(() => {
+        scheduleNext(null);
       });
     };
-    timeoutId = setTimeout(poll, 1500);
+
+    const cached = latestResumeRef.current?.key === resumeKey ? latestResumeRef.current.body : null;
+    timeoutId = setTimeout(poll, nextResumePollDelay(cached, 0));
     return () => { cancelled = true; clearTimeout(timeoutId); };
-  }, [done, loadResume, resumeReady, running]);
+  }, [done, loadResume, resumeKey, resumeReady, running]);
 
   const byName = useMemo(() => groupBy(events), [events]);
 
@@ -240,6 +334,7 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
 
   async function restartAnswer() {
     setRestarting(true);
+    showToast('正在重新开始解答…', 'info');
     try {
       await fetch(apiUrl(withSolution(`/api/answer/${params.id}/start`, currentSolutionId)), { method: 'POST' });
       setEvents([]);
@@ -248,6 +343,9 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
       setJobStage('queued');
       setPipeline(null);
       await loadResume();
+      showToast('解答已重新启动', 'success');
+    } catch (e) {
+      showToast(`重启失败: ${e}`, 'error');
     } finally {
       setRestarting(false);
     }
@@ -255,6 +353,7 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
 
   async function createNewSolution() {
     setCreatingSolution(true);
+    showToast('正在创建新解法…', 'info');
     try {
       const res = await fetch(apiUrl(`/api/questions/${params.id}/solutions`), {
         method: 'POST',
@@ -269,6 +368,9 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
       setDone(false);
       setPipeline(null);
       await loadResume();
+      showToast('新解法已创建', 'success');
+    } catch (e) {
+      showToast(`创建解法失败: ${e}`, 'error');
     } finally {
       setCreatingSolution(false);
     }
@@ -320,6 +422,25 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
   async function handleStageAction(stage: string, action: 'confirm' | 'rerun') {
     const key = `${stage}:${action}`;
     setStageActionPending(key);
+    const label = stageLabel(stage);
+    if (action === 'rerun') {
+      setDone(false);
+      setRunning(true);
+      setJobStage(stage);
+      setPipeline((prev) => optimisticPipelineForRerun(prev, stage));
+      setEvents((prev) => [
+        ...prev.filter((ev) => !(ev.name === 'status' && ev.data?.stage === stage)),
+        {
+          name: 'status',
+          data: {
+            stage,
+            message: optimisticRerunMessage(stage),
+          },
+          ts: Date.now(),
+        },
+      ]);
+    }
+    showToast(`正在${action === 'rerun' ? '重跑' : '确认'}${label}…`, 'info');
     try {
       const note = stageNoteDrafts[stage] ?? '';
       const res = await fetch(
@@ -341,12 +462,14 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
         throw new Error(await res.text());
       }
       await loadResume();
+      showToast(`${label}${action === 'rerun' ? '重跑' : '确认'}完成`, 'success');
     } catch (e) {
       setEvents((prev) => [...prev, {
         name: 'error',
         data: { message: String(e) },
         ts: Date.now(),
       }]);
+      showToast(`${label}${action === 'rerun' ? '重跑' : '确认'}失败: ${e}`, 'error');
     } finally {
       setStageActionPending(null);
     }
@@ -356,7 +479,83 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
     await handleStageAction(stage, 'rerun');
   }
 
+  async function handleDeleteSolution(solutionId: string) {
+    if (!confirm('确定删除此解法？相关可视化和索引数据将一并删除。')) return;
+    showToast('正在删除解法…', 'info');
+    try {
+      const res = await fetch(
+        apiUrl(`/api/questions/${params.id}/solutions/${solutionId}/delete`),
+        { method: 'POST' },
+      );
+      if (!res.ok) {
+        const body = await res.text();
+        if (res.status === 409) { showToast('无法删除最后一个解法', 'error'); return; }
+        throw new Error(body);
+      }
+      if (currentSolutionId === solutionId) setCurrentSolutionId(null);
+      await loadResume();
+      showToast('解法已删除', 'success');
+    } catch (e) {
+      showToast(`删除失败: ${e}`, 'error');
+    }
+  }
+
+  async function handleDeleteVisualization(vizRef: string) {
+    if (!currentSolutionId) return;
+    if (!confirm(`确定删除可视化 "${vizRef}"？`)) return;
+    showToast('正在删除可视化…', 'info');
+    try {
+      const res = await fetch(
+        apiUrl(`/api/questions/${params.id}/solutions/${currentSolutionId}/visualizations/${encodeURIComponent(vizRef)}/delete`),
+        { method: 'POST' },
+      );
+      if (!res.ok) throw new Error(await res.text());
+      await loadResume();
+      showToast('可视化已删除', 'success');
+    } catch (e) {
+      showToast(`删除失败: ${e}`, 'error');
+    }
+  }
+
+  async function handleClearIndex() {
+    if (!currentSolutionId) return;
+    if (!confirm('确定清除当前解法的检索索引？此操作不可恢复。')) return;
+    showToast('正在清除索引…', 'info');
+    try {
+      const res = await fetch(
+        apiUrl(`/api/questions/${params.id}/solutions/${currentSolutionId}/index/clear`),
+        { method: 'POST' },
+      );
+      if (!res.ok) throw new Error(await res.text());
+      await loadResume();
+      showToast('索引已清除', 'success');
+    } catch (e) {
+      showToast(`清除失败: ${e}`, 'error');
+    }
+  }
+
+  async function handleDeleteQuestion() {
+    if (!confirm('确定删除此题目及所有相关数据（解法、可视化、索引）？此操作不可恢复。')) return;
+    setDeletingQuestion(true);
+    setRunning(false);
+    showToast('正在删除题目…', 'info');
+    try {
+      const res = await fetch(apiUrl(`/api/questions/${params.id}/delete`), { method: 'POST' });
+      if (res.status === 404) {
+        redirectToLibrary();
+        return;
+      }
+      if (!res.ok) throw new Error(await res.text());
+      redirectToLibrary();
+    } catch (e) {
+      setDeletingQuestion(false);
+      showToast(`删除失败: ${e}`, 'error');
+    }
+  }
+
   return (
+    <>
+    {toast && <ToastNotification message={toast.message} kind={toast.kind} onDismiss={dismissToast} />}
     <section
       className={`qpage-grid${canOpenDialog ? ' with-dialog' : ''}${dialogCollapsed ? ' dialog-collapsed' : ''}`}
       style={pageGridStyle}
@@ -379,6 +578,14 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
       <button type="button" onClick={toggleBasket} style={{ fontSize: 12, marginBottom: 8 }}>
         {inBasket ? '✓ 已加入练习篮 (点击移除)' : '加入练习篮'}
       </button>
+      <button
+        type="button"
+        onClick={handleDeleteQuestion}
+        disabled={deletingQuestion}
+        style={{ fontSize: 12, marginBottom: 8, marginLeft: 8, color: '#b42318' }}
+      >
+        {deletingQuestion ? '删除中…' : '删除题目'}
+      </button>
       <div style={{ marginBottom: 12 }}>
         {canOpenDialog ? (
           <span style={mutedStyle}>右侧追问面板已绑定当前解法；窄屏时会自动折到下方。</span>
@@ -392,6 +599,7 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
         creating={creatingSolution}
         onSelect={setCurrentSolutionId}
         onCreate={createNewSolution}
+        onDelete={handleDeleteSolution}
       />
       {!done && (
         <p style={mutedStyle}>
@@ -409,6 +617,7 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
         onNoteChange={(stage, value) => setStageNoteDrafts((prev) => ({ ...prev, [stage]: value }))}
         actionPending={stageActionPending}
         onRerun={handleDirectRerun}
+        onClearIndex={handleClearIndex}
       />
       <StageReviewPanel
         review={pendingReview}
@@ -541,7 +750,7 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
         <div style={{ ...mutedStyle, marginBottom: 10 }}>
           把题目的关键步骤放到大图里演示，方便结合上面的解答一起看。
         </div>
-        <VizPanel vizEvents={byName.visualization || []} fullWidth />
+        <VizPanel vizEvents={byName.visualization || []} fullWidth onDeleteViz={handleDeleteVisualization} />
       </section>
 
       {byName.method_pattern && (
@@ -589,7 +798,7 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
       )}
       </article>
 
-      {currentSolutionId && (
+      {currentSolutionId && !deletingQuestion && (
         <aside className="qpage-sidepanel">
           {canOpenDialog && !dialogCollapsed && (
             <div
@@ -610,6 +819,7 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
         </aside>
       )}
     </section>
+    </>
   );
 }
 
@@ -628,6 +838,81 @@ function latestStatus(byName: Partial<Record<SectionName, AnyEv[]>>): string | n
   if (!items?.length) return null;
   const last = items[items.length - 1]?.data;
   return typeof last?.message === 'string' ? last.message : null;
+}
+
+function buildResumeFingerprint(body: any): string {
+  const stageReviews = Array.isArray(body?.stage_reviews)
+    ? body.stage_reviews.map((item: any) => `${item.stage}:${item.review_status}:${item.artifact_version}`).join('|')
+    : '';
+  return JSON.stringify({
+    status: body?.status ?? null,
+    complete: Boolean(body?.complete),
+    running: Boolean(body?.job?.running),
+    stage: body?.job?.stage ?? null,
+    done: Boolean(body?.job?.done),
+    error: body?.job?.error ?? null,
+    sections: Array.isArray(body?.sections) ? body.sections.length : 0,
+    visualizations: Array.isArray(body?.visualizations) ? body.visualizations.length : 0,
+    stageReviews,
+  });
+}
+
+function nextResumePollDelay(body: any, unchangedCount: number): number {
+  const stage = typeof body?.job?.stage === 'string' ? body.job.stage : body?.status ?? null;
+  let baseMs = 2500;
+  if (stage === 'solving' || stage === 'visualizing') {
+    baseMs = 3000;
+  } else if (stage === 'indexing') {
+    baseMs = 4000;
+  } else if (stage === 'queued') {
+    baseMs = 2000;
+  }
+
+  const hidden = typeof document !== 'undefined' && document.visibilityState !== 'visible';
+  const hiddenBaseMs = hidden ? Math.max(baseMs, 8000) : baseMs;
+  const maxMs = hidden ? 15000 : 6000;
+  return Math.min(hiddenBaseMs + unchangedCount * 1000, maxMs);
+}
+
+function optimisticRerunMessage(stage: string): string {
+  const labels: Record<string, string> = {
+    parsed: '正在重新解析题面。',
+    solving: '正在重新生成解答。',
+    visualizing: '正在重新生成可视化。',
+    indexing: '正在重新建立索引。',
+  };
+  return labels[stage] ?? '正在重跑当前阶段。';
+}
+
+function optimisticPipelineForRerun(pipeline: Pipeline | null, stage: string): Pipeline | null {
+  if (!pipeline) return null;
+  const stageOrder = ['parsed', 'solving', 'visualizing', 'indexing'];
+  const stageIndex = stageOrder.indexOf(stage);
+  if (stageIndex < 0) return pipeline;
+
+  const steps = pipeline.steps.map((step) => {
+    const idx = stageOrder.indexOf(step.key);
+    if (idx < 0) return step;
+    if (idx < stageIndex) {
+      return { ...step, state: 'done' as const };
+    }
+    if (idx === stageIndex) {
+      return { ...step, state: 'active' as const, review_status: null, artifact_version: 0 };
+    }
+    return { ...step, state: 'pending' as const, review_status: null, artifact_version: 0 };
+  });
+
+  return {
+    ...pipeline,
+    current_stage: stage,
+    current_call: stageIndex + 1,
+    completed_calls: stageIndex,
+    visualizations_generated: stageIndex > stageOrder.indexOf('visualizing')
+      ? pipeline.visualizations_generated
+      : false,
+    error: null,
+    steps,
+  };
 }
 
 function progressHeadline(pipeline: Pipeline | null): string | null {
@@ -795,12 +1080,14 @@ function SolutionSwitcher({
   creating,
   onSelect,
   onCreate,
+  onDelete,
 }: {
   solutions: SolutionSummary[];
   currentSolutionId: string | null;
   creating: boolean;
   onSelect: (solutionId: string) => void;
   onCreate: () => void;
+  onDelete: (solutionId: string) => void;
 }) {
   return (
     <div style={{ marginBottom: 14 }}>
@@ -814,24 +1101,44 @@ function SolutionSwitcher({
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 8 }}>
           {solutions.map((solution) => {
             const active = solution.solution_id === currentSolutionId;
+            const isLast = solutions.length === 1;
             return (
-              <button
-                key={solution.solution_id}
-                type="button"
-                onClick={() => onSelect(solution.solution_id)}
-                style={{
-                  border: active ? '1px solid #245ea8' : '1px solid #d9d9d9',
-                  background: active ? '#eef5ff' : '#fff',
-                  color: active ? '#245ea8' : '#666',
-                  borderRadius: 999,
-                  padding: '6px 12px',
-                  fontSize: 12,
-                  cursor: 'pointer',
-                }}
-              >
-                {solution.title}
-                {solution.is_current ? ' · 当前' : ''}
-              </button>
+              <div key={solution.solution_id} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                <button
+                  type="button"
+                  onClick={() => onSelect(solution.solution_id)}
+                  style={{
+                    border: active ? '1px solid #245ea8' : '1px solid #d9d9d9',
+                    background: active ? '#eef5ff' : '#fff',
+                    color: active ? '#245ea8' : '#666',
+                    borderRadius: 999,
+                    padding: '6px 12px',
+                    fontSize: 12,
+                    cursor: 'pointer',
+                  }}
+                >
+                  {solution.title}
+                  {solution.is_current ? ' · 当前' : ''}
+                </button>
+                {!isLast && (
+                  <button
+                    type="button"
+                    onClick={() => onDelete(solution.solution_id)}
+                    style={{
+                      border: '1px solid #f4c7c7',
+                      background: '#fff',
+                      color: '#b42318',
+                      borderRadius: 4,
+                      padding: '4px 8px',
+                      fontSize: 11,
+                      cursor: 'pointer',
+                    }}
+                    title="删除此解法"
+                  >
+                    删除
+                  </button>
+                )}
+              </div>
             );
           })}
         </div>
@@ -847,6 +1154,7 @@ function StageRerunBoard({
   onNoteChange,
   actionPending,
   onRerun,
+  onClearIndex,
 }: {
   currentSolutionId: string | null;
   stageReviews: StageReview[];
@@ -854,6 +1162,7 @@ function StageRerunBoard({
   onNoteChange: (stage: string, value: string) => void;
   actionPending: string | null;
   onRerun: (stage: string) => void;
+  onClearIndex: () => void;
 }) {
   const stages = ['parsed', 'solving', 'visualizing', 'indexing'];
   return (
@@ -894,11 +1203,25 @@ function StageRerunBoard({
                   lineHeight: 1.5,
                 }}
               />
-              <div style={{ marginTop: 8 }}>
+              <div style={{ marginTop: 8, display: 'flex', gap: 8, alignItems: 'center' }}>
                 <button className="btn btn-secondary" onClick={() => onRerun(stage)} disabled={disabled || pending}>
                   {pending ? '重跑中…' : `重跑${stageLabel(stage)}`}
                 </button>
+                {stage === 'indexing' && currentSolutionId && (
+                  <button
+                    className="btn btn-secondary"
+                    onClick={onClearIndex}
+                    style={{ color: '#b42318' }}
+                  >
+                    清除索引
+                  </button>
+                )}
               </div>
+              {stage === 'indexing' && (
+                <div style={{ fontSize: 11, color: '#888', marginTop: 4 }}>
+                  清除索引将删除检索单元和向量，可重新建立索引。
+                </div>
+              )}
             </div>
           );
         })}
@@ -1251,9 +1574,11 @@ function Outline({
 function VizPanel({
   vizEvents,
   fullWidth = false,
+  onDeleteViz,
 }: {
   vizEvents: AnyEv[];
   fullWidth?: boolean;
+  onDeleteViz?: (vizRef: string) => void;
 }) {
   const [activeIdx, setActiveIdx] = useState(0);
   if (vizEvents.length === 0) {
@@ -1277,20 +1602,38 @@ function VizPanel({
     }}>
       <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 12 }}>
         {vizEvents.map((ev, i) => (
-          <button
-            key={i}
-            type="button"
-            onClick={() => setActiveIdx(i)}
-            style={{
-              padding: '6px 12px', fontSize: 12,
-              border: '1px solid #ddd', borderRadius: 4,
-              background: i === activeIdx ? '#eef5ff' : '#fff',
-              cursor: 'pointer',
-            }}
-            title={ev.data.title_cn}
-          >
-            {i + 1}. {(ev.data.title_cn || '').slice(0, 12)}
-          </button>
+          <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+            <button
+              type="button"
+              onClick={() => setActiveIdx(i)}
+              style={{
+                padding: '6px 12px', fontSize: 12,
+                border: '1px solid #ddd', borderRadius: 4,
+                background: i === activeIdx ? '#eef5ff' : '#fff',
+                cursor: 'pointer',
+              }}
+              title={ev.data.title_cn}
+            >
+              {i + 1}. {(ev.data.title_cn || '').slice(0, 12)}
+            </button>
+            {onDeleteViz && (
+              <button
+                type="button"
+                onClick={() => onDeleteViz(ev.data.id || ev.data.viz_ref)}
+                style={{
+                  border: 'none',
+                  background: 'none',
+                  color: '#b42318',
+                  fontSize: 11,
+                  cursor: 'pointer',
+                  padding: '2px 4px',
+                }}
+                title="删除此可视化"
+              >
+                ×
+              </button>
+            )}
+          </div>
         ))}
       </div>
       <div style={{ padding: fullWidth ? 12 : 8, border: '1px solid #eee', borderRadius: 10 }}>
@@ -1319,6 +1662,52 @@ function VizPanel({
           <RichText text={active.data.caption_cn || ''} />
         </div>
       </div>
+    </div>
+  );
+}
+
+function ToastNotification({
+  message,
+  kind,
+  onDismiss,
+}: {
+  message: string;
+  kind: 'info' | 'success' | 'error';
+  onDismiss: () => void;
+}) {
+  const palette =
+    kind === 'success'
+      ? { bg: '#eef8f0', fg: '#1f7a3d', border: '#cfe8d5' }
+      : kind === 'error'
+        ? { bg: '#fff1f1', fg: '#b42318', border: '#f4c7c7' }
+        : { bg: '#eef5ff', fg: '#245ea8', border: '#d5e4fb' };
+  return (
+    <div
+      role="alert"
+      onClick={onDismiss}
+      style={{
+        position: 'fixed',
+        top: 16,
+        left: '50%',
+        transform: 'translateX(-50%)',
+        padding: '10px 20px',
+        borderRadius: 8,
+        background: palette.bg,
+        color: palette.fg,
+        border: `1px solid ${palette.border}`,
+        boxShadow: '0 2px 8px rgba(0,0,0,0.08)',
+        fontSize: 14,
+        fontWeight: 500,
+        cursor: 'pointer',
+        zIndex: 9999,
+        maxWidth: '90vw',
+        textAlign: 'center',
+      }}
+    >
+      {kind === 'info' && '⏳ '}
+      {kind === 'success' && '✓ '}
+      {kind === 'error' && '⚠ '}
+      {message}
     </div>
   );
 }

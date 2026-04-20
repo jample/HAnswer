@@ -15,6 +15,8 @@ from app.prompts.parser_prompt import ParserPrompt
 from app.prompts.solver_prompt import SolverPrompt
 from app.prompts.variant_synth_prompt import VariantSynthPrompt
 from app.prompts.vizcoder_prompt import VizCoderPrompt
+from app.prompts.vizitem_prompt import VizItemPrompt
+from app.prompts.vizplanner_prompt import VizPlannerPrompt
 
 
 class _Registry:
@@ -23,6 +25,8 @@ class _Registry:
         self._register(DialogPrompt())
         self._register(ParserPrompt())
         self._register(SolverPrompt())
+        self._register(VizPlannerPrompt())
+        self._register(VizItemPrompt())
         self._register(VizCoderPrompt())
         self._register(VariantSynthPrompt())
 

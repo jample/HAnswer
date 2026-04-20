@@ -2,19 +2,19 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal
 
-from datetime import datetime
-
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from sqlalchemy import Text, and_, case, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.db import models
 from app.db.session import session_scope
-from app.config import settings
 from app.services.embedding import build_dense_embedder
+from app.services.llm_client import PromptLogContext
 from app.services.llm_deps import get_llm_client
 from app.services.retrieval_service import (
     SimilarQuery,
@@ -77,7 +77,15 @@ async def similar(
         excluded_ids=req.filters.excluded_ids,
         k=req.k,
     )
-    dense = build_dense_embedder(llm)
+    dense = build_dense_embedder(
+        llm,
+        prompt_context=PromptLogContext(
+            phase_description="相似题检索",
+            question_id=str(req.question_id) if req.question_id else None,
+            solution_id=str(req.solution_id) if req.solution_id else None,
+            related={"mode": req.mode, "k": req.k},
+        ),
+    )
     if settings.retrieval.multi_route:
         hits = await similar_questions_multi_route(
             session, query=q, embedding=dense,

@@ -53,6 +53,7 @@ async def ingest_image_endpoint(
             mime=file.content_type,
             llm=llm,
             subject_hint=subject_hint,
+            image_name=file.filename,
         )
     except LLMError as e:
         raise HTTPException(502, f"parser LLM failed: {e}")
@@ -153,6 +154,7 @@ async def replace_question_image_endpoint(
             mime=file.content_type,
             llm=llm,
             subject_hint=subject_hint,
+            image_name=file.filename,
         )
     except KeyError:
         raise HTTPException(404, "question not found")

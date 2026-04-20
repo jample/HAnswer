@@ -27,6 +27,8 @@ from app.prompts.registry import PromptRegistry
 from app.prompts.solver_prompt import SolverPrompt
 from app.prompts.variant_synth_prompt import VariantSynthPrompt
 from app.prompts.vizcoder_prompt import VizCoderPrompt
+from app.prompts.vizitem_prompt import VizItemPrompt
+from app.prompts.vizplanner_prompt import VizPlannerPrompt
 
 __all__ = [
     "DesignDecision",
@@ -38,4 +40,6 @@ __all__ = [
     "SolverPrompt",
     "VariantSynthPrompt",
     "VizCoderPrompt",
+    "VizItemPrompt",
+    "VizPlannerPrompt",
 ]

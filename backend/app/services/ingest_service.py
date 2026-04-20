@@ -16,7 +16,7 @@ from app.db import repo
 from app.db.models import IngestImage, Question
 from app.prompts import PromptRegistry
 from app.schemas import ParsedQuestion
-from app.services.llm_client import GeminiClient
+from app.services.llm_client import GeminiClient, PromptLogContext
 from app.services.stage_review_service import ensure_parsed_stage_review
 
 MIME_EXT = {
@@ -53,6 +53,7 @@ async def ingest_image(
     llm: GeminiClient,
     subject_hint: str | None = None,
     user_guidance: str | None = None,
+    image_name: str | None = None,
 ) -> IngestResult:
     """End-to-end ingest: blob → parser → persistence.
 
@@ -98,7 +99,13 @@ async def ingest_image(
         model_cls=ParsedQuestion,
         template_kwargs=kwargs,
         messages_override=messages,
+        prompt_context=PromptLogContext(
+            phase_description="解析题目",
+            image_names=[image_name or path.name],
+            related={"subject_hint": subject_hint, "user_guidance": user_guidance or ""},
+        ),
         timeout_s=settings.llm.parser_timeout_s,
+        stream=settings.llm.stream_parser_json,
     )
 
     question = await repo.create_question_from_parsed(
@@ -157,7 +164,14 @@ async def rescan_question(
         model_cls=ParsedQuestion,
         template_kwargs=kwargs,
         messages_override=messages,
+        prompt_context=PromptLogContext(
+            phase_description="重新解析题目",
+            question_id=str(question_id),
+            image_names=[image_path.name],
+            related={"subject_hint": subject_hint, "user_guidance": user_guidance or ""},
+        ),
         timeout_s=settings.llm.parser_timeout_s,
+        stream=settings.llm.stream_parser_json,
     )
 
     await repo.clear_generated_content(session, question_id=question_id)
@@ -175,6 +189,7 @@ async def replace_question_image(
     llm: GeminiClient,
     subject_hint: str | None = None,
     user_guidance: str | None = None,
+    image_name: str | None = None,
 ) -> IngestResult:
     if mime not in MIME_EXT:
         raise ValueError(f"unsupported mime: {mime}")
@@ -207,7 +222,14 @@ async def replace_question_image(
         model_cls=ParsedQuestion,
         template_kwargs=kwargs,
         messages_override=messages,
+        prompt_context=PromptLogContext(
+            phase_description="替换图片后解析题目",
+            question_id=str(question_id),
+            image_names=[image_name or path.name],
+            related={"subject_hint": subject_hint, "user_guidance": user_guidance or ""},
+        ),
         timeout_s=settings.llm.parser_timeout_s,
+        stream=settings.llm.stream_parser_json,
     )
 
     await repo.clear_generated_content(session, question_id=question_id)

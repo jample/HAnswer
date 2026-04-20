@@ -41,12 +41,26 @@
   (function () {
     'use strict';
 
+    const FRAME_BUDGET_MS = 50;
+    const MAX_FRAME_OVERRUNS = 5;
+    const FRAME_WARMUP_COUNT = 10;
+    const INITIAL_RENDER_BUDGET_MS = 600;
+    const parentOrigin = (function () {
+      try {
+        return document.referrer ? new URL(document.referrer).origin : null;
+      } catch (_) {
+        return null;
+      }
+    })();
+
     // --- 1. Freeze / delete dangerous globals --------------------------
     const KILL = [
       'fetch', 'XMLHttpRequest', 'WebSocket', 'Worker',
       'importScripts', 'localStorage', 'sessionStorage', 'indexedDB',
     ];
     for (const k of KILL) {
+      try { window[k] = undefined; }
+      catch (_) {}
       try { Object.defineProperty(window, k, { value: undefined, configurable: false }); }
       catch (_) {}
     }
@@ -63,19 +77,29 @@
       return _setInterval.apply(this, arguments);
     };
     let frameOverruns = 0;
+    let frameCount = 0;
     let vizDisabled = false;
     window.requestAnimationFrame = function (cb) {
       return _raf(function (ts) {
         if (vizDisabled) return;
+        frameCount += 1;
         const t0 = performance.now();
-        cb(ts);
+        try {
+          cb(ts);
+        } catch (e) {
+          vizDisabled = true;
+          postError(String(e && e.message || e));
+          dispose({ preserveDisabled: true });
+          return;
+        }
         const elapsed = performance.now() - t0;
-        if (elapsed > 16) {
+        const warmed = frameCount > FRAME_WARMUP_COUNT;
+        if (warmed && elapsed > FRAME_BUDGET_MS) {
           frameOverruns += 1;
-          if (frameOverruns >= 3) {
+          if (frameOverruns >= MAX_FRAME_OVERRUNS) {
             vizDisabled = true;
-            postError('animation frame budget exceeded (16ms)');
-            dispose();
+            postError('animation frame budget exceeded (' + FRAME_BUDGET_MS + 'ms)');
+            dispose({ preserveDisabled: true });
           }
         } else {
           frameOverruns = 0;
@@ -94,32 +118,66 @@
       return String(src || '').replace(/<\/script/gi, '<\\/script');
     }
 
+    function normalizeJsxCode(src) {
+      let text = String(src || '').trim();
+      const fence = text.match(/^\s*```(?:javascript|js)?\s*([\s\S]*?)\s*```\s*$/i);
+      if (fence) {
+        text = String(fence[1] || '').trim();
+      }
+      const fullFn = text.match(
+        /^\s*\(?\s*function(?:\s+[A-Za-z_$][A-Za-z0-9_$]*)?\s*\(\s*board\s*,\s*JXG\s*,\s*H\s*,\s*params\s*\)\s*\{([\s\S]*)\}\s*\)?\s*;?\s*$/
+      );
+      if (fullFn) return String(fullFn[1] || '').trim();
+      const arrowFn = text.match(
+        /^\s*\(?\s*\(?\s*board\s*,\s*JXG\s*,\s*H\s*,\s*params\s*\)?\s*=>\s*\{([\s\S]*)\}\s*\)?\s*;?\s*$/
+      );
+      if (arrowFn) return String(arrowFn[1] || '').trim();
+      return text;
+    }
+
     function postError(msg) {
       document.getElementById('err').style.display = 'block';
       document.getElementById('err').textContent = msg;
-      parent.postMessage({ type: 'error', message: msg }, '*');
+      parent.postMessage({ type: 'error', message: msg }, parentOrigin || '*');
     }
 
-    function dispose() {
+    function dispose(options) {
+      const preserveDisabled = !!(options && options.preserveDisabled);
       if (controller && typeof controller.destroy === 'function') {
         try { controller.destroy(); } catch (_) {}
       }
       controller = null;
       frameOverruns = 0;
-      vizDisabled = false;
+      frameCount = 0;
+      if (!preserveDisabled) {
+        vizDisabled = false;
+      }
       if (window.H && typeof window.H._setBoard === 'function') {
         try { window.H._setBoard(null); } catch (_) {}
+      }
+      if (window.H && typeof window.H._setRuntimeGuards === 'function') {
+        try { window.H._setRuntimeGuards(null); } catch (_) {}
       }
       if (board) {
         try { JXG.JSXGraph.freeBoard(board); } catch (_) {}
         board = null;
       }
-      document.getElementById('err').style.display = 'none';
+      if (!preserveDisabled) {
+        document.getElementById('err').style.display = 'none';
+        document.getElementById('err').textContent = '';
+      }
+    }
+
+    function handleRuntimeError(error) {
+      vizDisabled = true;
+      postError(String(error && error.message || error));
+      dispose({ preserveDisabled: true });
     }
 
     function render(jsxCode, params) {
       dispose();
       const t0 = performance.now();
+      const normalizedCode = normalizeJsxCode(jsxCode);
       board = JXG.JSXGraph.initBoard('board', {
         boundingbox: [-5, 5, 5, -5],
         axis: true,
@@ -129,6 +187,9 @@
       });
       if (window.H && typeof window.H._setBoard === 'function') {
         window.H._setBoard(board);
+      }
+      if (window.H && typeof window.H._setRuntimeGuards === 'function') {
+        window.H._setRuntimeGuards({ onError: handleRuntimeError });
       }
       try {
         const runtimeKey = '__hanswerRuntime_' + Math.random().toString(36).slice(2);
@@ -146,8 +207,10 @@
                   "use strict";
                   var window=undefined,document=undefined,globalThis=undefined,self=undefined,
                       top=undefined,parent=undefined,fetch=undefined,XMLHttpRequest=undefined,
-                      eval=undefined,Function=undefined;
-                  ${escapeForInlineFunctionBody(jsxCode)}
+                      eval=undefined,Function=undefined,WebSocket=undefined,
+                      Worker=undefined,importScripts=undefined,localStorage=undefined,
+                      sessionStorage=undefined,indexedDB=undefined,navigator=undefined;
+                  ${escapeForInlineFunctionBody(normalizedCode)}
                 })(__runtime.board, __runtime.JXG, __runtime.H, __runtime.params);
                 __done(__result || null);
               } catch (e) {
@@ -166,11 +229,11 @@
           delete window[runtimeKey];
         }
         const renderMs = performance.now() - t0;
-        parent.postMessage({ type: 'metric', renderMs }, '*');
-        if (renderMs > 200) {
+        parent.postMessage({ type: 'metric', renderMs }, parentOrigin || '*');
+        if (renderMs > INITIAL_RENDER_BUDGET_MS) {
           vizDisabled = true;
-          postError('initial render budget exceeded (200ms)');
-          dispose();
+          postError('initial render budget exceeded (' + INITIAL_RENDER_BUDGET_MS + 'ms)');
+          dispose({ preserveDisabled: true });
         }
       } catch (e) {
         postError(String(e && e.message || e));
@@ -179,10 +242,12 @@
 
     // --- 3. Message loop ---------------------------------------------
     window.addEventListener('message', function (ev) {
+      if (ev.source !== parent) return;
+      if (parentOrigin && ev.origin !== parentOrigin) return;
       const msg = ev.data || {};
       switch (msg.type) {
         case 'init':
-          parent.postMessage({ type: 'ready' }, '*');
+          parent.postMessage({ type: 'ready' }, parentOrigin || '*');
           break;
         case 'render':
           render(msg.jsxCode || '', msg.params || {});
@@ -200,7 +265,7 @@
     });
 
     // Kick off
-    parent.postMessage({ type: 'ready' }, '*');
+    parent.postMessage({ type: 'ready' }, parentOrigin || '*');
   })();
   </script>
 </body>

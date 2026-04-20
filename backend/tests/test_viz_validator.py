@@ -11,7 +11,7 @@ import shutil
 
 import pytest
 
-from app.services.viz_validator import VizValidationError, validate_jsx_code
+from app.services.viz_validator import VizValidationError, normalize_jsx_code, validate_jsx_code
 
 
 pytestmark = pytest.mark.skipif(
@@ -95,3 +95,27 @@ async def test_validator_rejects_oversize():
 async def test_validator_rejects_syntax_error():
     with pytest.raises(VizValidationError):
         await validate_jsx_code("var x = ;")
+
+
+def test_normalize_jsx_code_unwraps_full_function():
+    wrapped = """
+    function(board, JXG, H, params) {
+      var p = board.create("point", [0, 0]);
+      return { destroy: function() {} };
+    }
+    """
+    normalized = normalize_jsx_code(wrapped)
+    assert "function(board, JXG, H, params)" not in normalized
+    assert 'board.create("point", [0, 0]);' in normalized
+
+
+@pytest.mark.asyncio
+async def test_validator_accepts_full_function_wrapper():
+    wrapped = """
+    function(board, JXG, H, params) {
+      var p = board.create("point", [0, 0]);
+      return { destroy: function() {} };
+    }
+    """
+    report = await validate_jsx_code(wrapped)
+    assert report.ok

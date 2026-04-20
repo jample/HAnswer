@@ -225,8 +225,8 @@ VISUALIZATION_SCHEMA: dict = {
             "type": "string",
             "enum": ["geogebra", "jsxgraph"],
             "description": (
-                "渲染引擎。优先使用 'geogebra' (GeoGebra Apps API), 仅在"
-                "GeoGebra 命令无法表达时退回到 'jsxgraph'。"
+                "渲染引擎。服务端会通过配置决定默认偏好; 当前可选"
+                " 'geogebra' (GeoGebra Apps API) 或 'jsxgraph'。"
             ),
         },
         "ggb_commands": {
@@ -279,7 +279,8 @@ VISUALIZATION_SCHEMA: dict = {
             "type": "string",
             "description": (
                 "JSXGraph 渲染函数体 (engine=jsxgraph 时必须, 否则留空字符串)。"
-                "签名: function(board, JXG, H, params) { ... }。"
+                "这里只放函数体本身, 不要再包一层"
+                " `function(board, JXG, H, params) { ... }`。"
                 "仅可用: board, JXG, H, params, Math, Number, Array, Object, "
                 "Boolean, String, JSON, console, requestAnimationFrame, cancelAnimationFrame。"
                 "禁止: window, document, fetch, XMLHttpRequest, WebSocket, Worker, "
@@ -333,6 +334,177 @@ VISUALIZATION_LIST_SCHEMA: dict = {
                 "面向中学应考场景, 3-4 个可视化; 需覆盖解答中不同"
                 "的关键阶段/分类讨论/最终结论。"
             ),
+        },
+    },
+    "additionalProperties": False,
+}
+
+
+VISUALIZATION_STORYBOARD_SCHEMA: dict = {
+    "type": "object",
+    "required": [
+        "theme_cn",
+        "selection_rationale_cn",
+        "symbol_map",
+        "shared_params",
+        "coverage_summary",
+        "sequence",
+        "items",
+    ],
+    "properties": {
+        "theme_cn": {"type": "string"},
+        "selection_rationale_cn": {"type": "string"},
+        "symbol_map": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["symbol", "meaning_cn"],
+                "properties": {
+                    "symbol": {"type": "string"},
+                    "meaning_cn": {"type": "string"},
+                    "source_ref": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+        },
+        "shared_params": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["name", "label_cn", "kind", "default"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "label_cn": {"type": "string"},
+                    "kind": {"type": "string", "enum": ["slider", "toggle"]},
+                    "min": {"type": "number"},
+                    "max": {"type": "number"},
+                    "step": {"type": "number"},
+                    "default": {},
+                },
+                "additionalProperties": False,
+            },
+        },
+        "coverage_summary": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["item_id", "summary_cn", "anchor_refs"],
+                "properties": {
+                    "item_id": {"type": "string"},
+                    "summary_cn": {"type": "string"},
+                    "anchor_refs": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["kind", "ref"],
+                            "properties": {
+                                "kind": {
+                                    "type": "string",
+                                    "enum": [
+                                        "question_given",
+                                        "solution_step",
+                                        "formula",
+                                        "pitfall",
+                                        "final_answer",
+                                        "method_pattern",
+                                    ],
+                                },
+                                "ref": {"type": "string"},
+                                "excerpt_cn": {"type": "string"},
+                            },
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "additionalProperties": False,
+            },
+        },
+        "sequence": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 3,
+            "maxItems": 4,
+        },
+        "items": {
+            "type": "array",
+            "minItems": 3,
+            "maxItems": 4,
+            "items": {
+                "type": "object",
+                "required": [
+                    "id",
+                    "title_cn",
+                    "anchor_refs",
+                    "difficulty_reason_cn",
+                    "student_confusion_risk",
+                    "conceptual_jump_cn",
+                    "why_visualization_needed_cn",
+                    "learning_goal_cn",
+                    "engine",
+                    "shared_symbols",
+                    "shared_params",
+                    "depends_on",
+                    "caption_outline_cn",
+                    "geo_target_cn",
+                ],
+                "properties": {
+                    "id": {"type": "string"},
+                    "title_cn": {"type": "string"},
+                    "anchor_refs": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "required": ["kind", "ref"],
+                            "properties": {
+                                "kind": {
+                                    "type": "string",
+                                    "enum": [
+                                        "question_given",
+                                        "solution_step",
+                                        "formula",
+                                        "pitfall",
+                                        "final_answer",
+                                        "method_pattern",
+                                    ],
+                                },
+                                "ref": {"type": "string"},
+                                "excerpt_cn": {"type": "string"},
+                            },
+                            "additionalProperties": False,
+                        },
+                    },
+                    "difficulty_reason_cn": {"type": "string"},
+                    "student_confusion_risk": {
+                        "type": "string",
+                        "enum": ["low", "medium", "high"],
+                    },
+                    "conceptual_jump_cn": {"type": "string"},
+                    "why_visualization_needed_cn": {"type": "string"},
+                    "learning_goal_cn": {"type": "string"},
+                    "engine": {
+                        "type": "string",
+                        "enum": ["geogebra", "jsxgraph"],
+                    },
+                    "shared_symbols": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "shared_params": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "depends_on": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "relation_to_prev_cn": {"type": "string"},
+                    "relation_to_next_cn": {"type": "string"},
+                    "caption_outline_cn": {"type": "string"},
+                    "geo_target_cn": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
         },
     },
     "additionalProperties": False,

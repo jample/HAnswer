@@ -25,6 +25,7 @@ export default function JsxgraphSandbox({
   params = [],
   height = 360,
 }: Props) {
+  const opaqueSandboxOrigin = 'null';
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const [ready, setReady] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -36,6 +37,7 @@ export default function JsxgraphSandbox({
   useEffect(() => {
     function onMessage(ev: MessageEvent) {
       if (ev.source !== iframeRef.current?.contentWindow) return;
+      if (ev.origin !== opaqueSandboxOrigin) return;
       const msg = (ev.data || {}) as { type?: string; message?: unknown; renderMs?: unknown };
       if (msg.type === 'ready') setReady(true);
       else if (msg.type === 'error') setErr(String(msg.message || 'viz error'));
@@ -47,6 +49,8 @@ export default function JsxgraphSandbox({
 
   useEffect(() => {
     if (!ready) return;
+    // The sandboxed iframe has an opaque origin, so host -> iframe messages
+    // must use '*' and be authenticated by the iframe via ev.origin.
     iframeRef.current?.contentWindow?.postMessage(
       { type: 'render', jsxCode, params: initialParams.current },
       '*',

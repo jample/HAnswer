@@ -31,7 +31,7 @@ from app.db import repo
 from app.db.models import AnswerPackageSection, SolutionStepRow
 from app.prompts import PromptRegistry
 from app.schemas import AnswerPackage, ParsedQuestion
-from app.services.llm_client import GeminiClient, LLMError
+from app.services.llm_client import GeminiClient, LLMError, PromptLogContext
 
 
 @dataclass
@@ -139,6 +139,7 @@ async def generate_answer(
     *,
     question_id: uuid.UUID,
     llm: GeminiClient,
+    solution_id: uuid.UUID | None = None,
     existing_patterns: list[dict] | None = None,
     existing_kps: list[dict] | None = None,
     user_guidance: str | None = None,
@@ -189,6 +190,12 @@ async def generate_answer(
                 model_cls=AnswerPackage,
                 template_kwargs=kwargs,
                 messages_override=messages_override,
+                prompt_context=PromptLogContext(
+                    phase_description="生成解答",
+                    question_id=str(question_id),
+                    solution_id=str(solution_id) if solution_id else None,
+                    related={"user_guidance": user_guidance or ""},
+                ),
                 timeout_s=settings.llm.solver_timeout_s,
                 stream=False,
             )
@@ -212,6 +219,12 @@ async def generate_answer(
             model_cls=AnswerPackage,
             template_kwargs=kwargs,
             messages_override=messages_override,
+            prompt_context=PromptLogContext(
+                phase_description="生成解答",
+                question_id=str(question_id),
+                solution_id=str(solution_id) if solution_id else None,
+                related={"user_guidance": user_guidance or ""},
+            ),
             timeout_s=settings.llm.solver_timeout_s,
         ):
             if isinstance(item, AnswerPackage):

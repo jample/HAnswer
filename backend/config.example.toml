@@ -41,11 +41,24 @@ cors_origins = ["http://localhost:3333"]
 [storage]
 image_dir = "./data/images"
 
+[viz]
+# Which engine VizCoder should prefer for newly generated visualizations.
+# Both engines remain available at runtime; this only changes the LLM prompt
+# bias and default generation path.
+default_engine = "geogebra"  # "jsxgraph" | "geogebra"
+
 [llm]
 # Retry & repair loop knobs (§4 non-functional requirements).
-max_retries = 2
-max_repair_attempts = 2
+# Number of retry attempts *after* the initial call for transient LLM failures
+# such as 429 / 503 / timeout. 0 disables automatic paid re-attempts and lets
+# the frontend surface the failure so the user can decide whether to retry.
+max_retries = 0
+max_repair_attempts = 0
+# Global process-local Gemini concurrency limit. Set to 1 for keys that only
+# tolerate strictly sequential Gemini calls; raise it later for stronger quota.
+max_parallel_gemini_calls = 1
 request_timeout_s = 60
+stream_parser_json = true
 parser_timeout_s = 120
 solver_timeout_s = 300
 vizcoder_timeout_s = 240

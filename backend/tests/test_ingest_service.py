@@ -41,6 +41,26 @@ def _llm_with(parsed: dict) -> GeminiClient:
 
 
 @pytest.mark.asyncio
+async def test_ingest_uses_streaming_parser_when_enabled(session, tmp_image_dir):
+    llm = _llm_with(_VALID_PARSED)
+    old_flag = settings.llm.stream_parser_json
+    settings.llm.stream_parser_json = True
+    try:
+        await ingest_image(
+            session,
+            data=b"stream-parser-bytes",
+            mime="image/jpeg",
+            llm=llm,
+            subject_hint="math",
+        )
+    finally:
+        settings.llm.stream_parser_json = old_flag
+
+    assert llm.transport.calls
+    assert llm.transport.calls[-1].get("stream") is True
+
+
+@pytest.mark.asyncio
 async def test_ingest_happy_path(session, tmp_image_dir):
     llm = _llm_with(_VALID_PARSED)
     data = b"\xff\xd8\xff\xe0fake-jpeg-bytes-happy"

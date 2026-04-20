@@ -9,17 +9,16 @@ features continue to function.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import repo
-from app.db.models import Question, QuestionSolution
+from app.db.models import Question, QuestionSolution, QuestionStageReview
 from app.services.stage_review_service import (
     REVIEW_CONFIRMED,
     REVIEW_PENDING,
-    REVIEW_REJECTED,
     review_question_status,
 )
 
@@ -27,7 +26,7 @@ SOLUTION_STAGES = ("solving", "visualizing", "indexing")
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _solution_title(ordinal: int) -> str:
@@ -217,7 +216,13 @@ async def sync_solution_stage_reviews_to_question(
     question_id: uuid.UUID,
     solution: QuestionSolution,
 ) -> None:
-    from app.services.stage_review_service import set_stage_review_status, record_stage_artifact
+    from app.services.stage_review_service import record_stage_artifact, set_stage_review_status
+
+    await session.execute(
+        delete(QuestionStageReview)
+        .where(QuestionStageReview.question_id == question_id)
+        .where(QuestionStageReview.stage.in_(SOLUTION_STAGES))
+    )
 
     for stage in SOLUTION_STAGES:
         review = get_solution_stage_review(solution, stage=stage)
@@ -365,12 +370,39 @@ async def clear_solution_stage_outputs(
         solution.status = review_question_status("solving")
     elif stage == "indexing":
         solution.sediment_json = None
+        reviews.pop("indexing", None)
         solution.status = review_question_status("visualizing")
     else:
         raise ValueError(f"unsupported solution stage: {stage}")
     solution.stage_reviews_json = reviews
     solution.updated_at = _utcnow()
     await session.flush()
+
+
+async def sync_question_from_current_solution(
+    session: AsyncSession,
+    *,
+    question: Question,
+) -> QuestionSolution | None:
+    current = await get_current_solution(session, question_id=question.id)
+    if current is None:
+        question.answer_package_json = None
+        question.status = review_question_status("parsed")
+        await session.execute(
+            delete(QuestionStageReview)
+            .where(QuestionStageReview.question_id == question.id)
+            .where(QuestionStageReview.stage.in_(SOLUTION_STAGES))
+        )
+        await session.flush()
+        return None
+
+    await set_current_solution(session, question=question, solution=current)
+    await sync_solution_stage_reviews_to_question(
+        session,
+        question_id=question.id,
+        solution=current,
+    )
+    return current
 
 
 async def update_solution_answer(
@@ -462,7 +494,10 @@ async def bootstrap_solution_from_question(
             "caption_cn": row.caption,
             "learning_goal": row.learning_goal,
             "helpers_used": list(row.helpers_used_json or []),
+            "engine": getattr(row, "engine", None) or "jsxgraph",
             "jsx_code": row.jsx_code,
+            "ggb_commands": list(getattr(row, "ggb_commands_json", None) or []),
+            "ggb_settings": getattr(row, "ggb_settings_json", None),
             "params": list(row.params_json or []),
             "animation": row.animation_json,
         }

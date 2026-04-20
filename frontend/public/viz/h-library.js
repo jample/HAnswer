@@ -13,6 +13,16 @@
     return x && x.board ? x.board : null;
   }
 
+  function easingOf(name) {
+    switch (name) {
+      case 'easeInOutSine':
+        return function (t) { return -(Math.cos(Math.PI * t) - 1) / 2; };
+      case 'linear':
+      default:
+        return function (t) { return t; };
+    }
+  }
+
   const H = {
     shapes: {
       circle(cx, cy, r, attrs) {
@@ -84,17 +94,105 @@
       },
     },
     anim: {
-      animate(paramName, from, to, durationMs, onUpdate) {
-        const start = performance.now();
-        let handle;
-        function frame(now) {
-          const t = Math.min(1, (now - start) / durationMs);
-          const v = from + (to - from) * t;
-          try { onUpdate && onUpdate(paramName, v); } catch (_) {}
-          if (t < 1) handle = requestAnimationFrame(frame);
+      loop(options) {
+        const cfg = Object.assign({
+          durationMs: 2000,
+          onFrame: null,
+          easing: 'linear',
+          yoyo: false,
+          repeat: true,
+        }, options || {});
+        const ease = easingOf(cfg.easing);
+        let handle = 0;
+        let start = null;
+        let cycle = 0;
+        let stopped = false;
+
+        function fail(error) {
+          try {
+            if (typeof H._handleRuntimeError === 'function') {
+              H._handleRuntimeError(error);
+            }
+          } catch (_) {}
+          stop();
         }
-        handle = requestAnimationFrame(frame);
-        return () => cancelAnimationFrame(handle);
+
+        function step(now) {
+          if (stopped) return;
+          if (start == null) start = now;
+          const raw = cfg.durationMs <= 0 ? 1 : Math.min(1, (now - start) / cfg.durationMs);
+          const base = ease(raw);
+          const progress = cfg.yoyo && cycle % 2 === 1 ? 1 - base : base;
+          try {
+            if (typeof cfg.onFrame === 'function') cfg.onFrame(progress, now - start, cycle);
+          } catch (error) {
+            fail(error);
+            return;
+          }
+          try {
+            if (H._currentBoard && typeof H._currentBoard.update === 'function') {
+              H._currentBoard.update();
+            }
+          } catch (error) {
+            fail(error);
+            return;
+          }
+          if (raw >= 1) {
+            if (!cfg.repeat) {
+              stopped = true;
+              H._activeStops.delete(stop);
+              return;
+            }
+            cycle += 1;
+            start = now;
+          }
+          handle = requestAnimationFrame(step);
+        }
+
+        handle = requestAnimationFrame(step);
+
+        function stop() {
+          stopped = true;
+          if (handle) cancelAnimationFrame(handle);
+          H._activeStops.delete(stop);
+        }
+
+        H._activeStops.add(stop);
+        return stop;
+      },
+      oscillate(options) {
+        const cfg = Object.assign({
+          from: 0,
+          to: 1,
+          durationMs: 2000,
+          onValue: null,
+          easing: 'easeInOutSine',
+          yoyo: true,
+          repeat: true,
+        }, options || {});
+        return H.anim.loop({
+          durationMs: cfg.durationMs,
+          easing: cfg.easing,
+          yoyo: cfg.yoyo,
+          repeat: cfg.repeat,
+          onFrame: function (progress, elapsedMs, cycle) {
+            const value = cfg.from + (cfg.to - cfg.from) * progress;
+            try {
+              if (typeof cfg.onValue === 'function') cfg.onValue(value, progress, elapsedMs, cycle);
+            } catch (_) {}
+          },
+        });
+      },
+      animate(paramName, from, to, durationMs, onUpdate) {
+        return H.anim.loop({
+          durationMs: durationMs,
+          easing: 'linear',
+          repeat: false,
+          onFrame: function (progress) {
+            const value = from + (to - from) * progress;
+            try { onUpdate && onUpdate(paramName, value); } catch (_) {}
+          },
+        });
       },
     },
     geom: {
@@ -117,7 +215,22 @@
     },
     // Set by sandbox.html before invoking user code.
     _currentBoard: null,
-    _setBoard(b) { H._currentBoard = b; },
+    _activeStops: new Set(),
+    _handleRuntimeError: null,
+    _setBoard(b) {
+      H._currentBoard = b;
+      if (!b) {
+        for (const stop of Array.from(H._activeStops)) {
+          try { stop(); } catch (_) {}
+        }
+        H._activeStops.clear();
+      }
+    },
+    _setRuntimeGuards(guards) {
+      H._handleRuntimeError = guards && typeof guards.onError === 'function'
+        ? guards.onError
+        : null;
+    },
   };
 
   window.H = H;

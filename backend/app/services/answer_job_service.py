@@ -20,14 +20,15 @@ from app.config import settings
 from app.db import repo
 from app.db.models import AnswerPackageSection, RetrievalUnitRow, VisualizationRow
 from app.db.session import session_scope
-from app.schemas import AnswerPackage
+from app.schemas import AnswerPackage, VisualizationStoryboard
+from app.services.embedding import build_dense_embedder
+from app.services.llm_client import LLMError, PromptLogContext, TransientLLMError
+from app.services.llm_deps import get_llm_client
 from app.services.question_solution_service import (
     build_solution_stage_user_guidance,
     clear_solution_stage_outputs,
-    create_solution,
-    ensure_current_solution,
     get_solution_or_create,
-    serialize_solution,
+    record_solution_stage_artifact,
     set_current_solution,
     set_solution_stage_review_status,
     solution_stage_reviews,
@@ -35,19 +36,13 @@ from app.services.question_solution_service import (
     update_solution_answer,
     update_solution_indexing,
     update_solution_visualizations,
-    record_solution_stage_artifact,
 )
-from app.services.embedding import build_dense_embedder
-from app.services.llm_client import LLMError
-from app.services.llm_deps import get_llm_client
 from app.services.sediment_service import sediment
 from app.services.solver_service import generate_answer
 from app.services.sparse_encoder import get_sparse_encoder
 from app.services.stage_review_service import (
     REVIEW_CONFIRMED,
-    REVIEW_PENDING,
     REVIEW_REJECTED,
-    build_stage_user_guidance,
     clear_stage_outputs,
     list_stage_reviews,
     next_stage,
@@ -60,7 +55,10 @@ from app.services.stage_review_service import (
     summarize_visualizations,
 )
 from app.services.vector_store import get_vector_store
-from app.services.vizcoder_service import generate_visualizations
+from app.services.vizcoder_service import (
+    generate_visualizations_from_storyboard,
+    plan_visualization_storyboard,
+)
 
 log = logging.getLogger(__name__)
 
@@ -98,7 +96,7 @@ _CALL_STAGES: list[dict[str, object]] = [
         "key": "visualizing",
         "call_index": 3,
         "label": "生成可视化",
-        "description": "Gemini VizCoder 为关键步骤生成交互式图形。",
+        "description": "Gemini 先规划 storyboard, 再逐张生成交互式图形。",
     },
     {
         "key": "indexing",
@@ -130,6 +128,25 @@ def _job_key(question_id: uuid.UUID | str, solution_id: uuid.UUID | str | None =
     qid = str(question_id)
     sid = str(solution_id) if solution_id is not None else "question"
     return f"{qid}:{sid}"
+
+
+async def clear_answer_job_state(
+    question_id: uuid.UUID,
+    *,
+    solution_id: uuid.UUID | None = None,
+    include_all_solutions: bool = False,
+) -> None:
+    qid = str(question_id)
+    if include_all_solutions:
+        keys = [key for key in set([*_tasks.keys(), *_states.keys()]) if key.startswith(f"{qid}:")]
+    else:
+        keys = [_job_key(question_id, solution_id)]
+
+    for key in keys:
+        task = _tasks.pop(key, None)
+        if task is not None and not task.done():
+            task.cancel()
+        _states.pop(key, None)
 
 
 def _parse_uuid(value: object) -> uuid.UUID | None:
@@ -456,6 +473,7 @@ async def _run_answer_job(
                     session,
                     question_id=question_id,
                     llm=llm,
+                    solution_id=solution_id,
                     user_guidance=user_guidance,
                 ):
                     # Persist each streamed section in its own transaction
@@ -499,10 +517,12 @@ async def _run_answer_job(
             await _set_stage(
                 question_id,
                 stage="visualizing",
-                message="答案已生成，正在补充可视化。",
+                message="答案已生成，正在先规划 storyboard，再逐张补充可视化。",
                 solution_id=solution_id,
             )
             rows: list[VisualizationRow] = []
+            storyboard = None
+            fallback_storyboard = None
             async with session_scope() as session:
                 q = await repo.get_question(session, question_id)
                 if q is None:
@@ -515,16 +535,38 @@ async def _run_answer_job(
                 await set_current_solution(session, question=q, solution=solution)
                 q.answer_package_json = deepcopy(solution.answer_package_json)
                 await session.flush()
+                fallback_storyboard = (
+                    ((solution.stage_reviews_json or {}).get("visualizing") or {}).get("refs") or {}
+                ).get("storyboard")
                 user_guidance = await build_solution_stage_user_guidance(
                     session,
                     question_id=question_id,
                     solution=solution,
                     target_stage="visualizing",
                 )
-                async for ev in generate_visualizations(
+                try:
+                    storyboard = await plan_visualization_storyboard(
+                        session,
+                        question_id=question_id,
+                        llm=llm,
+                        solution_id=solution_id,
+                        user_guidance=user_guidance,
+                    )
+                except LLMError as e:
+                    if fallback_storyboard is None:
+                        raise
+                    storyboard = VisualizationStoryboard.model_validate(fallback_storyboard)
+                    log.warning(
+                        "visualizing planner unavailable for %s; reusing existing storyboard: %s",
+                        question_id,
+                        e,
+                    )
+                async for ev in generate_visualizations_from_storyboard(
                     session,
                     question_id=question_id,
                     llm=llm,
+                    solution_id=solution_id,
+                    storyboard=storyboard,
                     user_guidance=user_guidance,
                 ):
                     if ev.name == "error":
@@ -534,22 +576,32 @@ async def _run_answer_job(
                     .where(VisualizationRow.question_id == question_id)
                     .order_by(VisualizationRow.created_at)
                 )).scalars().all())
+                if not rows:
+                    raise RuntimeError("visualizing produced no valid visualizations")
                 await update_solution_visualizations(
                     session,
                     solution=solution,
                     visualizations=[_serialize_viz_row(row) for row in rows],
                 )
                 solution.status = review_question_status("visualizing")
+            assert storyboard is not None
+            storyboard_payload = storyboard.model_dump(mode="json")
             await _mark_stage_ready_for_review(
                 question_id,
                 stage="visualizing",
-                summary=summarize_visualizations(rows),
+                summary={
+                    **summarize_visualizations(rows),
+                    "storyboard_theme_cn": storyboard_payload.get("theme_cn"),
+                    "storyboard_item_count": len(storyboard_payload.get("items") or []),
+                    "storyboard_sequence": list(storyboard_payload.get("sequence") or []),
+                },
                 refs={
                     "question_id": str(question_id),
                     "solution_id": str(solution_id),
                     "visualization_ids": [str(row.id) for row in rows],
+                    "storyboard": storyboard_payload,
                 },
-                message="Gemini VizCoder 已完成。请确认这些可视化是否可用。",
+                message="可视化 storyboard 与逐图生成已完成。请确认这些可视化是否可用。",
                 solution_id=solution_id,
             )
         elif stage == "indexing":
@@ -590,7 +642,14 @@ async def _run_answer_job(
                         question_id=question_id,
                         solution_id=solution_id,
                         package=pkg,
-                        embedding=build_dense_embedder(llm),
+                        embedding=build_dense_embedder(
+                            llm,
+                            prompt_context=PromptLogContext(
+                                phase_description="建立索引",
+                                question_id=str(question_id),
+                                solution_id=str(solution_id),
+                            ),
+                        ),
                         vector_store=vector_store,
                         sparse_encoder=get_sparse_encoder(),
                         progress=_progress,
@@ -651,7 +710,10 @@ async def _run_answer_job(
         log.exception("answer job question missing")
         await _append_error(question_id, stage=stage, message=str(e), solution_id=solution_id)
     except LLMError as e:
-        log.exception("answer job llm failure")
+        if isinstance(e, TransientLLMError):
+            log.warning("answer job transient llm failure: %s", e)
+        else:
+            log.exception("answer job llm failure")
         await _append_error(question_id, stage=stage, message=str(e), solution_id=solution_id)
     except Exception as e:  # noqa: BLE001
         log.exception("answer job crashed")
