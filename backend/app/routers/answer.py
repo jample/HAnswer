@@ -4,15 +4,19 @@ from __future__ import annotations
 
 import json
 import logging
+from copy import deepcopy
 from datetime import UTC, datetime
+from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Body, Depends, HTTPException
+from pydantic import BaseModel, Field
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
+from app.config import settings
 from app.db import repo
 from app.db.models import (
     AnswerPackageSection,
@@ -23,6 +27,7 @@ from app.db.models import (
 from app.db.session import session_scope
 from app.schemas import AnswerPackage
 from app.services.answer_job_service import (
+    _build_visualization_row,
     _serialize_viz_row,
     build_pipeline_snapshot,
     clear_answer_job_state,
@@ -32,16 +37,24 @@ from app.services.answer_job_service import (
     start_answer_job,
 )
 from app.services.embedding import build_dense_embedder
+from app.services.geogebra_codegen_service import (
+    generate_geogebra_visualization_or_fallback,
+)
 from app.services.llm_client import LLMError, PromptLogContext
 from app.services.llm_deps import get_llm_client
 from app.services.question_solution_service import (
     create_solution,
     get_current_solution,
     get_solution,
+    get_solution_or_create,
     list_solutions,
     serialize_solution,
+    set_current_solution,
     solution_stage_reviews,
     sync_question_from_current_solution,
+    update_solution_answer,
+    update_solution_indexing,
+    update_solution_visualizations,
 )
 from app.services.sediment_service import sediment
 from app.services.solver_service import _sections, generate_answer
@@ -54,12 +67,45 @@ from app.services.stage_review_service import (
     serialize_stage_review,
 )
 from app.services.vector_store import VectorStore, get_vector_store
-from app.services.vizcoder_service import generate_visualizations
+from app.services.visual_action_logger import get_visual_action_logger
+from app.services.visualization_spec_service import (
+    generate_visualization_spec_bundle,
+    persist_visualization_spec_bundle,
+    select_recommended_visualization,
+)
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/answer", tags=["answer"])
 questions_router = APIRouter(prefix="/api/questions", tags=["answer"])
+
+
+def _is_geogebra_visualization_payload(payload: dict | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    engine = str(payload.get("engine") or "").strip().lower()
+    if engine:
+        return engine == "geogebra"
+    return "execution_payload" in payload or bool(payload.get("spec_json"))
+
+
+class VisualActionEvent(BaseModel):
+    timestamp: str | None = None
+    source: str
+    phase: str
+    action: str
+    status: str = "info"
+    question_id: str | None = None
+    solution_id: str | None = None
+    visualization_id: str | None = None
+    engine: str | None = None
+    component: str | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+    error: str | None = None
+
+
+class VisualActionBatch(BaseModel):
+    records: list[VisualActionEvent] = Field(default_factory=list)
 
 
 async def _session():
@@ -73,26 +119,30 @@ def _extract_note(payload: dict | None) -> str | None:
     return str(payload.get("note") or "").strip()
 
 
-def _extract_storyboard_from_solution(solution) -> dict | None:
-    if solution is None:
-        return None
-    review = (solution.stage_reviews_json or {}).get("visualizing") or {}
-    refs = review.get("refs") or {}
-    storyboard = refs.get("storyboard")
-    return dict(storyboard) if isinstance(storyboard, dict) else None
+@router.post("/visual-actions")
+async def record_visual_actions_endpoint(batch: VisualActionBatch) -> dict:
+    await get_visual_action_logger().record_many([
+        record.model_dump(mode="json") for record in batch.records
+    ])
+    return {"logged": len(batch.records)}
 
 
 @router.post("/{question_id}/start")
 async def start_answer_job_endpoint(
     question_id: UUID,
     solution_id: UUID | None = None,
+    payload: dict | None = Body(default=None),
     session: AsyncSession = Depends(_session),
 ) -> dict:
     q = await repo.get_question(session, question_id)
     if q is None:
         raise HTTPException(404, "question not found")
     try:
-        return await start_answer_job(question_id, solution_id=solution_id)
+        return await start_answer_job(
+            question_id,
+            solution_id=solution_id,
+            force=bool((payload or {}).get("force")),
+        )
     except KeyError:
         raise HTTPException(404, "question not found")
 
@@ -181,6 +231,7 @@ async def create_solution_endpoint(
 @router.post("/{question_id}")
 async def start_answer(
     question_id: UUID,
+    solution_id: UUID | None = None,
     session: AsyncSession = Depends(_session),
     llm=Depends(get_llm_client),
     vs: VectorStore = Depends(lambda: get_vector_store()),
@@ -191,30 +242,108 @@ async def start_answer(
 
     async def _gen():
         try:
+            question = await repo.get_question(session, question_id)
+            if question is None:
+                raise KeyError
+            solution = await get_solution_or_create(
+                session,
+                question_id=question_id,
+                solution_id=solution_id,
+            )
+            await set_current_solution(session, question=question, solution=solution)
             yield {
                 "event": "status",
                 "data": json.dumps({
                     "stage": "solver",
-                    "message": "正在调用 Gemini 生成完整教学型答案，复杂题可能需要几十秒。",
+                    "message": f"正在调用 {settings.active_llm_provider_label} 生成完整教学型答案，复杂题可能需要几十秒。",
                 }, ensure_ascii=False),
             }
             async for ev in generate_answer(
-                session, question_id=question_id, llm=llm,
+                session,
+                question_id=question_id,
+                llm=llm,
+                solution_id=solution.id,
             ):
                 yield {"event": ev.name, "data": json.dumps(ev.data, ensure_ascii=False)}
+            question = await repo.get_question(session, question_id)
+            if question is None or question.answer_package_json is None:
+                raise KeyError
+            await update_solution_answer(
+                session,
+                solution=solution,
+                answer_package_json=deepcopy(question.answer_package_json),
+            )
+            solution.status = question.status
+            await session.flush()
             yield {
                 "event": "status",
                 "data": json.dumps({
-                    "stage": "vizcoder",
-                    "message": "答案已生成，正在补充可视化。",
+                    "stage": "visualizing",
+                    "message": "可视化阶段 Stage 1/2：正在规划候选可视化规格。",
                 }, ensure_ascii=False),
             }
-            # Viz stage is a separate prompt (§7.2.3). Its own errors surface
-            # as per-viz `error` events, not a whole-stream failure.
-            async for ev in generate_visualizations(
-                session, question_id=question_id, llm=llm,
-            ):
-                yield {"event": ev.name, "data": json.dumps(ev.data, ensure_ascii=False)}
+            bundle = await generate_visualization_spec_bundle(
+                session,
+                question_id=question_id,
+                llm=llm,
+                solution_id=solution.id,
+            )
+            selected_spec = select_recommended_visualization(bundle)
+            await persist_visualization_spec_bundle(
+                session,
+                solution=solution,
+                bundle=bundle,
+                selected_spec=selected_spec,
+            )
+            yield {
+                "event": "status",
+                "data": json.dumps({
+                    "stage": "visualizing",
+                    "message": "可视化阶段 Stage 2/2：正在分别生成并校验 3 个 GeoGebra 可视化。",
+                }, ensure_ascii=False),
+            }
+            target_specs = sorted(
+                bundle.visualizations,
+                key=lambda spec: (
+                    spec.priority,
+                    -spec.renderability_assessment.implementation_stability_score,
+                ),
+            )[:3]
+            serialized_visualizations = []
+            for index, candidate_spec in enumerate(target_specs, start=1):
+                yield {
+                    "event": "status",
+                    "data": json.dumps({
+                        "stage": "visualizing",
+                        "message": (
+                            "可视化阶段 Stage 2/2：正在生成并校验 "
+                            f"{index}/{len(target_specs)} 个 GeoGebra 可视化。"
+                        ),
+                    }, ensure_ascii=False),
+                }
+                geogebra = await generate_geogebra_visualization_or_fallback(
+                    llm=llm,
+                    spec=candidate_spec,
+                    question_id=str(question_id),
+                    solution_id=str(solution.id),
+                )
+                row = _build_visualization_row(
+                    question_id=question_id,
+                    spec=candidate_spec,
+                    generated=geogebra.execution_payload,
+                )
+                session.add(row)
+                await session.flush()
+                serialized = _serialize_viz_row(row)
+                if serialized is not None:
+                    serialized_visualizations.append(serialized)
+            await update_solution_visualizations(
+                session,
+                solution=solution,
+                visualizations=serialized_visualizations,
+            )
+            for serialized in serialized_visualizations:
+                yield {"event": "visualization", "data": json.dumps(serialized, ensure_ascii=False)}
 
             # Sediment (§3.6.2) — pattern / kp / embeddings.
             q = await repo.get_question(session, question_id)
@@ -233,7 +362,6 @@ async def start_answer(
                         question_id=question_id,
                         package=pkg,
                         embedding=build_dense_embedder(
-                            llm,
                             prompt_context=PromptLogContext(
                                 phase_description="建立索引",
                                 question_id=str(question_id),
@@ -252,12 +380,26 @@ async def start_answer(
                             ),
                         }),
                     }
+                    await update_solution_indexing(
+                        session,
+                        solution=solution,
+                        payload={
+                            "pattern_id": str(result.pattern_id),
+                            "kp_ids": [str(k) for k in result.kp_ids],
+                            "near_dup_of": (
+                                str(result.near_dup_of) if result.near_dup_of else None
+                            ),
+                        },
+                    )
                 except Exception as e:  # noqa: BLE001
                     log.exception("sediment failed (non-fatal)")
                     yield {
                         "event": "error",
                         "data": json.dumps({"stage": "sediment", "message": str(e)}),
                     }
+
+                    solution.status = q.status if q is not None else solution.status
+                    await session.flush()
 
             yield {
                 "event": "status",
@@ -326,15 +468,25 @@ async def resume_answer(
         except Exception:  # pragma: no cover - defensive fallback
             log.exception("resume fallback failed to rebuild sections")
 
-    if solution is not None:
-        visualizations = list(solution.visualizations_json or [])
+    viz_rows = (await session.execute(
+        select(VisualizationRow)
+        .where(VisualizationRow.question_id == question_id)
+        .order_by(VisualizationRow.created_at)
+    )).scalars().all()
+    if viz_rows:
+        visualizations = [
+            payload
+            for row in viz_rows
+            if (payload := _serialize_viz_row(row)) is not None
+        ]
+    elif solution is not None:
+        visualizations = [
+            payload
+            for payload in list(solution.visualizations_json or [])
+            if _is_geogebra_visualization_payload(payload)
+        ]
     else:
-        viz_rows = (await session.execute(
-            select(VisualizationRow)
-            .where(VisualizationRow.question_id == question_id)
-            .order_by(VisualizationRow.created_at)
-        )).scalars().all()
-        visualizations = [_serialize_viz_row(v) for v in viz_rows]
+        visualizations = []
 
     parsed_stage_reviews = [
         serialize_stage_review(row)
@@ -351,7 +503,6 @@ async def resume_answer(
         solution.id if solution is not None else None,
     )
     solutions = [serialize_solution(row) for row in await list_solutions(session, question_id=question_id)]
-    storyboard = _extract_storyboard_from_solution(solution)
     return {
         "question_id": str(q.id),
         "status": solution.status if solution is not None else q.status,
@@ -362,6 +513,7 @@ async def resume_answer(
             question_status=solution.status if solution is not None else q.status,
             has_parsed=bool(q.parsed_json),
             has_answer=answer_package_json is not None,
+            has_visualization_plan=bool(solution and solution.visualization_plan_json),
             visualizations_generated=bool(visualizations),
             job_state=job,
             stage_reviews=stage_reviews,
@@ -369,8 +521,8 @@ async def resume_answer(
         "stage_reviews": stage_reviews,
         "answer_package": answer_package_json,
         "sections": sections,
+        "visualization_plan": solution.visualization_plan_json if solution is not None else None,
         "visualizations": visualizations,
-        "storyboard": storyboard,
         "complete": (solution.status if solution is not None else q.status) == "answered",
     }
 
@@ -399,7 +551,6 @@ async def get_question(
         *[row for row in parsed_stage_reviews if row.get("stage") == "parsed"],
         *(solution_stage_reviews(solution) if solution is not None else []),
     ]
-    storyboard = _extract_storyboard_from_solution(solution)
     return {
         "question_id": str(q.id),
         "subject": q.subject,
@@ -408,9 +559,9 @@ async def get_question(
         "status": solution.status if solution is not None else q.status,
         "parsed": q.parsed_json,
         "answer_package": solution.answer_package_json if solution is not None else q.answer_package_json,
+        "visualization_plan": solution.visualization_plan_json if solution is not None else None,
         "seen_count": q.seen_count,
         "stage_reviews": stage_reviews,
-        "storyboard": storyboard,
         "solutions": solutions,
         "current_solution_id": str(solution.id) if solution is not None else None,
     }

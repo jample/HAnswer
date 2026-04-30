@@ -38,6 +38,19 @@ type PromptMeta = {
 };
 
 type ConfigView = {
+  openai: {
+    api_key_masked: string;
+    api_key_configured: boolean;
+    base_url_configured: boolean;
+    base_url: string;
+    model_default: string;
+    model_parser: string;
+    model_solver: string;
+    model_vizcoder: string;
+    model_chat: string;
+    model_embed: string;
+    embed_dim: number;
+  };
   gemini: {
     api_key_masked: string;
     api_key_configured: boolean;
@@ -46,6 +59,14 @@ type ConfigView = {
     model_vizcoder: string;
     model_embed: string;
     embed_dim: number;
+  };
+  embedding: {
+    provider: string;
+    api_key_masked: string;
+    api_key_configured: boolean;
+    endpoint_configured: boolean;
+    model: string;
+    dimensions: number;
   };
   postgres: { dsn_masked: string };
   milvus: { host: string; port: number; database: string; auto_bootstrap: boolean };
@@ -104,7 +125,22 @@ export default function SettingsPage() {
       <h2 style={h2Style}>当前配置</h2>
       {cfg ? (
         <div style={{ display: 'grid', gap: 12, gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))' }}>
-          <Card title="Gemini">
+          <Card title="OpenAI">
+            <Row k="API Key" v={cfg.openai.api_key_configured
+              ? <code>{cfg.openai.api_key_masked}</code>
+              : <span style={{ color: '#c00' }}>未配置</span>} />
+            <Row k="Base URL" v={cfg.openai.base_url_configured
+              ? <code style={{ wordBreak: 'break-all' }}>{cfg.openai.base_url}</code>
+              : <span style={{ color: '#c00' }}>未配置</span>} />
+            <Row k="默认模型" v={<code>{cfg.openai.model_default}</code>} />
+            <Row k="Parser 模型" v={<code>{cfg.openai.model_parser}</code>} />
+            <Row k="Solver 模型" v={<code>{cfg.openai.model_solver}</code>} />
+            <Row k="VizCoder 模型" v={<code>{cfg.openai.model_vizcoder}</code>} />
+            <Row k="Dialog 模型" v={<code>{cfg.openai.model_chat}</code>} />
+            <Row k="Embedding 模型" v={<code>{cfg.openai.model_embed}</code>} />
+            <Row k="向量维度" v={cfg.openai.embed_dim} />
+          </Card>
+          <Card title="Gemini 备用">
             <Row k="API Key" v={cfg.gemini.api_key_configured
               ? <code>{cfg.gemini.api_key_masked}</code>
               : <span style={{ color: '#c00' }}>未配置</span>} />
@@ -113,6 +149,17 @@ export default function SettingsPage() {
             <Row k="VizCoder 模型" v={<code>{cfg.gemini.model_vizcoder}</code>} />
             <Row k="Embedding 模型" v={<code>{cfg.gemini.model_embed}</code>} />
             <Row k="向量维度" v={cfg.gemini.embed_dim} />
+          </Card>
+          <Card title="Embedding">
+            <Row k="Provider" v={<code>{cfg.embedding.provider}</code>} />
+            <Row k="API Key" v={cfg.embedding.api_key_configured
+              ? <code>{cfg.embedding.api_key_masked}</code>
+              : <span style={{ color: '#c00' }}>未配置</span>} />
+            <Row k="Endpoint" v={cfg.embedding.endpoint_configured
+              ? <span>已配置</span>
+              : <span style={{ color: '#c00' }}>未配置</span>} />
+            <Row k="模型" v={<code>{cfg.embedding.model}</code>} />
+            <Row k="向量维度" v={cfg.embedding.dimensions} />
           </Card>
           <Card title="PostgreSQL">
             <Row k="DSN" v={<code style={{ wordBreak: 'break-all' }}>{cfg.postgres.dsn_masked}</code>} />

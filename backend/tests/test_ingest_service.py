@@ -10,8 +10,10 @@ Prereq: `alembic upgrade head` run once against the configured DSN.
 from __future__ import annotations
 
 import json
+from io import BytesIO
 
 import pytest
+from PIL import Image
 
 from app.config import settings
 from app.schemas import ParsedQuestion
@@ -41,7 +43,7 @@ def _llm_with(parsed: dict) -> GeminiClient:
 
 
 @pytest.mark.asyncio
-async def test_ingest_uses_streaming_parser_when_enabled(session, tmp_image_dir):
+async def test_ingest_uses_non_streaming_parser_even_when_stream_flag_enabled(session, tmp_image_dir):
     llm = _llm_with(_VALID_PARSED)
     old_flag = settings.llm.stream_parser_json
     settings.llm.stream_parser_json = True
@@ -57,7 +59,27 @@ async def test_ingest_uses_streaming_parser_when_enabled(session, tmp_image_dir)
         settings.llm.stream_parser_json = old_flag
 
     assert llm.transport.calls
-    assert llm.transport.calls[-1].get("stream") is True
+    assert llm.transport.calls[-1].get("stream") is not True
+
+
+@pytest.mark.asyncio
+async def test_ingest_preprocesses_large_image_for_parser(session, tmp_image_dir):
+    llm = _llm_with(_VALID_PARSED)
+    image = Image.new("RGB", (3200, 1800), (240, 240, 240))
+    buf = BytesIO()
+    image.save(buf, format="PNG")
+
+    await ingest_image(
+        session,
+        data=buf.getvalue(),
+        mime="image/png",
+        llm=llm,
+        subject_hint="math",
+    )
+
+    assert llm.transport.calls
+    inline_data = llm.transport.calls[-1]["messages"][-1]["parts"][1]["inline_data"]
+    assert inline_data["mime_type"] == "image/jpeg"
 
 
 @pytest.mark.asyncio

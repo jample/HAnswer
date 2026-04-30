@@ -20,7 +20,6 @@ Resolution rules:
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import logging
 import uuid
@@ -37,7 +36,6 @@ from app.db.models import (
     Question,
     QuestionKPLink,
     QuestionPatternLink,
-    RetrievalUnitRow,
 )
 from app.schemas import AnswerPackage, KnowledgePointRef, MethodPattern, ParsedQuestion
 from app.services.embedding import DenseEmbedder, EmbedItem, TaskKind
@@ -493,9 +491,8 @@ async def sediment(
             progress,
             f"写入向量数据库 (稠密 {len(to_embed)} 条)…",
         )
-        dense_jobs: list[Awaitable[None]] = []
         for s in to_embed:
-            dense_jobs.append(vector_store.upsert(
+            await vector_store.upsert(
                 s.collection,
                 ref_id=s.ref_id,
                 vector=s.dense_vec or [],
@@ -503,8 +500,7 @@ async def sediment(
                 grade_band=s.grade_band,
                 difficulty=s.difficulty,
                 unit_kind=s.unit_kind,
-            ))
-        await asyncio.gather(*dense_jobs)
+            )
 
         if sparse_encoder is not None and getattr(vector_store, "supports_sparse", False):
             await _maybe_report(
@@ -512,9 +508,8 @@ async def sediment(
                 f"写入稀疏向量索引 (BM25 / bge-m3, {len(to_embed)} 条)…",
             )
             sparse_vecs = await sparse_encoder.encode([s.text for s in to_embed])
-            sparse_jobs: list[Awaitable[None]] = []
             for s, sp in zip(to_embed, sparse_vecs, strict=True):
-                sparse_jobs.append(vector_store.upsert_sparse(
+                await vector_store.upsert_sparse(
                     s.collection,
                     ref_id=s.ref_id,
                     sparse=sp,
@@ -522,8 +517,7 @@ async def sediment(
                     grade_band=s.grade_band,
                     difficulty=s.difficulty,
                     unit_kind=s.unit_kind,
-                ))
-            await asyncio.gather(*sparse_jobs)
+                )
 
         # Persist new sigs + cross-table embedding refs.
         for s in to_embed:

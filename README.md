@@ -97,12 +97,15 @@ in your local environment to verify the full suite end-to-end.
 ## Configuration
 
 All backend configuration lives in `backend/config.toml` (git-ignored).
-Copy the example, then export your Gemini API key as an environment variable:
+Copy the example, then export your LLM and embedding API keys as environment variables:
 
 ```bash
 cd backend
 cp config.example.toml config.toml
 export GEMINI_API_KEY="your_key_here"   # never put the key in config.toml
+export OAI_API_KEY="your_openai_key"    # used when [llm].provider = "openai"
+export EMB_URL="https://your-embedding-gateway/v1"
+export EMB_API_KEY="your_embedding_key"
 ```
 
 ```toml
@@ -111,8 +114,16 @@ export GEMINI_API_KEY="your_key_here"   # never put the key in config.toml
 model_parser   = "gemini-3.1-pro-preview" # image → ParsedQuestion
 model_solver   = "gemini-3.1-pro-preview" # ParsedQuestion → AnswerPackage
 model_vizcoder = "gemini-3.1-pro-preview" # AnswerPackage → visualizations[]
-model_embed    = "gemini-embedding-2-preview"  # or "gemini-embedding-001"
-embed_dim      = 1536 # model default 3072; 1536 is the recommended MRL prefix
+
+[embedding]
+# Dedicated dense embedding service for indexing/retrieval.
+# Endpoint/key come from EMB_URL and EMB_API_KEY. Do not put them here.
+# For Azure OpenAI-compatible v1, set EMB_URL to:
+# https://<resource>.openai.azure.com/openai/v1/
+# and use the deployment name as `model`.
+provider   = "openai"                  # "openai" | "gemini" | "bge-m3"
+model      = "text-embedding-3-large"
+dimensions = 1536
 
 [postgres]
 dsn = "postgresql+asyncpg://jianbo@localhost:5432/jianbo"  # asyncpg driver required
@@ -146,7 +157,6 @@ stream_solver_json  = true              # Gemini structured-output streaming
 stream_vizcoder_json = true
 
 [retrieval]                             # §3.4
-embedder           = "gemini"          # "gemini" | "bge-m3"
 sparse_encoder     = "bm25"            # "bm25"   | "bge-m3"
 multi_route        = true              # RRF over dense + sparse + structural
 rrf_k              = 60
@@ -271,6 +281,63 @@ cd frontend && npm run dev
 
 ---
 
+## Developer command reference
+
+Use these when working on the repo beyond the basic startup flow above.
+
+### Infrastructure
+
+```bash
+docker compose up -d
+docker compose ps
+```
+
+### Backend development
+
+```bash
+cd backend
+python -m venv .venv && source .venv/bin/activate
+pip install -e .
+pip install -e '.[dev]'
+pip install -e '.[retrieval]'
+cp config.example.toml config.toml
+alembic upgrade head
+python -m scripts.seed_knowledge
+python -m scripts.rebuild_retrieval_index
+uvicorn app.main:app --reload --port 8787
+```
+
+### Backend validation
+
+```bash
+cd backend
+pytest
+pytest tests/test_prompts.py
+ruff check .
+python -m app.prompts.cli list
+python -m app.prompts.cli explain solver
+```
+
+### Frontend validation
+
+```bash
+cd frontend
+npm install
+npm run dev
+npm run build
+npm run lint
+npm run typecheck
+```
+
+### Visualization validator runtime
+
+```bash
+cd backend/viz_validator
+npm install
+```
+
+---
+
 ## Pages
 
 | Path | Purpose |
@@ -346,6 +413,61 @@ On refresh, /q/[id] calls GET /api/answer/{id}/resume to rehydrate.
 
 ---
 
+## Architecture snapshot
+
+### Stack
+
+- Backend: FastAPI + async SQLAlchemy + asyncpg + Alembic + Pydantic v2
+- Frontend: Next.js App Router + React + TypeScript
+- Database: PostgreSQL for questions, solutions, reviews, dialog, and cost ledger
+- Vector store: Milvus dense + sparse collections
+- LLM provider: configurable OpenAI-compatible or Gemini transports for parser/solver/viz/dialog
+- Embedding provider: dedicated `[embedding]` service, defaulting to OpenAI-compatible remote embeddings
+- Infra: local Docker Compose for etcd + MinIO + Milvus + Attu
+
+### Core backend modules
+
+- `backend/app/routers/`: ingest, answer, dialog, retrieve, practice, knowledge, admin
+- `backend/app/services/llm_client.py` + `gemini_transport.py`: transport, retries, repair loop, prompt logging, cost tracking
+- `backend/app/services/streaming_json.py`: top-level JSON streaming parser for incremental solve delivery
+- `backend/app/services/answer_job_service.py`: background 4-stage pipeline with confirm/rerun review flow
+- `backend/app/services/solver_service.py`: solver orchestration and persisted incremental answer sections
+- `backend/app/services/visualization_spec_service.py` + `jsxgraph_codegen_service.py`: HAVizNew two-stage visualization planning and codegen
+- `backend/app/services/sediment_service.py`: pattern / knowledge-point resolution, dedup, retrieval-profile build, Milvus upsert
+- `backend/app/services/retrieval_service.py`: dense + sparse + structural retrieval with RRF fusion
+- `backend/app/services/dialog_service.py`: persistent multi-turn study chat with rolling memory snapshots
+- `backend/app/prompts/`: versioned prompt templates and few-shot assets
+- `backend/app/db/`: ORM models, async session, repository helpers
+
+### Frontend structure
+
+- `frontend/app/`: routes for Ask, Answer, Library, Knowledge, Practice, Dialog, Settings
+- `frontend/components/MathText.tsx`: math rendering
+- `frontend/components/VizSandbox.tsx`: visualization dispatcher and sandbox host
+- `frontend/public/viz/`: sandbox runtime, helper library, JSXGraph assets
+- `frontend/next.config.js`: `/api/*` proxy and sandbox CSP wiring
+
+### Answer pipeline
+
+1. `parsed`: image to `ParsedQuestion`
+2. `solving`: `ParsedQuestion` to teaching-first `AnswerPackage`
+3. `visualizing`: `AnswerPackage` to `VisualizationSpecBundle`, then selected spec to JSXGraph code
+4. `indexing`: sediment into taxonomy + retrieval units + Milvus vectors
+
+Each stage supports review, confirm, and rerun. The frontend uses `GET /api/answer/{id}/resume` to reconstruct progress and artifacts after refresh.
+
+### Data model landmarks
+
+- Core: `questions`, `question_solutions`, `answer_packages`, `question_stage_reviews`
+- Taxonomy: `knowledge_points`, `method_patterns`, `pitfalls`, question-to-taxonomy link tables
+- Retrieval: `question_retrieval_profiles`, `retrieval_units`, `solution_steps`
+- Visualization: `visualizations`
+- Practice: `exams`, `exam_items`
+- Dialog: `conversation_sessions`, `conversation_messages`, `conversation_memory_snapshots`
+- Tracking: `llm_calls`, `ingest_images`
+
+---
+
 ## Retrieval strategy (M5, §3.4)
 
 ```
@@ -360,24 +482,26 @@ query / anchor ──┼── sparse  (BM25 / bge-m3 lexical over the same four
               PG hydrate + difficulty filters → top-K
 ```
 
-Fast remote mode: Gemini dense (`gemini-embedding-2-preview`) + BM25 sparse +
-structural — no local model load on each query.
+Fast remote mode: OpenAI-compatible dense (`text-embedding-3-large`) + BM25
+sparse + structural — no local model load on each query.
 
 ```toml
-[gemini]
-model_embed    = "gemini-embedding-2-preview"
-embed_dim      = 1536
+[embedding]
+provider   = "openai"
+model      = "text-embedding-3-large"
+dimensions = 1536
 
 [retrieval]
-embedder       = "gemini"
 sparse_encoder = "bm25"
 ```
 
 For stronger local mixed-language recall, flip to bge-m3:
 
 ```toml
+[embedding]
+provider = "bge-m3"
+
 [retrieval]
-embedder       = "bge-m3"
 sparse_encoder = "bge-m3"
 bge_m3_device  = "cpu"         # or "cuda" / "mps"
 bge_m3_dense_dim = 1024
@@ -420,11 +544,11 @@ If you switch sparse encoder family (`bge-m3` ↔ `bm25`), use
 `--recreate-sparse` as well so Milvus does not keep stale sparse rows
 from the previous encoder.
 
-When using `gemini-embedding-2-preview`, the backend prepends task
-prefixes to the text (`task: search result | query: ...` for queries,
-`title: none | text: ...` for documents), matching Google's Embedding v2
-guidance. Legacy models (`text-embedding-004`, `gemini-embedding-001`)
-continue to use the `task_type` API parameter.
+When `[embedding].provider="gemini"` and `model="gemini-embedding-2-preview"`,
+the backend prepends task prefixes to the text (`task: search result | query: ...`
+for queries, `title: none | text: ...` for documents), matching Google's
+Embedding v2 guidance. Legacy Gemini models (`text-embedding-004`,
+`gemini-embedding-001`) continue to use the `task_type` API parameter.
 
 Set `multi_route = false` to fall back to the single-route formula
 `0.5·cos + 0.3·pattern_match + 0.2·kp_overlap` (safe when sparse
@@ -444,6 +568,8 @@ python -m app.prompts.cli preview variant_synth \
 
 Registered templates: `parser`, `solver`, `vizcoder`, `variant_synth`.
 
+Current prompt modules in the repo also include dialog and visualization-stage templates such as `dialog`, `vizspec`, `jsxgraph_codegen`, `vizplanner`, and `vizitem`.
+
 ---
 
 ## Tests
@@ -457,6 +583,8 @@ tests are skipped automatically.
 cd backend
 pytest           # 86 tests
 ```
+
+Tests run against a real local PostgreSQL instance with SAVEPOINT rollback rather than mocks. Visualization validator tests require Node.js; they auto-skip if `node` is unavailable.
 
 Smoke test against a real image (calls live Gemini):
 
@@ -475,8 +603,9 @@ python -m scripts.smoke_parse ../data/samples/q1.jpg --subject math
 | `/api/ingest/image` returns `502 parser LLM failed` | Gemini key empty / invalid / rate-limited | Check `/api/admin/config` (`api_key_configured: false`?); set `export GEMINI_API_KEY=<your_key>` and restart uvicorn |
 | `/api/answer/{id}` stream immediately emits `error` | Solver repair loop exhausted (bad schema) | Tail uvicorn logs for the pydantic `ValidationError`; consider bumping `[llm].max_repair_attempts` |
 | `/api/answer/{id}` background job fails with `TransientLLMError(timeout...)` during `2/4 生成解答` | Solver answer is taking longer than the configured timeout, or Gemini stalled before sending chunks | Raise `[llm].solver_timeout_s`; keep `stream_solver_json=true` so long JSON answers use Gemini structured streaming instead of one large blocking wait |
-| Sediment / indexing crashes with `404 NOT_FOUND` for `text-embedding-004` | The modern `google-genai` endpoint rejected that model | Switch `[gemini].model_embed` to `gemini-embedding-2-preview` (recommended) or `gemini-embedding-001` and rebuild Milvus. The legacy `text-embedding-004` path is still supported if you install `google-generativeai` |
-| `text-embedding-004` is configured but retrieval is still slow | `retrieval.sparse_encoder` is still set to `bge-m3`, so the local model still loads for sparse search | Set `[retrieval].embedder="gemini"` and `[retrieval].sparse_encoder="bm25"`, then rebuild Milvus indexes |
+| Sediment / indexing crashes with an embedding provider `400` / `404` | `EMB_URL`, `EMB_API_KEY`, `[embedding].provider`, model, or dimensions do not match the gateway/key | Set `EMB_URL`/`EMB_API_KEY` and `[embedding]` to a model supported by that endpoint/key, then rebuild Milvus if dimensions changed |
+| Remote embeddings are configured but retrieval is still slow | `retrieval.sparse_encoder` is still set to `bge-m3`, so the local model still loads for sparse search | Set `[retrieval].sparse_encoder="bm25"`, then rebuild Milvus indexes |
+| Index rebuild crashes with Milvus `[flush] rate limit exceeded[rate=0.1]` | Explicit flushes are too frequent for local Milvus standalone | Keep `[milvus].flush_on_write=false` and restart the backend; PostgreSQL remains the source of truth and vectors are queryable without flushing every write |
 | `bge-m3` import fails inside `FlagEmbedding` with a `transformers` symbol error | `FlagEmbedding 1.x` was installed alongside an incompatible `transformers` 5.x build | Re-run `cd backend && python -m pip install -e '.[retrieval]'`; the repo now pins `transformers<5` for the retrieval extra |
 | `pytest` fails with `connection refused: 5432` | Postgres not running or DSN wrong | `pg_isready -p 5432`; fix `[postgres].dsn` |
 | Milvus collections missing / `get_collection_stats` errors | Milvus still starting (~90s first boot), or `auto_bootstrap=false` | `docker compose ps` — wait for `healthy`; run `python -m app.services.milvus_setup` |
@@ -488,6 +617,24 @@ python -m scripts.smoke_parse ../data/samples/q1.jpg --subject math
 | `/settings` cost ledger is empty | No LLM calls yet, or `PgCostLedger` failed silently | Tail uvicorn logs for `cost ledger write failed`; check Postgres connectivity |
 | `npm run dev` → EADDRINUSE 3333 | Another instance already running | `lsof -i :3333` and kill, or set `PORT=3334 npm run dev` and update CORS |
 | Browser shows page but `/api/*` returns 404 | Backend not running or on the wrong port | Confirm uvicorn on 8787 and that `frontend/next.config.js` proxies match |
+
+---
+
+## Conventions and trackers
+
+- Python uses snake_case, 4-space indentation, and the backend Ruff configuration.
+- Frontend components use PascalCase; App Router folders stay lowercase.
+- Keep backend config in `backend/config.toml`; Gemini API key comes from `$GEMINI_API_KEY`.
+- Settings are read-only in the app; config changes require file edits and a backend restart.
+- Do not add ad-hoc prompt strings in application code; route all LLM calls through the prompt-template framework.
+
+Project trackers:
+
+- `Unfinished.md`: current requirement audit and remaining implementation gaps
+- `P2S.md`: problem tracker / bug backlog
+- `HAnswerR.md`: detailed stage-1 specification
+
+Historically recurring operational gaps are tracked in `P2S.md`, including restart resilience for in-memory job state, list pagination limits, and some frontend loading / pagination polish.
 
 ---
 
@@ -508,7 +655,8 @@ backend/
       solver_service.py    # M3 Solver orchestration + SSE events
       vizcoder_service.py  # M4 VizCoder + AST validation
       viz_validator.py     # subprocess wrapper for validate.mjs
-      embedding.py         # M5 dense embedders (Gemini + bge-m3)
+      embedding.py         # M5 dense embedders (OpenAI-compatible + Gemini + bge-m3)
+      embedding_deps.py    # dedicated embedding-client wiring
       bge_m3_runtime.py    # shared local bge-m3 loader for dense+sparse heads
       sparse_encoder.py    # M5 sparse lexical (BM25 + bge-m3)
       vector_store.py      # Milvus / InMemory, dense + sparse

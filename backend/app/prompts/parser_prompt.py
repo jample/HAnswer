@@ -13,7 +13,6 @@ OPTIMIZATION
 from __future__ import annotations
 
 import base64
-import json
 from typing import Any
 
 from app.prompts.base import DesignDecision, PromptTemplate, PromptVersion
@@ -93,23 +92,21 @@ class ParserPrompt(PromptTemplate):
           - Confidence threshold language.
           - Diagram description verbosity.
         """
-        schema_str = json.dumps(self.schema, indent=2, ensure_ascii=False)
         return f"""\
-你是一位经验丰富的中学数理教师, 擅长阅读学生提交的题目照片。
-你的任务是将图片中的题目解析为结构化 JSON, 严格遵循下方 Schema, 不得输出 Schema 之外的字段。
+    You are an experienced middle-school / high-school math and physics teacher who reads photos submitted by students.
+    Your task is to parse the problem shown in the image into structured JSON. Follow the schema exactly and do not output fields outside the schema.
 
-## 输出要求
-- 仅输出一个 JSON 对象, 不要包含 ```json 标记或任何解释文字。
-- 所有数学公式用 LaTeX 并以 $ 包裹 (如 $x^2+2x+1=0$)。
-- topic_path 从学科大类写到具体知识点, 例如 ["代数","一元二次方程","求根公式"]。
-- difficulty 为 1-5 整数: 1=基础 2=偏易 3=中等 4=偏难 5=竞赛/压轴。
-- confidence 为 0-1 浮点数, 诚实反映解析确信度; 图片模糊或截断时应降低。
-- 若图片含图形或示意图, 必须在 diagram_description 用文字详细描述 (点的标注、"
-"线段关系、角度标记、坐标系等), 因为下游模块无法看到图片。
-- given 和 find 拆分为独立条目, 每条一个字符串。
-
-## JSON Schema
-{schema_str}
+    ## Output requirements
+    - Output exactly one JSON object and nothing else. Do not include ```json fences or explanatory prose.
+    - All human-readable text fields in the JSON must be in Simplified Chinese.
+    - All math expressions must use LaTeX wrapped in $...$ (for example $x^2+2x+1=0$).
+    - topic_path must go from broad subject area to specific knowledge point, for example ["代数", "一元二次方程", "求根公式"].
+    - difficulty must be an integer from 1 to 5: 1=basic, 2=easy, 3=medium, 4=hard, 5=competition / olympiad style.
+    - confidence must be a float in [0, 1] and should honestly reflect parsing certainty; lower it when the image is blurry, cropped, or ambiguous.
+    - If the image includes a diagram or figure, diagram_description must describe it in detail using text (labeled points, segment relations, angle marks, coordinates, axes, etc.), because downstream modules cannot see the image.
+    - Split given and find into separate list items, one fact per string.
+    - The backend separately enforces the exact ParsedQuestion JSON Schema, so every required field must be present with the correct type.
+    - Required top-level fields are: subject, grade_band, topic_path, question_text, given, find, diagram_description, difficulty, tags, confidence.
 """
 
     # ── User ────────────────────────────────────────────────────────
@@ -124,12 +121,12 @@ class ParserPrompt(PromptTemplate):
         subject_hint: str | None = kwargs.get("subject_hint")
         image_description: str | None = kwargs.get("image_description")
 
-        parts: list[str] = ["请解析下面图片中的题目。"]
+        parts: list[str] = ["Please parse the problem shown in the image below."]
         if subject_hint:
             cn = {"math": "数学", "physics": "物理"}.get(subject_hint, subject_hint)
-            parts.append(f"提示: 用户已指定学科为「{cn}」。")
+            parts.append(f"Hint: the user selected subject '{cn}'.")
         if image_description:
-            parts.append(f"图片说明: {image_description}")
+            parts.append(f"Image note: {image_description}")
         return "\n".join(parts)
 
     # ── Multimodal build ────────────────────────────────────────────

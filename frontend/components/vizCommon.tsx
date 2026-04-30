@@ -9,7 +9,7 @@ export type VizParam = {
   min?: number;
   max?: number;
   step?: number;
-  default: unknown;
+  default: number | boolean;
 };
 
 export function ParamControls({

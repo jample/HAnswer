@@ -6,6 +6,13 @@ import json
 from typing import Any
 
 from app.config import settings
+from app.prompts._audience import curriculum_boundary_block
+from app.prompts._viz_compact import (
+    compact_answer_for_item,
+    compact_previous_items,
+    compact_question,
+    compact_storyboard_root,
+)
 from app.prompts.base import DesignDecision, PromptTemplate, PromptVersion
 from app.prompts.schemas import VISUALIZATION_SCHEMA
 from app.prompts.vizcoder_prompt import (
@@ -23,9 +30,17 @@ def _preferred_engine(kwargs: dict[str, Any]) -> str:
     return "geogebra"
 
 
+def _resolved_engine(kwargs: dict[str, Any]) -> str:
+    storyboard_item = kwargs.get("storyboard_item") or {}
+    item_engine = str(storyboard_item.get("engine") or "").strip().lower()
+    if item_engine in {"jsxgraph", "geogebra"}:
+        return item_engine
+    return _preferred_engine(kwargs)
+
+
 class VizItemPrompt(PromptTemplate):
 
-    version = PromptVersion(major=1, minor=0, date_updated="2026-04-20")
+    version = PromptVersion(major=1, minor=2, date_updated="2026-04-22")
     name = "vizitem"
 
     purpose = (
@@ -46,7 +61,7 @@ class VizItemPrompt(PromptTemplate):
         DesignDecision(
             title="一次只生成一个 visualization",
             rationale=(
-                "把 3-4 张图拆成独立调用后, 单次输出更短、更稳定, 某一张失败时也不会"
+                "把 2 张图拆成独立调用后, 单次输出更短、更稳定, 某一张失败时也不会"
                 "拖垮整组可视化。"
             ),
         ),
@@ -67,8 +82,19 @@ class VizItemPrompt(PromptTemplate):
         DesignDecision(
             title="共享符号和共享参数必须复用",
             rationale=(
-                "storyboard 的价值在于 3-4 张图读起来像一个教学故事。符号和参数漂移"
+                "storyboard 的价值在于 2 张图读起来像一个教学故事。符号和参数漂移"
                 "会直接破坏这种连贯性。"
+            ),
+        ),
+        DesignDecision(
+            title="压缩上下文, 降低 token 与故障率",
+            rationale=(
+                "实际日志显示单次 vizitem 调用约 13K 输入 token, 其中绝大部分是与本"
+                "图无关的 AnswerPackage 子段 (similar_questions / key_points_of_answer / "
+                "self_check) 与重复的 JSON Schema (Schema 已经通过 response_schema 通"
+                "道传给 Gemini)。这里只保留与当前 storyboard_item 真正相关的题面、"
+                "锚定步骤、共享符号/参数, 并按 engine 选择 cheatsheet, 把单次输入压"
+                "到约 3K-4K token。"
             ),
         ),
     ]
@@ -77,60 +103,104 @@ class VizItemPrompt(PromptTemplate):
     def schema(self) -> dict:
         return VISUALIZATION_SCHEMA
 
+    def fewshot_examples(self, **kwargs: Any) -> list[dict]:
+        example_user = {
+            "storyboard_item": {
+                "id": "viz-example-1",
+                "title_cn": "交点建立",
+                "learning_goal_cn": "看清交点与函数图像的对应关系",
+                "engine": "geogebra",
+                "shared_symbols": ["A", "B"],
+                "shared_params": ["t"],
+            }
+        }
+        example_output = {
+            "id": "viz-example-1",
+            "title_cn": "交点建立",
+            "caption_cn": "突出抛物线与 x 轴交点 A、B 的位置。",
+            "learning_goal": "看清交点与函数图像的对应关系",
+            "interactive_hints": ["拖动参数观察交点变化"],
+            "helpers_used": [],
+            "engine": "geogebra",
+            "jsx_code": "",
+            "ggb_commands": [
+                "t=Slider(-2,2,0.1)",
+                "f(x)=x^2-2*x+t",
+                "A=Intersect(f,xAxis,1)",
+                "B=Intersect(f,xAxis,2)"
+            ],
+            "ggb_settings": {"app_name": "graphing", "grid_visible": True, "axes_visible": True},
+            "params": [{"name": "t", "label_cn": "参数 t", "kind": "slider", "min": -2, "max": 2, "step": 0.1, "default": 0}],
+            "animation": None,
+        }
+        return [
+            {
+                "role": "user",
+                "content": "Example storyboard item\n" + json.dumps(example_user, ensure_ascii=False, indent=2),
+            },
+            {"role": "assistant", "content": json.dumps(example_output, ensure_ascii=False, indent=2)},
+        ]
+
     def system_message(self, **kwargs: Any) -> str:
-        preferred_engine = _preferred_engine(kwargs)
-        storyboard_item = kwargs["storyboard_item"]
-        schema_str = json.dumps(self.schema, indent=2, ensure_ascii=False)
+        engine = _resolved_engine(kwargs)
         allow = ", ".join(ALLOWED_GLOBALS)
         forbid = ", ".join(FORBIDDEN_GLOBALS)
-        item_engine = str(storyboard_item.get("engine") or preferred_engine).strip().lower()
         engine_policy = (
-            '当前这一项默认应输出 engine="geogebra"。除非 storyboard_item 明确要求 jsxgraph, '
-            "否则不要切换。"
-            if item_engine != "jsxgraph"
-            else '当前这一项 storyboard 已明确指定 engine="jsxgraph"。'
+            'This item should default to engine="geogebra". Do not switch unless storyboard_item explicitly requires jsxgraph.'
+            if engine != "jsxgraph"
+            else 'This storyboard item explicitly requires engine="jsxgraph".'
         )
+        engine_preference = (
+            "The overall rendering preference is GeoGebra-first."
+            if engine != "jsxgraph"
+            else "This item uses JSXGraph. Generate JSXGraph code only."
+        )
+        if engine == "geogebra":
+            engine_block = (
+                "## GeoGebra requirements\n"
+                "- One command per line; do not write a ggbApplet prefix.\n"
+                "- Put view settings in ggb_settings, not in ggb_commands.\n"
+                "- Do not output wrappers such as SetValue(...), SetConditionToShowObject(...), or Line(ax+by=c).\n"
+                "- If item.shared_params is non-empty, reuse same-name sliders / toggles whenever possible.\n"
+                "- jsx_code must be an empty string.\n\n"
+                f"## GeoGebra cheatsheet\n{GGB_CHEATSHEET}"
+            )
+        else:
+            engine_block = (
+                "## JSXGraph requirements\n"
+                "- jsx_code must contain only the function body itself.\n"
+                f"- Allowed globals only: {allow}\n"
+                f"- Forbidden: {forbid}\n"
+                "- ggb_commands must be an empty array.\n\n"
+                f"## JSXGraph cheatsheet\n{H_CHEATSHEET}"
+            )
+        # Note: JSON output schema is enforced via the Gemini API's
+        # `response_json_schema` channel, so we do NOT duplicate the full
+        # schema in the system prompt (that was ~1.5K wasted tokens).
         return f"""\
-你是中学数学/物理可视化代码生成师。现在 storyboard 已经先行确定, 你的任务只剩下:
-把 **一个** storyboard item 落成 **一个** 可运行 visualization JSON。
+    You are a math / physics visualization code generator for middle-school and high-school lessons. The storyboard has already been decided. Your only remaining task is to turn **one** storyboard item into **one** runnable visualization JSON object.
 
-## 硬约束
-- 只输出一个 Visualization JSON 对象, 不要再输出 visualizations 数组。
-- `id` 必须与 storyboard_item.id 完全一致。
-- 这次只覆盖当前 storyboard_item, 不要顺带把其他 item 混进同一张图。
-- `learning_goal` 必须服务于 storyboard_item.learning_goal_cn。
-- `caption_cn` 必须落地 storyboard_item.caption_outline_cn。
-- 复用 storyboard root 中的共享符号与共享参数, 不要擅自改名。
+    ## Hard constraints
+    - Output exactly one Visualization JSON object. Do not output a visualizations array.
+    - `id` must match storyboard_item.id exactly.
+    - Cover only the current storyboard_item. Do not mix other items into the same visualization.
+    - `learning_goal` must directly serve storyboard_item.learning_goal_cn.
+    - `caption_cn` must realize storyboard_item.caption_outline_cn.
+    - Reuse shared symbols and shared parameters from the storyboard root. Do not rename them arbitrarily.
+        - Respect parsed_question.subject and parsed_question.grade_band as a hard curriculum boundary.
+            If grade_band is junior, the figure and explanations must stay within Junior High School knowledge and wording.
+            Do not explain a junior problem with Senior High School concepts.
 
-## 引擎策略
+    ## Engine policy
 - {engine_policy}
-- 默认渲染偏好仍是 GeoGebra-first。
-- 若输出 GeoGebra: `ggb_commands` 非空, `jsx_code` 为空字符串。
-- 若输出 JSXGraph: `jsx_code` 非空, `ggb_commands` 为空数组。
+    - {engine_preference}
 
-## GeoGebra 要求
-- 一行一个命令, 不要写 ggbApplet 前缀。
-- 视图设置放进 ggb_settings, 不要写到 ggb_commands。
-- 不要输出 SetValue(...) / SetConditionToShowObject(...) / Line(ax+by=c) 包装。
-- 若 item.shared_params 非空, 优先复用同名 Slider / toggle。
+{engine_block}
 
-## JSXGraph 要求
-- jsx_code 只写函数体本身。
-- 仅可使用全局: {allow}
-- 严禁使用: {forbid}
-
-## 输出格式
-- 仅输出一个 JSON 对象, 严格匹配下方 Schema。
-- 不要附加解释文字。
-
-## GeoGebra cheatsheet
-{GGB_CHEATSHEET}
-
-## JSXGraph cheatsheet
-{H_CHEATSHEET}
-
-## JSON Schema
-{schema_str}
+    ## Output rules
+    - Output exactly one JSON object whose field names / types / enums strictly match response_schema.
+    - All human-readable text fields in the output must be in Simplified Chinese.
+    - Do not add any explanation outside the JSON.
 """
 
     def user_message(self, **kwargs: Any) -> str:
@@ -139,24 +209,33 @@ class VizItemPrompt(PromptTemplate):
         storyboard: dict = kwargs["storyboard"]
         storyboard_item: dict = kwargs["storyboard_item"]
         previous_items: list[dict] = list(kwargs.get("previous_items") or [])
+
+        question_brief = compact_question(parsed_question)
+        answer_brief = compact_answer_for_item(answer_package, storyboard_item=storyboard_item)
+        storyboard_brief = compact_storyboard_root(storyboard, item=storyboard_item)
+        previous_brief = compact_previous_items(previous_items)
+
         return (
-            "## ParsedQuestion\n"
-            + json.dumps(parsed_question, indent=2, ensure_ascii=False)
-            + "\n\n## AnswerPackage\n"
-            + json.dumps(answer_package, indent=2, ensure_ascii=False)
-            + "\n\n## Storyboard Root\n"
-            + json.dumps(storyboard, indent=2, ensure_ascii=False)
-            + "\n\n## Current Storyboard Item\n"
+            "## QuestionBrief (trimmed problem statement + diagram description)\n"
+            + json.dumps(question_brief, indent=2, ensure_ascii=False)
+            + "\n\n"
+            + curriculum_boundary_block(parsed_question, language="en")
+            + "\n\n## AnswerContext (only the step / pattern data relevant to this item)\n"
+            + json.dumps(answer_brief, indent=2, ensure_ascii=False)
+            + "\n\n## StoryboardRoot (trimmed theme / shared symbols / params / sequence)\n"
+            + json.dumps(storyboard_brief, indent=2, ensure_ascii=False)
+            + "\n\n## CurrentStoryboardItem (the full item that must be implemented now)\n"
             + json.dumps(storyboard_item, indent=2, ensure_ascii=False)
-            + "\n\n## Previous Storyboard Items\n"
-            + json.dumps(previous_items, indent=2, ensure_ascii=False)
-            + "\n\n请严格把当前 storyboard_item 落成一个 visualization。"
-            + "\n要求:"
-            + "\n- `id` 必须等于 storyboard_item.id。"
-            + "\n- `title_cn` 尽量保持 storyboard_item.title_cn 的表述。"
-            + "\n- `learning_goal` 直接服务于 storyboard_item.learning_goal_cn。"
-            + "\n- `caption_cn` 明确回扣当前 item 对应的解答锚点。"
-            + "\n- 若 storyboard_item.shared_symbols / shared_params 非空, 必须复用。"
-            + "\n- 默认优先 GeoGebra, 并让图形直接解释当前 bottleneck。"
-            + "\n- 不要把整个题目所有内容塞进同一张图。"
+            + "\n\n## PreviousItemsBrief (already covered items; do not duplicate them)\n"
+            + json.dumps(previous_brief, indent=2, ensure_ascii=False)
+            + "\n\nPlease turn CurrentStoryboardItem into exactly one visualization."
+            + "\nRequirements:"
+            + "\n- `id` must equal storyboard_item.id."
+            + "\n- `title_cn` should stay as close as possible to storyboard_item.title_cn."
+            + "\n- `learning_goal` must directly serve storyboard_item.learning_goal_cn."
+            + "\n- `caption_cn` must clearly tie back to the answer anchor for this item."
+            + "\n- If storyboard_item.shared_symbols / shared_params is non-empty, you must reuse them."
+            + "\n- Prefer GeoGebra by default and make the figure directly explain the current bottleneck."
+            + "\n- Do not try to cram the entire problem into a single figure."
+            + "\n- All human-readable output text must be in Simplified Chinese."
         )

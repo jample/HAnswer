@@ -8,7 +8,7 @@ truth: if a field changes here, update `prompts/schemas.py` in lock-step.
 from __future__ import annotations
 
 import re
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -205,8 +205,8 @@ class VisualizationStoryboard(BaseModel):
     symbol_map: list[StoryboardSymbol] = Field(default_factory=list)
     shared_params: list[VizParam] = Field(default_factory=list)
     coverage_summary: list[StoryboardCoverageEntry] = Field(default_factory=list)
-    sequence: list[str] = Field(min_length=3, max_length=4)
-    items: list[VisualizationStoryboardItem] = Field(min_length=3, max_length=4)
+    sequence: list[str] = Field(min_length=1, max_length=2)
+    items: list[VisualizationStoryboardItem] = Field(min_length=1, max_length=2)
 
     @model_validator(mode="after")
     def _check_storyboard_integrity(self) -> VisualizationStoryboard:
@@ -232,7 +232,11 @@ class VisualizationStoryboard(BaseModel):
             missing_symbols = [symbol for symbol in item.shared_symbols if symbol not in known_symbols]
             if missing_symbols:
                 raise ValueError(
-                    f"storyboard item '{item.id}' references unknown shared symbols: {missing_symbols}"
+                    f"storyboard item '{item.id}' references unknown shared symbols: {missing_symbols}. "
+                    "Every item.shared_symbols entry must appear as its own atomic "
+                    "symbol_map[].symbol value. Do not combine symbols like 'P, Q' or \"P', Q'\" "
+                    "into one symbol_map entry; declare 'P', 'Q', \"P'\", \"Q'\", 'r' separately "
+                    "when they are referenced by items."
                 )
             missing_params = [param for param in item.shared_params if param not in known_params]
             if missing_params:
@@ -268,11 +272,207 @@ class GgbSettings(BaseModel):
     show_menu_bar: bool = False
 
 
+class GeoGebraCommandStep(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    step: int = Field(ge=1)
+    purpose: str
+    command: str
+
+
+class GeoGebraPropertyCommandStep(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    step: int = Field(ge=1)
+    purpose: str
+    command: str
+
+
+class GeoGebraExecutionPayloadDraft(BaseModel):
+    """Lenient Stage 2 GeoGebra draft accepted directly from the LLM.
+
+    The service normalizes this into ``GeoGebraExecutionPayload`` before
+    strict validation. This keeps small shape mistakes local and avoids
+    spending another LLM call just because a command was emitted as a
+    string or an optional-script placeholder was incomplete.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    title: str = ""
+    preferred_geogebra_app: str = "classic"
+    execution_mode: str = "command_only"
+    math_meaning_summary: str = ""
+    object_naming_convention: str = ""
+    commands: list[Any] = Field(default_factory=list)
+    property_commands: list[Any] = Field(default_factory=list)
+    interaction_objects: list[dict[str, Any]] = Field(default_factory=list)
+    optional_script: dict[str, Any] | None = None
+    expected_created_objects: list[Any] = Field(default_factory=list)
+    consistency_checks: list[str] = Field(default_factory=list)
+    fallback_used: bool = False
+    fallback_reason: str = ""
+    implementation_notes: list[str] = Field(default_factory=list)
+
+
+class InteractionObjectSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    type: Literal["slider", "button", "checkbox", "input_box", "none"]
+    purpose: str
+
+    @field_validator("type", mode="before")
+    @classmethod
+    def _coerce_non_ui_interaction_type(cls, value: object) -> object:
+        raw = str(value or "").strip()
+        if raw in {"slider", "button", "checkbox", "input_box", "none"}:
+            return raw
+        if raw in {
+            "point",
+            "moving_point",
+            "draggable_point",
+            "segment",
+            "line",
+            "circle",
+            "locus",
+        }:
+            return "none"
+        return value
+
+
+class OptionalScriptSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    needed: bool
+    script_type: Literal["none", "ggbscript", "javascript"]
+    reason: str = ""
+    target_object: str = ""
+    trigger: Literal["none", "on_click", "on_update", "on_drag_end", "on_load"] = "none"
+    script_body: str = ""
+
+    @field_validator("script_type", mode="before")
+    @classmethod
+    def _coerce_empty_script_type(cls, value: object) -> object:
+        if str(value or "").strip() == "":
+            return "none"
+        return value
+
+    @field_validator("trigger", mode="before")
+    @classmethod
+    def _coerce_empty_trigger(cls, value: object) -> object:
+        if str(value or "").strip() == "":
+            return "none"
+        return value
+
+    @model_validator(mode="after")
+    def _check_script_consistency(self) -> OptionalScriptSpec:
+        if not self.needed:
+            if self.script_type != "none":
+                raise ValueError("script_type must be 'none' when needed is False")
+            return self
+        if self.script_type == "none":
+            raise ValueError("script_type cannot be 'none' when needed is True")
+        if not self.reason.strip():
+            raise ValueError("reason is required when script is needed")
+        return self
+
+
+class ExpectedCreatedObjectSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    type: str
+    role: str
+
+
+class GeoGebraExecutionPayload(BaseModel):
+    """GeoGebra-first Stage 2 execution payload for the main HAViz path."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    title: str
+    preferred_geogebra_app: Literal["geometry", "graphing", "classic"]
+    execution_mode: Literal[
+        "command_only",
+        "commands_plus_minimal_ggbscript",
+        "commands_plus_minimal_javascript",
+    ]
+    math_meaning_summary: str
+    object_naming_convention: str
+    commands: list[GeoGebraCommandStep] = Field(default_factory=list)
+    property_commands: list[GeoGebraPropertyCommandStep] = Field(default_factory=list)
+    interaction_objects: list[InteractionObjectSpec] = Field(default_factory=list)
+    optional_script: OptionalScriptSpec
+    expected_created_objects: list[ExpectedCreatedObjectSpec] = Field(default_factory=list)
+    consistency_checks: list[str] = Field(default_factory=list)
+    fallback_used: bool = False
+    fallback_reason: str = ""
+    implementation_notes: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _check_payload(self) -> GeoGebraExecutionPayload:
+        if not self.commands:
+            raise ValueError("At least one creation command is required")
+
+        command_steps = [row.step for row in self.commands]
+        if command_steps != sorted(command_steps):
+            raise ValueError("commands must be ordered by step")
+
+        property_steps = [row.step for row in self.property_commands]
+        if property_steps != sorted(property_steps):
+            raise ValueError("property_commands must be ordered by step")
+
+        if self.execution_mode == "command_only" and self.optional_script.needed:
+            raise ValueError("command_only execution_mode cannot include optional_script")
+        if self.execution_mode != "command_only" and not self.optional_script.needed:
+            raise ValueError("script-based execution_mode requires optional_script.needed=True")
+
+        if not self.fallback_used and self.fallback_reason.strip():
+            raise ValueError("fallback_reason should be empty when fallback_used is False")
+        if self.fallback_used and not self.fallback_reason.strip():
+            raise ValueError("fallback_reason is required when fallback_used is True")
+
+        return self
+
+
+class VisualizationDraft(BaseModel):
+    """Lenient visualization payload used immediately after LLM generation.
+
+    This model keeps the same field surface as ``Visualization`` but omits
+    the GeoGebra anti-pattern guards. The backend sanitizes GeoGebra payloads
+    locally and then upgrades them into the strict ``Visualization`` model
+    before persistence.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    title_cn: str
+    caption_cn: str
+    learning_goal: str
+    interactive_hints: list[str] = Field(default_factory=list)
+    helpers_used: list[str] = Field(default_factory=list)
+    engine: VizEngine = "jsxgraph"
+    jsx_code: str = ""
+    ggb_commands: list[str] = Field(default_factory=list)
+    ggb_settings: GgbSettings | None = None
+    params: list[VizParam] = Field(default_factory=list)
+    animation: VizAnimation | None = None
+
+
+class VisualizationListDraft(BaseModel):
+    """Lenient wrapper for batch visualization generation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    visualizations: list[VisualizationDraft] = Field(min_length=1, max_length=2)
+
+
 # ── GeoGebra ggb_commands anti-pattern guards ───────────────────────
 # These compile-time constants drive the Pydantic validator below.
-# When a payload trips one of these guards Pydantic raises ValidationError
-# with an actionable message; GeminiClient's repair loop then re-prompts the
-# LLM with the diagnostic until the payload is clean (or attempts exhausted).
+# When a payload trips one of these guards the backend rejects the strict
+# visualization during its local sanitize+validate phase before persistence.
 _GGB_VIEW_DIRECTIVES = frozenset({
     "SetCoordSystem", "SetAxesVisible", "SetGridVisible",
     "SetPerspective", "ShowAxes", "ShowGrid",
@@ -473,7 +673,7 @@ class VisualizationList(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    visualizations: list[Visualization] = Field(min_length=3, max_length=4)
+    visualizations: list[Visualization] = Field(min_length=1, max_length=2)
 
 
 # ── Variant synthesis (M7) ──────────────────────────────────────────

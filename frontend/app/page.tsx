@@ -473,34 +473,34 @@ function GeminiCallPreview({
     {
       idx: 1,
       label: '解析题面',
-      desc: 'Gemini Parser 识别题图并抽取结构化题面。',
+      desc: 'LLM Parser 读取题图并抽取结构化题面。',
       state: loading ? 'active' : parsedReady ? 'done' : 'pending',
     },
     {
       idx: 2,
       label: '生成解答',
-      desc: 'Gemini Solver 生成教学型解答。',
+      desc: 'LLM Solver 生成完整教学型答案包。',
       state: 'pending',
     },
     {
       idx: 3,
       label: '生成可视化',
-      desc: 'Gemini VizCoder 生成交互图形。',
+      desc: 'LLM 先生成结构化可视化规格，再生成并校验 GeoGebra 指令。',
       state: 'pending',
     },
     {
       idx: 4,
       label: '建立索引',
-      desc: 'Gemini Embedding 建立检索向量。',
+      desc: 'LLM Embedding 为问题、答案与检索单元建立向量索引。',
       state: 'pending',
     },
   ] as const;
 
   return (
     <div style={{ marginBottom: 14, padding: 12, border: '1px solid #e7edf5', borderRadius: 8, background: '#fafcff' }}>
-      <div style={{ fontWeight: 700, marginBottom: 4 }}>Gemini 处理流程</div>
+      <div style={{ fontWeight: 700, marginBottom: 4 }}>LLM 处理流程</div>
       <div style={{ color: 'var(--muted)', fontSize: 13, marginBottom: 8 }}>
-        当前任务共 4 次 Gemini 调用。上传页完成 1/4，开始解答后将在答题页继续 2/4 到 4/4。
+        当前任务按 4 个阶段推进。上传页完成第 1 阶段，开始解答后将在答题页继续第 2 到第 4 阶段。
       </div>
       <div style={{ display: 'grid', gap: 8 }}>
         {stages.map((stage) => {
@@ -523,7 +523,7 @@ function GeminiCallPreview({
             >
               <div style={{ fontWeight: 600 }}>
                 {stage.state === 'done' ? '✓ ' : stage.state === 'active' ? '● ' : '○ '}
-                Gemini {stage.idx}/4 · {stage.label}
+                LLM {stage.idx}/4 · {stage.label}
               </div>
               <div style={{ fontSize: 12, marginTop: 2 }}>{stage.desc}</div>
             </div>

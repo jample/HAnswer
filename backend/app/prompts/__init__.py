@@ -10,7 +10,7 @@ subclass carrying:
   - `.schema` JSON Schema for the expected output.
 
 Usage:
-    from app.prompts import ParserPrompt, SolverPrompt, VizCoderPrompt, PromptRegistry
+  from app.prompts import ParserPrompt, SolverPrompt, VizSpecPrompt, JsxGraphCodegenPrompt, PromptRegistry
 
     p = ParserPrompt()
     print(p.preview(subject_hint="math"))       # inspect
@@ -22,6 +22,8 @@ Usage:
 
 from app.prompts.base import DesignDecision, PromptTemplate, PromptVersion
 from app.prompts.dialog_prompt import DialogPrompt
+from app.prompts.geogebra_codegen_prompt import GeoGebraCodegenPrompt
+from app.prompts.jsxgraph_codegen_prompt import JsxGraphCodegenPrompt
 from app.prompts.parser_prompt import ParserPrompt
 from app.prompts.registry import PromptRegistry
 from app.prompts.solver_prompt import SolverPrompt
@@ -29,10 +31,13 @@ from app.prompts.variant_synth_prompt import VariantSynthPrompt
 from app.prompts.vizcoder_prompt import VizCoderPrompt
 from app.prompts.vizitem_prompt import VizItemPrompt
 from app.prompts.vizplanner_prompt import VizPlannerPrompt
+from app.prompts.vizspec_prompt import VizSpecPrompt
 
 __all__ = [
     "DesignDecision",
     "DialogPrompt",
+    "GeoGebraCodegenPrompt",
+    "JsxGraphCodegenPrompt",
     "ParserPrompt",
     "PromptRegistry",
     "PromptTemplate",
@@ -42,4 +47,5 @@ __all__ = [
     "VizCoderPrompt",
     "VizItemPrompt",
     "VizPlannerPrompt",
+    "VizSpecPrompt",
 ]

@@ -85,6 +85,21 @@ def summarize_visualizations(rows: list[VisualizationRow]) -> dict:
     }
 
 
+def summarize_visualization_plan(plan_json: dict | None) -> dict:
+    visualizations = list((plan_json or {}).get("visualizations") or [])
+    selected = dict((plan_json or {}).get("selected_visualization") or {})
+    return {
+        "candidate_count": len(visualizations),
+        "recommended_ids": [
+            str(item.get("id")) for item in visualizations if item.get("recommended")
+        ],
+        "titles": [str(item.get("title") or "") for item in visualizations],
+        "selected_visualization_id": (
+            selected.get("id") or (plan_json or {}).get("selected_visualization_id")
+        ),
+    }
+
+
 def summarize_indexing(
     *,
     pattern_id: str | None,
@@ -410,6 +425,8 @@ async def clear_stage_outputs(
         stages_to_delete.extend(["solving", "visualizing", "indexing"])
     elif stage == "solving":
         stages_to_delete.extend(["visualizing", "indexing"])
+    elif stage == "visualizing":
+        stages_to_delete.extend(["indexing"])
     elif stage == "indexing":
         stages_to_delete.extend([])
 

@@ -31,6 +31,12 @@ async def _session():
         yield s
 
 
+def _parser_llm_http_error(err: LLMError) -> HTTPException:
+    message = str(err).strip() or err.__class__.__name__
+    status_code = 504 if "timeout" in message.lower() else 502
+    return HTTPException(status_code, f"parser LLM failed: {message}")
+
+
 @router.post("/image")
 async def ingest_image_endpoint(
     file: UploadFile = File(...),
@@ -56,7 +62,7 @@ async def ingest_image_endpoint(
             image_name=file.filename,
         )
     except LLMError as e:
-        raise HTTPException(502, f"parser LLM failed: {e}")
+        raise _parser_llm_http_error(e)
 
     return {
         "question_id": str(result.question.id),
@@ -119,7 +125,7 @@ async def rescan_question_endpoint(
     except FileNotFoundError as e:
         raise HTTPException(404, str(e))
     except LLMError as e:
-        raise HTTPException(502, f"parser LLM failed: {e}")
+        raise _parser_llm_http_error(e)
 
     return {
         "question_id": str(result.question.id),
@@ -161,7 +167,7 @@ async def replace_question_image_endpoint(
     except ValueError as e:
         raise HTTPException(409, str(e))
     except LLMError as e:
-        raise HTTPException(502, f"parser LLM failed: {e}")
+        raise _parser_llm_http_error(e)
 
     return {
         "question_id": str(result.question.id),

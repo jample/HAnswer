@@ -15,7 +15,6 @@ import uuid
 from app.config import settings
 from app.db.session import session_scope
 from app.services.embedding import build_dense_embedder
-from app.services.llm_deps import get_llm_client
 from app.services.milvus_setup import doctor, ensure_collections
 from app.services.reindex_service import rebuild_retrieval_indexes
 from app.services.sparse_encoder import get_sparse_encoder
@@ -33,8 +32,7 @@ async def _run(
         force_recreate_dense=recreate_dense,
         recreate_sparse=recreate_sparse,
     )
-    llm = get_llm_client()
-    embedder = build_dense_embedder(llm)
+    embedder = build_dense_embedder()
     sparse = get_sparse_encoder()
     vector_store = get_vector_store()
 
@@ -48,7 +46,7 @@ async def _run(
             question_ids=parsed_ids or None,
         )
     return {
-        "active_embedder": settings.retrieval.embedder,
+        "active_embedder": settings.embedding.provider,
         "active_dense_dim": settings.retrieval_dense_dim,
         "recreate_dense": recreate_dense,
         "recreate_sparse": recreate_sparse,

@@ -1,7 +1,7 @@
 """Shared local bge-m3 runtime.
 
 Dense + sparse retrieval both use the same FlagEmbedding model. Loading
-it once avoids doubling RAM/VRAM when `retrieval.embedder` and
+it once avoids doubling RAM/VRAM when `[embedding].provider` and
 `retrieval.sparse_encoder` are both set to `bge-m3`.
 """
 
@@ -27,7 +27,7 @@ def get_bge_m3_model() -> Any:
                     raise RuntimeError(
                         "BGE-M3 is not installed. Run "
                         "`pip install -e '.[retrieval]'` before switching "
-                        "retrieval.embedder / retrieval.sparse_encoder to 'bge-m3'."
+                        "[embedding].provider / retrieval.sparse_encoder to 'bge-m3'."
                     ) from e
                 except ImportError as e:  # pragma: no cover - optional dep
                     raise RuntimeError(

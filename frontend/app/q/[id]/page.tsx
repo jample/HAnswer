@@ -5,6 +5,7 @@ import { use, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { TeX, RichText } from '../../../components/MathText';
 import QuestionDialogPanel from '../../../components/QuestionDialogPanel';
 import VizSandbox from '../../../components/VizSandbox';
+import type { VizParam } from '../../../components/vizCommon';
 import { apiUrl } from '../../../lib/api';
 
 /**
@@ -117,6 +118,7 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
   const [running, setRunning] = useState(false);
   const [jobStage, setJobStage] = useState<string | null>(null);
   const [pipeline, setPipeline] = useState<Pipeline | null>(null);
+  const [visualizationPlan, setVisualizationPlan] = useState<any | null>(null);
   const [stageReviews, setStageReviews] = useState<StageReview[]>([]);
   const [solutions, setSolutions] = useState<SolutionSummary[]>([]);
   const [currentSolutionId, setCurrentSolutionId] = useState<string | null>(null);
@@ -124,6 +126,7 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
   const [creatingSolution, setCreatingSolution] = useState(false);
   const [stageActionPending, setStageActionPending] = useState<string | null>(null);
   const [stageNoteDrafts, setStageNoteDrafts] = useState<Record<string, string>>({});
+  const [dialogLlmBusy, setDialogLlmBusy] = useState(false);
   const [dialogCollapsed, setDialogCollapsed] = useState(false);
   const [dialogPanelWidth, setDialogPanelWidth] = useState(380);
   const [toast, setToast] = useState<{ message: string; kind: 'info' | 'success' | 'error' } | null>(null);
@@ -160,6 +163,7 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
     }).then((body) => {
       if (!body) return;
       setInitial(body);
+      setVisualizationPlan(body?.visualization_plan ?? null);
       setSolutions(Array.isArray(body?.solutions) ? body.solutions : []);
       if (typeof body?.current_solution_id === 'string') {
         setCurrentSolutionId((prev) => prev ?? body.current_solution_id);
@@ -208,11 +212,14 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
     // cases where solution.status wasn't updated but job state recorded the error.
     const hasError = body?.status === 'error' || Boolean(body?.job?.error);
     const jobDone = Boolean(body?.job?.done);
+    const incomingStageReviews = Array.isArray(body?.stage_reviews) ? body.stage_reviews : [];
+    const awaitingReview = hasPendingStageReview(incomingStageReviews);
     setDone(Boolean(body?.complete) || hasError || jobDone);
-    setRunning(Boolean(body?.job?.running) && !hasError);
+    setRunning(Boolean(body?.job?.running) && !hasError && !jobDone && !awaitingReview);
     setJobStage(typeof body?.job?.stage === 'string' ? body.job.stage : body?.status ?? null);
     setPipeline(body?.pipeline ?? null);
-    setStageReviews(Array.isArray(body?.stage_reviews) ? body.stage_reviews : []);
+    setVisualizationPlan(body?.visualization_plan ?? null);
+    setStageReviews(incomingStageReviews);
     setSolutions(Array.isArray(body?.solutions) ? body.solutions : []);
     if (typeof body?.current_solution_id === 'string') {
       setCurrentSolutionId((prev) => prev ?? body.current_solution_id);
@@ -306,6 +313,8 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
   }, [done, loadResume, resumeKey, resumeReady, running]);
 
   const byName = useMemo(() => groupBy(events), [events]);
+  const liveStatusPayload = useMemo(() => latestStatusPayload(byName), [byName]);
+  const liveStatusMessage = typeof liveStatusPayload?.message === 'string' ? liveStatusPayload.message : null;
 
   const [inBasket, setInBasket] = useState(false);
   useEffect(() => {
@@ -333,17 +342,23 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
   }
 
   async function restartAnswer() {
+    if (restarting || stageActionPending || dialogLlmBusy) return;
     setRestarting(true);
-    showToast('正在重新开始解答…', 'info');
+    showToast(running ? '正在停止当前任务并重新开始解答…' : '正在重新开始解答…', 'info');
     try {
-      await fetch(apiUrl(withSolution(`/api/answer/${params.id}/start`, currentSolutionId)), { method: 'POST' });
+      const res = await fetch(apiUrl(withSolution(`/api/answer/${params.id}/start`, currentSolutionId)), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ force: running }),
+      });
+      if (!res.ok) throw new Error(await res.text());
       setEvents([]);
       setDone(false);
       setRunning(true);
       setJobStage('queued');
       setPipeline(null);
       await loadResume();
-      showToast('解答已重新启动', 'success');
+      showToast(running ? '当前任务已中断，新的解答任务已启动' : '解答已重新启动', 'success');
     } catch (e) {
       showToast(`重启失败: ${e}`, 'error');
     } finally {
@@ -352,6 +367,7 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
   }
 
   async function createNewSolution() {
+    if (llmBusy) return;
     setCreatingSolution(true);
     showToast('正在创建新解法…', 'info');
     try {
@@ -380,6 +396,12 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
     () => getPendingStageReview(stageReviews),
     [stageReviews],
   );
+  const llmBusy = running || restarting || creatingSolution || Boolean(stageActionPending) || dialogLlmBusy;
+  const llmBusyMessage = dialogLlmBusy
+    ? '当前正在进行追问调用，其他会触发 LLM 的操作已暂时锁定。'
+    : llmBusy
+      ? '当前有 LLM 调用在执行或排队，其他会触发 LLM 的操作已暂时锁定。'
+      : null;
   const hasAnswerContent = Boolean(
     initial?.answer_package
     || byName.solution_step?.length
@@ -420,6 +442,7 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
   }, [dialogCollapsed, dialogPanelWidth, handleDialogResize, stopDialogResize]);
 
   async function handleStageAction(stage: string, action: 'confirm' | 'rerun') {
+    if (llmBusy) return;
     const key = `${stage}:${action}`;
     setStageActionPending(key);
     const label = stageLabel(stage);
@@ -480,6 +503,7 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
   }
 
   async function handleDeleteSolution(solutionId: string) {
+    if (llmBusy) return;
     if (!confirm('确定删除此解法？相关可视化和索引数据将一并删除。')) return;
     showToast('正在删除解法…', 'info');
     try {
@@ -501,6 +525,7 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
   }
 
   async function handleDeleteVisualization(vizRef: string) {
+    if (llmBusy) return;
     if (!currentSolutionId) return;
     if (!confirm(`确定删除可视化 "${vizRef}"？`)) return;
     showToast('正在删除可视化…', 'info');
@@ -518,6 +543,7 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
   }
 
   async function handleClearIndex() {
+    if (llmBusy) return;
     if (!currentSolutionId) return;
     if (!confirm('确定清除当前解法的检索索引？此操作不可恢复。')) return;
     showToast('正在清除索引…', 'info');
@@ -535,6 +561,7 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
   }
 
   async function handleDeleteQuestion() {
+    if (llmBusy) return;
     if (!confirm('确定删除此题目及所有相关数据（解法、可视化、索引）？此操作不可恢复。')) return;
     setDeletingQuestion(true);
     setRunning(false);
@@ -581,13 +608,15 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
       <button
         type="button"
         onClick={handleDeleteQuestion}
-        disabled={deletingQuestion}
+        disabled={deletingQuestion || llmBusy}
         style={{ fontSize: 12, marginBottom: 8, marginLeft: 8, color: '#b42318' }}
       >
         {deletingQuestion ? '删除中…' : '删除题目'}
       </button>
       <div style={{ marginBottom: 12 }}>
-        {canOpenDialog ? (
+        {llmBusyMessage ? (
+          <span style={mutedStyle}>{llmBusyMessage}</span>
+        ) : canOpenDialog ? (
           <span style={mutedStyle}>右侧追问面板已绑定当前解法；窄屏时会自动折到下方。</span>
         ) : (
           <span style={mutedStyle}>完成“生成解答”后, 才能进入基于答案的多轮对话。</span>
@@ -597,25 +626,49 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
         solutions={solutions}
         currentSolutionId={currentSolutionId}
         creating={creatingSolution}
+        actionLocked={llmBusy}
         onSelect={setCurrentSolutionId}
         onCreate={createNewSolution}
         onDelete={handleDeleteSolution}
       />
       {!done && (
         <p style={mutedStyle}>
-          {latestStatus(byName)
+          {liveStatusMessage
             ?? progressHeadline(pipeline)
             ?? statusLabel(jobStage)
             ?? (running ? '解答生成中…' : '正在启动后台解答任务…')}
         </p>
       )}
-      <GeminiProgress pipeline={pipeline} done={done} liveMessage={latestStatus(byName)} />
+      <SolverLiveBanner
+        running={running}
+        restarting={restarting}
+        jobStage={jobStage}
+        pipeline={pipeline}
+        statusPayload={liveStatusPayload}
+        solutionStepCount={byName.solution_step?.length ?? 0}
+      />
+      {(running || restarting) && (
+        <div style={{ marginBottom: 12 }}>
+          <button
+            className="btn btn-secondary"
+            onClick={restartAnswer}
+            disabled={restarting || Boolean(stageActionPending) || dialogLlmBusy}
+          >
+            {restarting ? '正在中断并重启…' : '停止当前任务并重新开始'}
+          </button>
+          <span style={{ ...mutedStyle, marginLeft: 10 }}>
+            服务重启后恢复的旧任务也可以用这个按钮中断并重新启动。
+          </span>
+        </div>
+      )}
+      <GeminiProgress pipeline={pipeline} done={done} liveMessage={liveStatusMessage} />
       <StageRerunBoard
         currentSolutionId={currentSolutionId}
         stageReviews={stageReviews}
         noteDrafts={stageNoteDrafts}
         onNoteChange={(stage, value) => setStageNoteDrafts((prev) => ({ ...prev, [stage]: value }))}
         actionPending={stageActionPending}
+        actionLocked={llmBusy}
         onRerun={handleDirectRerun}
         onClearIndex={handleClearIndex}
       />
@@ -627,6 +680,7 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
           : pendingReview?.review_note || ''}
         onNoteChange={(stage, value) => setStageNoteDrafts((prev) => ({ ...prev, [stage]: value }))}
         actionPending={stageActionPending}
+        actionLocked={llmBusy}
         onConfirm={(stage) => handleStageAction(stage, 'confirm')}
         onRerun={(stage) => handleStageAction(stage, 'rerun')}
       />
@@ -750,7 +804,14 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
         <div style={{ ...mutedStyle, marginBottom: 10 }}>
           把题目的关键步骤放到大图里演示，方便结合上面的解答一起看。
         </div>
-        <VizPanel vizEvents={byName.visualization || []} fullWidth onDeleteViz={handleDeleteVisualization} />
+        <VizPanel
+          questionId={params.id}
+          vizEvents={byName.visualization || []}
+          visualizationPlan={visualizationPlan}
+          fullWidth
+          onDeleteViz={handleDeleteVisualization}
+          actionsLocked={llmBusy}
+        />
       </section>
 
       {byName.method_pattern && (
@@ -794,7 +855,7 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
       )}
 
       {byName.error && (
-        <ErrorPanel events={byName.error} onRetry={restartAnswer} restarting={restarting} />
+        <ErrorPanel events={byName.error} onRetry={restartAnswer} restarting={restarting} actionLocked={llmBusy} />
       )}
       </article>
 
@@ -813,6 +874,8 @@ export default function QuestionPage({ params: paramsPromise }: { params: Promis
             questionId={params.id}
             solutionId={currentSolutionId}
             canOpen={canOpenDialog}
+            llmBusy={llmBusy}
+            onLlmBusyChange={setDialogLlmBusy}
             collapsed={dialogCollapsed}
             onToggleCollapse={() => setDialogCollapsed((prev) => !prev)}
           />
@@ -833,17 +896,37 @@ function groupBy(events: AnyEv[]): Partial<Record<SectionName, AnyEv[]>> {
   return out;
 }
 
-function latestStatus(byName: Partial<Record<SectionName, AnyEv[]>>): string | null {
+function latestStatusPayload(byName: Partial<Record<SectionName, AnyEv[]>>): Record<string, any> | null {
   const items = byName.status;
   if (!items?.length) return null;
   const last = items[items.length - 1]?.data;
+  return last && typeof last === 'object' ? last : null;
+}
+
+function latestStatus(byName: Partial<Record<SectionName, AnyEv[]>>): string | null {
+  const last = latestStatusPayload(byName);
   return typeof last?.message === 'string' ? last.message : null;
+}
+
+function formatElapsed(totalSeconds: number | null): string | null {
+  if (totalSeconds == null || totalSeconds < 0) return null;
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) {
+    return `${hours}小时 ${minutes}分 ${seconds}秒`;
+  }
+  if (minutes > 0) {
+    return `${minutes}分 ${seconds}秒`;
+  }
+  return `${seconds}秒`;
 }
 
 function buildResumeFingerprint(body: any): string {
   const stageReviews = Array.isArray(body?.stage_reviews)
     ? body.stage_reviews.map((item: any) => `${item.stage}:${item.review_status}:${item.artifact_version}`).join('|')
     : '';
+  const plan = body?.visualization_plan ?? null;
   return JSON.stringify({
     status: body?.status ?? null,
     complete: Boolean(body?.complete),
@@ -853,6 +936,8 @@ function buildResumeFingerprint(body: any): string {
     error: body?.job?.error ?? null,
     sections: Array.isArray(body?.sections) ? body.sections.length : 0,
     visualizations: Array.isArray(body?.visualizations) ? body.visualizations.length : 0,
+    visualizationPlanSelectedId: plan?.selected_visualization?.id ?? plan?.selected_visualization_id ?? null,
+    visualizationPlanCandidateCount: Array.isArray(plan?.visualizations) ? plan.visualizations.length : 0,
     stageReviews,
   });
 }
@@ -860,7 +945,9 @@ function buildResumeFingerprint(body: any): string {
 function nextResumePollDelay(body: any, unchangedCount: number): number {
   const stage = typeof body?.job?.stage === 'string' ? body.job.stage : body?.status ?? null;
   let baseMs = 2500;
-  if (stage === 'solving' || stage === 'visualizing') {
+  if (stage === 'solving') {
+    baseMs = 1800;
+  } else if (stage === 'visualizing') {
     baseMs = 3000;
   } else if (stage === 'indexing') {
     baseMs = 4000;
@@ -878,7 +965,7 @@ function optimisticRerunMessage(stage: string): string {
   const labels: Record<string, string> = {
     parsed: '正在重新解析题面。',
     solving: '正在重新生成解答。',
-    visualizing: '正在重新生成可视化。',
+    visualizing: '正在重新生成可视化（重新规划规格并生成代码）。',
     indexing: '正在重新建立索引。',
   };
   return labels[stage] ?? '正在重跑当前阶段。';
@@ -920,16 +1007,16 @@ function progressHeadline(pipeline: Pipeline | null): string | null {
   if (pipeline.error) return pipeline.error;
   const active = pipeline.steps.find((step) => step.state === 'active');
   if (active) {
-    return `Gemini ${active.call_index}/${pipeline.total_calls} · ${active.label}`;
+    return `LLM ${active.call_index}/${pipeline.total_calls} · ${active.label}`;
   }
   const review = pipeline.steps.find((step) => step.state === 'review');
   if (review) {
-    return `等待人工确认 · Gemini ${review.call_index}/${pipeline.total_calls} · ${review.label}`;
+    return `等待人工确认 · LLM ${review.call_index}/${pipeline.total_calls} · ${review.label}`;
   }
   if (pipeline.completed_calls >= pipeline.total_calls) {
-    return `Gemini ${pipeline.total_calls}/${pipeline.total_calls} · 全部调用完成`;
+    return `LLM ${pipeline.total_calls}/${pipeline.total_calls} · 全部调用完成`;
   }
-  return `Gemini ${pipeline.completed_calls}/${pipeline.total_calls} · 等待下一阶段`;
+  return `LLM ${pipeline.completed_calls}/${pipeline.total_calls} · 等待下一阶段`;
 }
 
 function statusLabel(stage: string | null): string | null {
@@ -940,7 +1027,7 @@ function statusLabel(stage: string | null): string | null {
     queued: '解答任务已排队。',
     solving: '正在生成教学型答案。',
     review_solve: '解答已生成，等待人工确认。',
-    visualizing: '答案已生成，正在补充可视化。',
+    visualizing: '正在生成可视化规格并生成 GeoGebra 指令。',
     review_viz: '可视化已生成，等待人工确认。',
     indexing: '正在写入知识点、方法模式与检索索引。',
     review_index: '索引已生成，等待人工确认。',
@@ -983,6 +1070,141 @@ function StatusSteps({ currentStage }: { currentStage: string | null }) {
   );
 }
 
+function SolverLiveBanner({
+  running,
+  restarting,
+  jobStage,
+  pipeline,
+  statusPayload,
+  solutionStepCount,
+}: {
+  running: boolean;
+  restarting: boolean;
+  jobStage: string | null;
+  pipeline: Pipeline | null;
+  statusPayload: Record<string, any> | null;
+  solutionStepCount: number;
+}) {
+  const solvingActive = Boolean(
+    (running || restarting)
+    && (
+      jobStage === 'solving'
+      || pipeline?.current_stage === 'solving'
+      || statusPayload?.stage === 'solving'
+    ),
+  );
+  const [startedAtMs, setStartedAtMs] = useState<number | null>(null);
+  const [, setTicker] = useState(0);
+
+  useEffect(() => {
+    if (!solvingActive) {
+      setStartedAtMs(null);
+      return;
+    }
+    const waited = Number(statusPayload?.wait_elapsed_s);
+    if (Number.isFinite(waited) && waited >= 0) {
+      const inferredStart = Date.now() - waited * 1000;
+      setStartedAtMs((prev) => {
+        if (prev == null) return inferredStart;
+        return Math.min(prev, inferredStart);
+      });
+      return;
+    }
+    setStartedAtMs((prev) => prev ?? Date.now());
+  }, [solvingActive, statusPayload?.wait_elapsed_s]);
+
+  useEffect(() => {
+    if (!solvingActive) return;
+    const timer = window.setInterval(() => {
+      setTicker((value) => value + 1);
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [solvingActive]);
+
+  if (!solvingActive) return null;
+
+  const elapsedSeconds = startedAtMs == null ? null : Math.max(0, Math.floor((Date.now() - startedAtMs) / 1000));
+  const elapsedLabel = formatElapsed(elapsedSeconds);
+  const waitingForFirstSection = solutionStepCount === 0 && !statusPayload?.heartbeat;
+  const message = typeof statusPayload?.message === 'string'
+    ? statusPayload.message
+    : restarting
+      ? '正在停止当前任务并重新启动解答。'
+      : 'LLM 正在生成解答。';
+
+  let detail = '正在准备首段答案内容。';
+  if (statusPayload?.heartbeat) {
+    detail = 'LLM 已开始推理，当前仍在等待第一个完整答案区块。';
+  } else if (solutionStepCount > 0) {
+    detail = `分步解答已显示 ${solutionStepCount} 步，后续内容会继续追加。`;
+  } else if (waitingForFirstSection) {
+    detail = '第一个完整区块尚未落盘，页面会在拿到可显示内容后立即刷新。';
+  }
+
+  return (
+    <div style={{
+      marginBottom: 14,
+      padding: 14,
+      borderRadius: 10,
+      border: '1px solid #d5e4fb',
+      background: 'linear-gradient(135deg, #f7fbff 0%, #eef5ff 100%)',
+      boxShadow: '0 10px 24px rgba(36, 94, 168, 0.08)',
+    }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap', alignItems: 'center' }}>
+        <div>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+            <span style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 6,
+              padding: '4px 10px',
+              borderRadius: 999,
+              background: '#245ea8',
+              color: '#fff',
+              fontSize: 12,
+              fontWeight: 700,
+            }}>
+              <span style={{ fontSize: 10 }}>●</span>
+              生成解答进行中
+            </span>
+            {elapsedLabel && (
+              <span style={{
+                fontSize: 12,
+                color: '#245ea8',
+                fontWeight: 600,
+              }}
+              >
+                已耗时 {elapsedLabel}
+              </span>
+            )}
+          </div>
+          <div style={{ marginTop: 8, fontSize: 15, fontWeight: 600, color: '#153e75', lineHeight: 1.45 }}>
+            {message}
+          </div>
+          <div style={{ marginTop: 6, fontSize: 13, color: '#466489', lineHeight: 1.5 }}>
+            {detail}
+          </div>
+        </div>
+        <div style={{
+          minWidth: 148,
+          padding: '10px 12px',
+          borderRadius: 8,
+          background: '#fff',
+          border: '1px solid #d5e4fb',
+        }}>
+          <div style={{ fontSize: 12, color: '#5d7290' }}>当前阶段</div>
+          <div style={{ marginTop: 4, fontWeight: 700, color: '#153e75' }}>
+            LLM {pipeline?.current_call ?? 2}/{pipeline?.total_calls ?? 4}
+          </div>
+          <div style={{ marginTop: 4, fontSize: 12, color: '#5d7290' }}>
+            已显示步骤 {solutionStepCount}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function GeminiProgress({ pipeline, done, liveMessage }: { pipeline: Pipeline | null; done: boolean; liveMessage?: string | null }) {
   if (!pipeline) return null;
   return (
@@ -995,7 +1217,7 @@ function GeminiProgress({ pipeline, done, liveMessage }: { pipeline: Pipeline | 
     }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
         <div>
-          <div style={{ fontWeight: 600 }}>Gemini 调用进度</div>
+          <div style={{ fontWeight: 600 }}>LLM 调用进度</div>
           <div style={mutedStyle}>
             已完成 {pipeline.completed_calls}/{pipeline.total_calls}
             {done ? ' · 当前任务已完成' : pipeline.current_call ? ` · 当前调用 ${pipeline.current_call}/${pipeline.total_calls}` : ''}
@@ -1030,7 +1252,7 @@ function GeminiProgress({ pipeline, done, liveMessage }: { pipeline: Pipeline | 
             >
               <div style={{ fontWeight: 600 }}>
                 {step.state === 'done' ? '✓ ' : step.state === 'active' ? '● ' : step.state === 'review' ? '⌛ ' : step.state === 'error' ? '⚠ ' : '○ '}
-                Gemini {step.call_index}/4 · {step.label}
+                LLM {step.call_index}/4 · {step.label}
               </div>
               <div style={{ fontSize: 12, marginTop: 2 }}>{step.description}</div>
               {step.state === 'active' && liveMessage && (
@@ -1078,6 +1300,7 @@ function SolutionSwitcher({
   solutions,
   currentSolutionId,
   creating,
+  actionLocked,
   onSelect,
   onCreate,
   onDelete,
@@ -1085,6 +1308,7 @@ function SolutionSwitcher({
   solutions: SolutionSummary[];
   currentSolutionId: string | null;
   creating: boolean;
+  actionLocked: boolean;
   onSelect: (solutionId: string) => void;
   onCreate: () => void;
   onDelete: (solutionId: string) => void;
@@ -1093,7 +1317,7 @@ function SolutionSwitcher({
     <div style={{ marginBottom: 14 }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
         <div style={{ fontWeight: 600 }}>解法版本</div>
-        <button className="btn btn-secondary" onClick={onCreate} disabled={creating}>
+        <button className="btn btn-secondary" onClick={onCreate} disabled={creating || actionLocked}>
           {creating ? '创建中…' : '新建解法'}
         </button>
       </div>
@@ -1107,6 +1331,7 @@ function SolutionSwitcher({
                 <button
                   type="button"
                   onClick={() => onSelect(solution.solution_id)}
+                  disabled={actionLocked}
                   style={{
                     border: active ? '1px solid #245ea8' : '1px solid #d9d9d9',
                     background: active ? '#eef5ff' : '#fff',
@@ -1114,7 +1339,8 @@ function SolutionSwitcher({
                     borderRadius: 999,
                     padding: '6px 12px',
                     fontSize: 12,
-                    cursor: 'pointer',
+                    cursor: actionLocked ? 'not-allowed' : 'pointer',
+                    opacity: actionLocked ? 0.6 : 1,
                   }}
                 >
                   {solution.title}
@@ -1124,6 +1350,7 @@ function SolutionSwitcher({
                   <button
                     type="button"
                     onClick={() => onDelete(solution.solution_id)}
+                    disabled={actionLocked}
                     style={{
                       border: '1px solid #f4c7c7',
                       background: '#fff',
@@ -1131,7 +1358,8 @@ function SolutionSwitcher({
                       borderRadius: 4,
                       padding: '4px 8px',
                       fontSize: 11,
-                      cursor: 'pointer',
+                      cursor: actionLocked ? 'not-allowed' : 'pointer',
+                      opacity: actionLocked ? 0.6 : 1,
                     }}
                     title="删除此解法"
                   >
@@ -1153,6 +1381,7 @@ function StageRerunBoard({
   noteDrafts,
   onNoteChange,
   actionPending,
+  actionLocked,
   onRerun,
   onClearIndex,
 }: {
@@ -1161,6 +1390,7 @@ function StageRerunBoard({
   noteDrafts: Record<string, string>;
   onNoteChange: (stage: string, value: string) => void;
   actionPending: string | null;
+  actionLocked: boolean;
   onRerun: (stage: string) => void;
   onClearIndex: () => void;
 }) {
@@ -1177,7 +1407,7 @@ function StageRerunBoard({
       <div style={{ display: 'grid', gap: 10 }}>
         {stages.map((stage) => {
           const review = stageReviews.find((item) => item.stage === stage);
-          const disabled = stage !== 'parsed' && !currentSolutionId;
+          const disabled = actionLocked || (stage !== 'parsed' && !currentSolutionId);
           const pending = actionPending === `${stage}:rerun`;
           return (
             <div key={stage} style={{ border: '1px solid #eee', borderRadius: 8, padding: 10 }}>
@@ -1211,6 +1441,7 @@ function StageRerunBoard({
                   <button
                     className="btn btn-secondary"
                     onClick={onClearIndex}
+                    disabled={actionLocked}
                     style={{ color: '#b42318' }}
                   >
                     清除索引
@@ -1239,7 +1470,7 @@ function summarizeReview(review: StageReview): string {
     return `方法模式 ${summary.method_pattern || '未识别'} · 步骤 ${summary.solution_step_count || 0} · 知识点 ${summary.knowledge_point_count || 0}`;
   }
   if (review.stage === 'visualizing') {
-    return `可视化 ${summary.visualization_count || 0} 个`;
+    return `规格 ${summary.candidate_count || 0} 个 · 主规格 ${summary.selected_visualization_id || '-'} · 已生成 ${summary.visualization_count || 0} 个`;
   }
   if (review.stage === 'indexing') {
     return `模式 ${summary.pattern_id || '-'} · 知识点 ${summary.kp_count || 0} · 检索单元 ${summary.retrieval_unit_count || 0}`;
@@ -1253,6 +1484,7 @@ function StageReviewPanel({
   noteValue,
   onNoteChange,
   actionPending,
+  actionLocked,
   onConfirm,
   onRerun,
 }: {
@@ -1261,6 +1493,7 @@ function StageReviewPanel({
   noteValue: string;
   onNoteChange: (stage: string, value: string) => void;
   actionPending: string | null;
+  actionLocked: boolean;
   onConfirm: (stage: string) => void;
   onRerun: (stage: string) => void;
 }) {
@@ -1317,10 +1550,10 @@ function StageReviewPanel({
         </div>
       </div>
       <div style={{ marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-        <button className="btn btn-secondary" onClick={() => onConfirm(review.stage)} disabled={confirming || rerunning}>
+        <button className="btn btn-secondary" onClick={() => onConfirm(review.stage)} disabled={confirming || rerunning || actionLocked}>
           {confirming ? '确认中…' : '确认并进入下一阶段'}
         </button>
-        <button className="btn btn-secondary" onClick={() => onRerun(review.stage)} disabled={confirming || rerunning}>
+        <button className="btn btn-secondary" onClick={() => onRerun(review.stage)} disabled={confirming || rerunning || actionLocked}>
           {rerunning ? '重跑中…' : '驳回并重跑本阶段'}
         </button>
       </div>
@@ -1427,10 +1660,12 @@ function ErrorPanel({
   events,
   onRetry,
   restarting,
+  actionLocked,
 }: {
   events: AnyEv[];
   onRetry: () => void;
   restarting: boolean;
+  actionLocked: boolean;
 }) {
   const latest = events[events.length - 1]?.data || {};
   const message = typeof latest?.message === 'string' ? latest.message : '解答失败。';
@@ -1450,7 +1685,7 @@ function ErrorPanel({
       color: '#8f1d1d',
     }}>
       <div style={{ fontWeight: 700, marginBottom: 8 }}>
-        {isTimeout ? 'Gemini 调用超时' : isServiceOverloaded ? 'Gemini 服务繁忙' : '解答失败'}
+        {isTimeout ? 'LLM 调用超时' : isServiceOverloaded ? 'LLM 服务繁忙' : '解答失败'}
       </div>
       <div style={{ lineHeight: 1.6 }}>{message}</div>
       {failedStage && (
@@ -1470,7 +1705,7 @@ function ErrorPanel({
         </details>
       )}
       <div style={{ marginTop: 12 }}>
-        <button className="btn btn-secondary" onClick={onRetry} disabled={restarting}>
+        <button className="btn btn-secondary" onClick={onRetry} disabled={restarting || actionLocked}>
           {restarting ? '重新启动中…' : '重新开始解答'}
         </button>
       </div>
@@ -1572,16 +1807,22 @@ function Outline({
 // ── Visualization section ─────────────────────────────────────────
 
 function VizPanel({
+  questionId,
   vizEvents,
+  visualizationPlan,
   fullWidth = false,
   onDeleteViz,
+  actionsLocked = false,
 }: {
+  questionId?: string;
   vizEvents: AnyEv[];
+  visualizationPlan?: any | null;
   fullWidth?: boolean;
   onDeleteViz?: (vizRef: string) => void;
+  actionsLocked?: boolean;
 }) {
   const [activeIdx, setActiveIdx] = useState(0);
-  if (vizEvents.length === 0) {
+  if (vizEvents.length === 0 && !visualizationPlan) {
     return (
       <div style={{
         padding: 12, border: '1px dashed #ddd', borderRadius: 6,
@@ -1592,6 +1833,7 @@ function VizPanel({
     );
   }
   const active = vizEvents[Math.min(activeIdx, vizEvents.length - 1)];
+  const resolvedParams = active ? deriveVizParams(active.data.execution_payload, active.data.spec_json) : [];
   return (
     <div style={{
       border: '1px solid #e5e7eb',
@@ -1600,6 +1842,8 @@ function VizPanel({
       padding: fullWidth ? 16 : 8,
       boxShadow: fullWidth ? '0 1px 3px rgba(0,0,0,0.04)' : 'none',
     }}>
+      {visualizationPlan && <VisualizationPlanCard plan={visualizationPlan} />}
+      {vizEvents.length > 0 && (
       <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 12 }}>
         {vizEvents.map((ev, i) => (
           <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
@@ -1620,12 +1864,14 @@ function VizPanel({
               <button
                 type="button"
                 onClick={() => onDeleteViz(ev.data.id || ev.data.viz_ref)}
+                disabled={actionsLocked}
                 style={{
                   border: 'none',
                   background: 'none',
                   color: '#b42318',
                   fontSize: 11,
-                  cursor: 'pointer',
+                  cursor: actionsLocked ? 'not-allowed' : 'pointer',
+                  opacity: actionsLocked ? 0.6 : 1,
                   padding: '2px 4px',
                 }}
                 title="删除此可视化"
@@ -1636,6 +1882,8 @@ function VizPanel({
           </div>
         ))}
       </div>
+      )}
+      {active ? (
       <div style={{ padding: fullWidth ? 12 : 8, border: '1px solid #eee', borderRadius: 10 }}>
         <div style={{ fontWeight: 700, marginBottom: 6, fontSize: fullWidth ? 18 : 16 }}>{active.data.title_cn}</div>
         <div style={{ ...mutedStyle, marginBottom: 10, fontSize: 13 }}>
@@ -1643,12 +1891,12 @@ function VizPanel({
         </div>
         <VizSandbox
           key={active.data.id}
+          questionId={questionId}
           vizId={active.data.id}
           engine={active.data.engine}
-          jsxCode={active.data.jsx_code}
-          ggbCommands={active.data.ggb_commands}
-          ggbSettings={active.data.ggb_settings}
-          params={active.data.params}
+          executionPayload={active.data.execution_payload}
+          params={resolvedParams}
+          specJson={active.data.spec_json ?? null}
           height={fullWidth ? 560 : 420}
         />
         {(active.data.interactive_hints || []).length > 0 && (
@@ -1662,8 +1910,185 @@ function VizPanel({
           <RichText text={active.data.caption_cn || ''} />
         </div>
       </div>
+      ) : (
+        <div style={{
+          padding: 12,
+          border: '1px dashed #ddd',
+          borderRadius: 10,
+          color: '#777',
+          fontSize: 13,
+        }}>
+          已生成可视化规格，正在等待代码生成完成。
+        </div>
+      )}
     </div>
   );
+}
+
+function VisualizationPlanCard({ plan }: { plan: any }) {
+  const visualizations = Array.isArray(plan?.visualizations) ? plan.visualizations : [];
+  const selected = plan?.selected_visualization ?? null;
+  if (!visualizations.length && !selected) return null;
+  return (
+    <div style={{
+      marginBottom: 12,
+      padding: 12,
+      border: '1px solid #e6ecf3',
+      borderRadius: 10,
+      background: '#fafcff',
+    }}>
+      <div style={{ fontWeight: 700, marginBottom: 6 }}>可视化规格</div>
+      <div style={{ ...mutedStyle, marginBottom: 8 }}>
+        Stage 1 已产出 {visualizations.length || (selected ? 1 : 0)} 个关键规格，Stage 2 为这些规格分别生成 GeoGebra 代码。
+      </div>
+      {selected && (
+        <div style={{ marginBottom: 10, lineHeight: 1.6 }}>
+          <div><strong>主规格:</strong> <RichText text={selected.title || selected.id || ''} /></div>
+          <div><strong>教学目标:</strong> <RichText text={selected.pedagogical_purpose || ''} /></div>
+          <div><strong>展示结论:</strong> <RichText text={selected.mathematical_claim_being_shown || ''} /></div>
+        </div>
+      )}
+      {!!visualizations.length && (
+        <div style={{ display: 'grid', gap: 8 }}>
+          {visualizations.map((item: any, idx: number) => {
+            const selectedId = String(selected?.id || plan?.selected_visualization_id || '');
+            const isSelected = Boolean(selectedId && item?.id === selectedId);
+            const isRecommended = Boolean(item?.recommended);
+            const highlighted = isSelected || (!selectedId && isRecommended);
+            return (
+              <div
+                key={item?.id || idx}
+                style={{
+                  border: `1px solid ${highlighted ? '#d5e4fb' : '#e5e7eb'}`,
+                  borderRadius: 8,
+                  padding: '8px 10px',
+                  background: highlighted ? '#eef5ff' : '#fff',
+                }}
+              >
+                <div style={{ fontWeight: 600 }}>
+                  {isSelected ? '已选 · ' : isRecommended ? '推荐 · ' : ''}
+                  <RichText text={item?.title || item?.id || `候选 ${idx + 1}`} />
+                </div>
+                <div style={{ ...mutedStyle, marginTop: 4 }}>
+                  <RichText text={item?.pedagogical_purpose || ''} />
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function deriveVizParams(executionPayload: any, spec: any): VizParam[] {
+  const specParams = Array.isArray(spec?.interaction_and_animation?.parameters)
+    ? spec.interaction_and_animation.parameters
+    : [];
+  const byName = new Map<string, any>(specParams.map((param: any) => [String(param?.name || ''), param]));
+  const interactionObjects = Array.isArray(executionPayload?.interaction_objects)
+    ? executionPayload.interaction_objects
+    : [];
+
+  if (interactionObjects.length) {
+    return interactionObjects.flatMap((obj: any) => {
+      const name = String(obj?.name || '');
+      const type = String(obj?.type || '').toLowerCase();
+      const param = byName.get(name);
+      if (!name || !param) return [];
+      if (type === 'checkbox') {
+        return [{
+          name,
+          label_cn: String(param?.meaning || name),
+          kind: 'toggle' as const,
+          default: parseBooleanValue(param.default_value),
+        }];
+      }
+      if (type !== 'slider') return [];
+      const range = parseStructuredRange(param?.range, String(param?.type || '').toLowerCase())
+        ?? parseNumericRange(param?.range_or_values, String(param?.type || '').toLowerCase());
+      if (!range) return [];
+      return [{
+        name,
+        label_cn: String(param?.meaning || name),
+        kind: 'slider' as const,
+        min: range.min,
+        max: range.max,
+        step: range.step,
+        default: parseNumericValue(param.default_value, range.min),
+      }];
+    });
+  }
+
+  return specParams.flatMap((param: any) => {
+    const type = String(param?.type || '').toLowerCase();
+    const label = String(param?.meaning || param?.name || '');
+    if (!param?.name) return [];
+    if (type === 'boolean') {
+      return [{
+        name: String(param.name),
+        label_cn: label,
+        kind: 'toggle' as const,
+        default: parseBooleanValue(param.default_value),
+      }];
+    }
+    const range = parseStructuredRange(param?.range, type)
+      ?? parseNumericRange(param?.range_or_values, type);
+    if (!range) return [];
+    return [{
+      name: String(param.name),
+      label_cn: label,
+      kind: 'slider' as const,
+      min: range.min,
+      max: range.max,
+      step: range.step,
+      default: parseNumericValue(param.default_value, range.min),
+    }];
+  });
+}
+
+function parseBooleanValue(value: unknown): boolean {
+  if (typeof value === 'boolean') return value;
+  return String(value || '').toLowerCase() === 'true';
+}
+
+function parseNumericValue(value: unknown, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function parseStructuredRange(
+  value: unknown,
+  type: string,
+): { min: number; max: number; step: number } | null {
+  if (!value || typeof value !== 'object') return null;
+  const range = value as { min?: unknown; max?: unknown; step?: unknown };
+  const min = Number(range.min);
+  const max = Number(range.max);
+  const step = range.step === undefined
+    ? (type === 'integer_step' ? 1 : 0.1)
+    : Number(range.step);
+  if (!Number.isFinite(min) || !Number.isFinite(max) || min >= max) {
+    return null;
+  }
+  return {
+    min,
+    max,
+    step: Number.isFinite(step) && step > 0 ? step : (type === 'integer_step' ? 1 : 0.1),
+  };
+}
+
+function parseNumericRange(value: unknown, type: string): { min: number; max: number; step: number } | null {
+  if (typeof value !== 'string') return null;
+  const numbers = value.match(/-?\d+(?:\.\d+)?/g)?.map(Number) ?? [];
+  if (numbers.length < 2) return null;
+  const explicitStep = value.match(/step\s*[:=]?\s*(-?\d+(?:\.\d+)?)/i);
+  const step = explicitStep ? Number(explicitStep[1]) : (type === 'integer_step' ? 1 : 0.1);
+  return {
+    min: numbers[0],
+    max: numbers[1],
+    step: Number.isFinite(step) && step > 0 ? step : 0.1,
+  };
 }
 
 function ToastNotification({

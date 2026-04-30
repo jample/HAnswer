@@ -11,14 +11,17 @@ Streaming behavior
     ``GeminiClient.call_structured_streaming`` and an incremental JSON
     parser, so each top-level field of ``AnswerPackage`` becomes an SSE
     event the moment it finishes streaming from Gemini. ``solution_steps``
-    arrives as a single JSON array, then is fanned out into one
-    ``solution_step`` event per step. On streaming-parse failure the
+    is additionally emitted item-by-item as each step object closes,
+    so students can start reading the derivation earlier. On
+    streaming-parse failure the
     repair loop falls back to the bulk path and emits all events
     after the recovered package is validated.
 """
 
 from __future__ import annotations
 
+import logging
+import time
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -32,6 +35,8 @@ from app.db.models import AnswerPackageSection, SolutionStepRow
 from app.prompts import PromptRegistry
 from app.schemas import AnswerPackage, ParsedQuestion
 from app.services.llm_client import GeminiClient, LLMError, PromptLogContext
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -54,6 +59,10 @@ def _shape_field(key: str, value: object) -> list[SSEEvent]:
             if isinstance(step, dict):
                 out.append(SSEEvent("solution_step", step))
         return out
+    if key == "solution_steps[]":
+        if isinstance(value, dict):
+            return [SSEEvent("solution_step", value)]
+        return []
     if key == "key_points_of_answer":
         return [SSEEvent("key_points_of_answer", {"items": list(value or [])})]
     if key == "method_pattern":
@@ -75,8 +84,9 @@ def _sections(pkg: AnswerPackage) -> list[SSEEvent]:
     ]
     for step in pkg.solution_steps:
         events.append(SSEEvent("solution_step", step.model_dump()))
-    # Visualization events are appended by the VizCoder service; this stream
-    # intentionally skips them so the Solver milestone is independent.
+    # Visualization events are produced later by the visualizing stage
+    # (spec planning plus JSXGraph code generation), so the solver stream
+    # intentionally skips them and keeps the solving milestone independent.
     events.extend([
         SSEEvent("key_points_of_answer", {"items": pkg.key_points_of_answer}),
         SSEEvent("method_pattern", pkg.method_pattern.model_dump()),
@@ -186,7 +196,7 @@ async def generate_answer(
         try:
             pkg = await llm.call_structured(
                 template=solver,
-                model=settings.gemini.model_solver,
+                model=settings.llm_model("solver"),
                 model_cls=AnswerPackage,
                 template_kwargs=kwargs,
                 messages_override=messages_override,
@@ -210,12 +220,16 @@ async def generate_answer(
     # AnswerPackage finishes streaming. Track which sections we already
     # emitted so the post-validation _persist doesn't double-fire.
     emitted_sections: set[str] = set()
+    emitted_step_indexes: set[int] = set()
     pkg: AnswerPackage | None = None
+    solver_t0 = time.perf_counter()
+    first_field_ms: int | None = None
+    streamed_field_count = 0
 
     try:
         async for item in llm.call_structured_streaming(
             template=solver,
-            model=settings.gemini.model_solver,
+            model=settings.llm_model("solver"),
             model_cls=AnswerPackage,
             template_kwargs=kwargs,
             messages_override=messages_override,
@@ -226,20 +240,73 @@ async def generate_answer(
                 related={"user_guidance": user_guidance or ""},
             ),
             timeout_s=settings.llm.solver_timeout_s,
+            stream_recovery_timeout_s=settings.llm.solver_stream_recovery_timeout_s,
         ):
             if isinstance(item, AnswerPackage):
                 pkg = item
                 break
             # (key, value) tuple from the streaming parser.
             key, value = item
+            streamed_field_count += 1
+            if first_field_ms is None:
+                first_field_ms = int((time.perf_counter() - solver_t0) * 1000)
+                log.info(
+                    "solver first streamed field question_id=%s solution_id=%s key=%s first_field_ms=%s",
+                    question_id,
+                    solution_id,
+                    key,
+                    first_field_ms,
+                )
+            if key == "solution_steps":
+                step_count = len(value) if isinstance(value, list) else 0
+                log.info(
+                    "solver streamed field question_id=%s solution_id=%s key=%s step_count=%s",
+                    question_id,
+                    solution_id,
+                    key,
+                    step_count,
+                )
+            elif key == "solution_steps[]":
+                step_index = value.get("step_index") if isinstance(value, dict) else None
+                log.info(
+                    "solver streamed step question_id=%s solution_id=%s step_index=%s",
+                    question_id,
+                    solution_id,
+                    step_index,
+                )
+            else:
+                log.info(
+                    "solver streamed field question_id=%s solution_id=%s key=%s",
+                    question_id,
+                    solution_id,
+                    key,
+                )
             for ev in _shape_field(key, value):
-                emitted_sections.add(ev.name)
+                if ev.name == "solution_step":
+                    step_index = ev.data.get("step_index") if isinstance(ev.data, dict) else None
+                    if isinstance(step_index, int) and step_index in emitted_step_indexes:
+                        continue
+                    if isinstance(step_index, int):
+                        emitted_step_indexes.add(step_index)
+                else:
+                    emitted_sections.add(ev.name)
                 yield ev
     except LLMError:
         raise
 
     if pkg is None:
         raise LLMError("solver streaming finished without a validated AnswerPackage")
+
+    total_elapsed_ms = int((time.perf_counter() - solver_t0) * 1000)
+    log.info(
+        "solver completed question_id=%s solution_id=%s streamed_field_count=%s first_field_ms=%s total_elapsed_ms=%s solution_step_count=%s",
+        question_id,
+        solution_id,
+        streamed_field_count,
+        first_field_ms,
+        total_elapsed_ms,
+        len(pkg.solution_steps),
+    )
 
     # Persist the validated package + all sections (idempotent rewrite).
     await _persist(session, question_id, pkg)
@@ -250,11 +317,8 @@ async def generate_answer(
     # the polling side; for the SSE consumer we simply emit the gap.
     for ev in _sections(pkg):
         if ev.name == "solution_step":
-            # Steps are emitted individually; identify by step_index.
-            already = any(
-                e == ev.name for e in emitted_sections
-            )
-            if already:
+            step_index = ev.data.get("step_index") if isinstance(ev.data, dict) else None
+            if isinstance(step_index, int) and step_index in emitted_step_indexes:
                 continue
         if ev.name in emitted_sections:
             continue

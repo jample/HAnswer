@@ -420,7 +420,7 @@ async def append_message(
     try:
         llm_result = await llm.call_structured(
             template=prompt_template,
-            model=settings.dialog.model_chat,
+            model=settings.llm_model("dialog"),
             model_cls=ConversationTurnResult,
             template_kwargs={
                 "session_title": session_title,

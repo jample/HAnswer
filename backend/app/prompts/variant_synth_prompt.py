@@ -85,14 +85,14 @@ class VariantSynthPrompt(PromptTemplate):
 
     def system_message(self, **kwargs: Any) -> str:
         return (
-            "你是一位中文数学/物理出题老师。你的任务是在保留 method_pattern "
-            "(解题方法模式) 不变的前提下, 为给定源题目合成 N 道变体。\n\n"
-            "硬性要求:\n"
-            "  1. 每道变体的解法必须仍然使用源题提供的 general_procedure。\n"
-            "  2. 必须改变: 数字参数 / 命名对象 / 情境描述 中至少两项。\n"
-            "  3. 必须输出 answer_outline (解答要点) 与 rubric (评分提示)。\n"
-            "  4. 公式统一 LaTeX, 以 $ 包裹。\n"
-            "  5. 仅输出符合以下 JSON Schema 的 JSON, 不要附加任何解释文字:\n\n"
+            "You are a math / physics problem writer for Chinese middle-school and high-school students. Your task is to synthesize N variants of the given source problem while preserving the same method_pattern.\n\n"
+            "Hard requirements:\n"
+            "  1. Every variant must still use the source problem's general_procedure.\n"
+            "  2. Change at least two of the following: numbers, named objects, or surface scenario/context.\n"
+            "  3. Every variant must include answer_outline and rubric.\n"
+            "  4. Use LaTeX wrapped in $...$ for formulas.\n"
+            "  5. All human-readable text fields in the JSON must be in Simplified Chinese.\n"
+            "  6. Output only JSON matching the schema below. Do not add any explanation.\n\n"
             f"{json.dumps(self.schema, ensure_ascii=False, indent=2)}"
         )
 
@@ -101,12 +101,13 @@ class VariantSynthPrompt(PromptTemplate):
         count = int(kwargs.get("count", 3))
         difficulty_target = kwargs.get("difficulty_target")
         return (
-            "源题目信息:\n"
+            "Source problem information:\n"
             f"{json.dumps(source, ensure_ascii=False, indent=2)}\n\n"
-            f"请生成 {count} 道变体, 每道变体的 same_pattern 字段必须为 true。\n"
+            f"Please generate {count} variants. For every variant, same_pattern must be true.\n"
             + (
-                f"目标难度: {difficulty_target} (1-5)。"
+                f"Target difficulty: {difficulty_target} (1-5)."
                 if difficulty_target is not None else
-                "难度可在源题难度 ±1 范围内浮动。"
+                "Difficulty may vary within ±1 of the source problem."
             )
+            + "\nAll human-readable output text should be in Simplified Chinese."
         )

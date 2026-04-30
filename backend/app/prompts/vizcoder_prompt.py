@@ -6,13 +6,14 @@ import json
 from typing import Any
 
 from app.config import settings
+from app.prompts._audience import curriculum_boundary_block
 from app.prompts.base import DesignDecision, PromptTemplate, PromptVersion
 from app.prompts.schemas import VISUALIZATION_LIST_SCHEMA
 
 
 GGB_CHEATSHEET = """\
-# GeoGebra 命令速查 (engine="geogebra" 时使用)
-# 命令名必须使用英文; 一行一个命令; 命令之间没有分号。
+# GeoGebra cheatsheet (use when engine="geogebra")
+# Command names must be English. One command per line. No semicolons between commands.
 
 ## 1. 点 / 向量
 A=(2,3)
@@ -52,19 +53,19 @@ SetColor(c1, 255, 0, 0)
 SetLineStyle(l1, 2)
 SetLineThickness(l1, 4)
 
-## 6. 参数与视图规范
-- ggb_commands 只负责“定义对象”, 例如 `a=Slider(-3,3,0.1)`、`flag=false`。
-- 不要在 ggb_commands 中写 `SetValue(a, 1.2)` / `SetValue(flag, true)`。
-- 初始值写到 params[].default; 前端会在对象创建后自动同步 default。
-- 若某个滑块/开关出现在 params 里, ggb_commands 中必须有同名定义。
-- 视图范围、网格、坐标轴、视角放进 ggb_settings, 不要写进 ggb_commands。
-- 不要使用 `SetConditionToShowObject(...)`; 请改成 `If(...)` 条件定义。
-- 依赖点位移必须写 `P=(x(K)+dx, y(K)+dy)`; 禁止 `P=K+(dx,dy)`。
-- SetColor 必须用 RGB 三元组, 禁止色名字符串。
+## 6. Parameters and view rules
+- ggb_commands should only define objects, for example `a=Slider(-3,3,0.1)` or `flag=false`.
+- Do not write `SetValue(a, 1.2)` / `SetValue(flag, true)` in ggb_commands.
+- Put initial values in params[].default; the frontend will sync them after object creation.
+- If a slider / toggle appears in params, ggb_commands must define an object with the same name.
+- Put view range, grid, axes, and perspective in ggb_settings, not in ggb_commands.
+- Do not use `SetConditionToShowObject(...)`; use conditional definitions with `If(...)` instead.
+- Dependent point offsets must be written as `P=(x(K)+dx, y(K)+dy)`; do not write `P=K+(dx,dy)`.
+- SetColor must use an RGB triplet, not a named color string.
 """
 
 H_CHEATSHEET = """\
-# JSXGraph helper `H` (engine="jsxgraph" 时推荐优先使用)
+# JSXGraph helper `H` (prefer this when engine="jsxgraph")
 
 ## 1. 图形 / 曲线
 H.shapes.circle(cx, cy, r, attrs)
@@ -104,17 +105,17 @@ H.anim.oscillate({
 
 H.anim.animate(paramName, from, to, durationMs, onUpdate)
 
-## 4. JSXGraph 控制器模式
-推荐返回:
+## 4. JSXGraph controller pattern
+Recommended return value:
 {
   update: function(nextParams) { ... },
   destroy: function() { ... }
 }
 
-规则:
-- 先创建对象, 再在动画帧里更新坐标/函数/文本, 不要每帧重建整张图。
-- 动画里修改对象后调用 `board.update()` 的工作由 `H.anim.loop(...)` 完成。
-- 参数变化时在 `update(nextParams)` 内同步状态, 保持学生拖动控件和自动动画一致。
+Rules:
+- Create objects once, then update coordinates / functions / text inside animation frames. Do not rebuild the whole board every frame.
+- After mutating objects inside animation, `H.anim.loop(...)` handles the `board.update()` call.
+- When parameters change, sync state inside `update(nextParams)` so drag interactions and automatic animation remain consistent.
 """
 
 ALLOWED_GLOBALS = [
@@ -139,81 +140,117 @@ def _preferred_engine(kwargs: dict[str, Any]) -> str:
     return "jsxgraph"
 
 
+_FEWSHOT_VIZCODER_USER = {
+    "parsed_question": {"subject": "math", "grade_band": "junior", "question_text": "通过图像理解二次函数交点"},
+    "answer_package": {"solution_steps": [{"step_index": 1, "statement": "先画出函数图像并标出交点。"}]},
+}
+
+_FEWSHOT_VIZCODER_ASSISTANT = {
+    "visualizations": [
+        {
+            "id": "viz_batch_example_1",
+            "title_cn": "交点建立",
+            "caption_cn": "先固定抛物线，再看与 x 轴的交点位置。",
+            "learning_goal": "建立函数图像与交点的联系",
+            "interactive_hints": ["拖动参数观察交点变化"],
+            "helpers_used": [],
+            "engine": "geogebra",
+            "jsx_code": "",
+            "ggb_commands": ["t=Slider(-2,2,0.1)", "f(x)=x^2-2*x+t", "A=Intersect(f,xAxis,1)", "B=Intersect(f,xAxis,2)"],
+            "ggb_settings": {"app_name": "graphing", "axes_visible": True, "grid_visible": True},
+            "params": [{"name": "t", "label_cn": "参数 t", "kind": "slider", "min": -2, "max": 2, "step": 0.1, "default": 0}],
+            "animation": None,
+        },
+        {
+            "id": "viz_batch_example_2",
+            "title_cn": "顶点比较",
+            "caption_cn": "补出顶点后再判断最值位置。",
+            "learning_goal": "理解顶点与最值",
+            "interactive_hints": [],
+            "helpers_used": [],
+            "engine": "geogebra",
+            "jsx_code": "",
+            "ggb_commands": ["t=Slider(-2,2,0.1)", "f(x)=x^2-2*x+t", "V=Extremum(f)"],
+            "ggb_settings": {"app_name": "graphing", "axes_visible": True, "grid_visible": True},
+            "params": [{"name": "t", "label_cn": "参数 t", "kind": "slider", "min": -2, "max": 2, "step": 0.1, "default": 0}],
+            "animation": None,
+        }
+    ]
+}
+
+
 def _engine_policy_block(preferred_engine: str) -> str:
     if preferred_engine == "geogebra":
         return """\
-## 引擎选择 (重要)
-- engine="geogebra" — 当前服务端配置的默认引擎, 优先使用。
-  - 适合标准函数图、平面几何、圆锥曲线、立体几何、滑块驱动的规范作图。
-  - 输出 ggb_commands: ["...", "..."], 每条一个 GeoGebra 命令字符串;
-    jsx_code 留空字符串。
-  - ggb_settings.app_name 可选 classic / geometry / graphing / 3d / suite。
-  - 滑块/开关初值写到 params[].default, 不要写 SetValue(...).
+## Engine selection (important)
+- engine="geogebra" — this is the current server-side default and should be preferred.
+    - Best for standard function graphs, plane geometry, conic sections, solid geometry, and structured slider-driven constructions.
+    - Output ggb_commands as ["...", "..."]; each entry is one GeoGebra command string.
+        jsx_code should be an empty string.
+    - ggb_settings.app_name may be classic / geometry / graphing / 3d / suite.
+    - Put slider / toggle initial values in params[].default, not in SetValue(...).
 
-- engine="jsxgraph" — 作为可选引擎保留。
-  - 当题目需要更自由的动画、逐帧物理示意、自定义轨迹、局部重绘或
-    更精细的交互控制时, 可改用 JSXGraph。
-  - 输出 jsx_code (函数体), ggb_commands 留空数组。
+- engine="jsxgraph" — keep this as an optional engine.
+    - Use it when the problem clearly needs freer animation, frame-by-frame physics illustration, custom trajectories, local redraws, or finer interaction control.
+    - Output jsx_code (function body) and leave ggb_commands as an empty array.
 """
     return """\
-## 引擎选择 (重要)
-- engine="jsxgraph" — 当前服务端配置的默认引擎, 优先使用。
-  - 当你要做“参数变化带动画”“函数/几何对象随时间连续运动”“物理过程逐帧演示”
-    或需要较自由的交互逻辑时, 默认就用 JSXGraph。
-  - 输出 jsx_code (函数体), ggb_commands 留空数组。
-  - 优先写“创建对象一次 + 返回 controller.update/destroy + 用 H.anim.* 驱动”的结构。
-  - 至少 1 张图应在合适时包含轻量动画或显式动态过程展示; 若题目本质静态,
-    则至少提供连续可拖动/可滑动的参数变化。
+## Engine selection (important)
+- engine="jsxgraph" — this is the current server-side default and should be preferred.
+    - Use JSXGraph by default for animated parameter changes, continuous motion of functions / geometric objects, frame-by-frame physics demonstrations, or freer interaction logic.
+    - Output jsx_code (function body) and leave ggb_commands as an empty array.
+    - Prefer the stable structure: create objects once + return controller.update/destroy + drive motion with H.anim.*.
+    - At least one figure should include lightweight animation or explicit dynamic behavior when the problem naturally involves continuous change. If the problem is fundamentally static, provide at least continuous slider / draggable parameter change.
 
-- engine="geogebra" — 作为可选引擎保留。
-  - 当题目是标准欧式几何作图、GeoGebra 表达更直接且更稳时, 可使用 GeoGebra。
-  - 输出 ggb_commands: ["...", "..."], jsx_code 留空字符串。
+- engine="geogebra" — keep this as an optional engine.
+    - Use GeoGebra when the problem is standard Euclidean construction or when GeoGebra is clearly more direct and stable.
+    - Output ggb_commands: ["...", "..."] and leave jsx_code as an empty string.
 """
 
 
 def _engine_specific_rules(preferred_engine: str) -> str:
     if preferred_engine == "geogebra":
         return """\
-## GeoGebra 规范 (engine=geogebra 时)
-- 一行一个命令, 不要含换行或 ggbApplet 前缀。
-- ggb_commands 只放创建对象/样式/动画的命令; 视图/坐标轴/网格/视角放进 ggb_settings。
-- 变量/对象名禁止使用希腊字母英文别名 (alpha, beta, theta, ...); 会被 GeoGebra 改名。
-- 依赖另一个点的位移必须写 `P=(x(K)+dx, y(K)+dy)`。
-- 禁止 `SetValue(...)`、`SetConditionToShowObject(...)`、`Line(ax+by=c)` 包装写法。
-- 单条命令 ≤ 512 字符, 总命令数 ≤ 64。
+## GeoGebra rules (when engine=geogebra)
+- One command per line. Do not include newlines inside a command or add a ggbApplet prefix.
+- Put only object / style / animation creation commands in ggb_commands; put view / axes / grid / perspective in ggb_settings.
+- Do not use Greek-letter English aliases as variable names (alpha, beta, theta, ...); GeoGebra will rename them.
+- Dependent offsets from another point must be written as `P=(x(K)+dx, y(K)+dy)`.
+- Do not use wrappers such as `SetValue(...)`, `SetConditionToShowObject(...)`, or `Line(ax+by=c)`.
+- Max command length is 512 characters; max total command count is 64.
 
-## JSXGraph 备用规范 (engine=jsxgraph 时)
-- jsx_code 只写 **函数体本身**, 不要输出外层
-  `function(board, JXG, H, params) { ... }` 包装。
-- 返回 `{ update(nextParams), destroy() }` 或 `undefined`。
-- 安全: 仅可使用全局 __ALLOW__; 严禁使用 __FORBID__。
-- 若需要动画, 优先用 `H.anim.loop(...)` / `H.anim.oscillate(...)`。
+## Fallback JSXGraph rules (when engine=jsxgraph)
+- jsx_code must contain only the **function body**, not an outer wrapper like
+    `function(board, JXG, H, params) { ... }`.
+- Return `{ update(nextParams), destroy() }` or `undefined`.
+- Safety: allowed globals are only __ALLOW__; forbidden globals are __FORBID__.
+- When animation is needed, prefer `H.anim.loop(...)` / `H.anim.oscillate(...)`.
 """
     return """\
-## JSXGraph 规范 (engine=jsxgraph 时)
-- jsx_code 只写 **函数体本身**, 不要输出外层
-  `function(board, JXG, H, params) { ... }` 包装。
-- 推荐结构:
-  1. 读取 `params` 建立初始状态
-  2. 创建点/线/曲线/文字对象
-  3. 写一个 `sync(...)` 更新对象位置/文本/样式
-  4. 若需要动画, 用 `H.anim.loop(...)` / `H.anim.oscillate(...)`
-  5. 返回 `{ update(nextParams), destroy() }`
-- 动画应是轻量的: 更新已有对象, 不要每帧 `board.create(...)` 重建对象。
-- 优先用 `H.*` 帮手, 仅在必要时直接调用 `board.create(...)`。
-- 安全: 仅可使用全局 __ALLOW__; 严禁使用 __FORBID__。
-- 禁止字符串形式的 setTimeout/setInterval, 禁止 import/require/with。
+## JSXGraph rules (when engine=jsxgraph)
+- jsx_code must contain only the **function body**, not an outer wrapper like
+    `function(board, JXG, H, params) { ... }`.
+- Recommended structure:
+    1. read `params` and initialize state
+    2. create points / lines / curves / text objects
+    3. write a `sync(...)` function that updates positions / text / style
+    4. if animation is needed, use `H.anim.loop(...)` / `H.anim.oscillate(...)`
+    5. return `{ update(nextParams), destroy() }`
+- Animation should be lightweight: update existing objects instead of rebuilding with `board.create(...)` every frame.
+- Prefer the `H.*` helpers and call `board.create(...)` directly only when necessary.
+- Safety: allowed globals are only __ALLOW__; forbidden globals are __FORBID__.
+- Do not use string-based setTimeout / setInterval. Do not use import / require / with.
 
-## GeoGebra 备用规范 (engine=geogebra 时)
-- ggb_commands 一行一个命令, 只放创建对象/样式/动画命令。
-- 滑块/开关初值写入 params[].default, 不要写 SetValue(...).
-- 视图设置放进 ggb_settings, 不要把 SetCoordSystem / ShowGrid / ShowAxes 写进 ggb_commands。
+## Fallback GeoGebra rules (when engine=geogebra)
+- Put one command per line in ggb_commands and include only object / style / animation commands.
+- Put slider / toggle initial values in params[].default, not in SetValue(...).
+- Put view settings in ggb_settings; do not write SetCoordSystem / ShowGrid / ShowAxes in ggb_commands.
 """
 
 
 class VizCoderPrompt(PromptTemplate):
 
-    version = PromptVersion(major=4, minor=0, date_updated="2026-04-20")
+    version = PromptVersion(major=4, minor=1, date_updated="2026-04-22")
     name = "vizcoder"
 
     purpose = (
@@ -292,6 +329,12 @@ class VizCoderPrompt(PromptTemplate):
     def schema(self) -> dict:
         return VISUALIZATION_LIST_SCHEMA
 
+    def fewshot_examples(self, **kwargs: Any) -> list[dict]:
+        return [
+            {"role": "user", "content": "Example compact input\n" + json.dumps(_FEWSHOT_VIZCODER_USER, ensure_ascii=False, indent=2)},
+            {"role": "assistant", "content": json.dumps(_FEWSHOT_VIZCODER_ASSISTANT, ensure_ascii=False, indent=2)},
+        ]
+
     def system_message(self, **kwargs: Any) -> str:
         preferred_engine = _preferred_engine(kwargs)
         schema_str = json.dumps(self.schema, indent=2, ensure_ascii=False)
@@ -307,14 +350,16 @@ class VizCoderPrompt(PromptTemplate):
   解答, 帮助学生理解解题过程, 而不是凭题目自由发挥。
 - 在动笔之前, 先按下列顺序通读 AnswerPackage:
   1. method_pattern / key_points_of_answer — 决定整组图的主题。
-  2. solution_steps[] — 找出最关键、最难想象的 2-3 步, 为它们各配一张图;
+    2. solution_steps[] — 只选最关键、最难想象的 2 步, 为它们各配一张图;
      若该步已有 viz_ref, 沿用同一 id, caption_cn 中复述该步的核心结论。
   3. formulas — 关键公式必须在图中体现为曲线、几何关系、向量、运动轨迹或标注。
   4. pitfalls — 若有分类讨论、边界情形、临界值, 优先做成可切换或可拖动的对比图。
   5. final_answer / 最终结论 — 图中应明确标出关键结果, 让学生看到“答案在图上如何出现”。
-- **必须生成 3-4 个可视化**。
-  - 不同可视化要覆盖不同关键阶段, 不要重复画同一件事。
-  - 若题目存在分类讨论或多个情形, 必须至少有一张图覆盖这些情形。
+- **生成 1 或 2 个可视化, 不要凑数**。
+    - 只保留最重要的 1-2 个学习难点或关键阶段。
+    - 若只需要 1 张图就能把关键困难讲清, 不要机械补到 2 张。
+    - 若生成 2 张图, 它们必须覆盖不同关键阶段, 不要重复画同一件事。
+    - 若题目存在真正关键的分类讨论或多个情形, 应把其中一个名额留给它。
   - 每图必须有清晰的 learning_goal。
 - **符号一致性 (重要)**:
   - 可视化中的几何对象、点、参数必须复用题目和解答中的符号。
@@ -322,6 +367,10 @@ class VizCoderPrompt(PromptTemplate):
   - 不要凭空引入无意义的新滑块名; 若题面/解答已有 `t`, 优先直接用 `t`。
   - params[].label_cn 用题目/解答里的中文术语。
   - caption_cn / interactive_hints 里的参数名必须与渲染代码中一致。
+- **学段约束 (重要)**:
+    - ParsedQuestion.subject 与 ParsedQuestion.grade_band 是硬性课程边界。
+    - 若 grade_band=junior, 只能使用初中阶段学生已经学过、也能理解的知识来组织图示与说明。
+    - 不要用高中知识去解释初中题, 否则会增加理解负担。
 - caption_cn 用简体中文一句话说明该图如何对应解答中的某一步; 可含 LaTeX, 用 $...$ 包裹。
 - interactive_hints 给学生明确操作建议。
 - 严禁生成与 AnswerPackage 中任何步骤、公式或结论无关的装饰性图。
@@ -368,11 +417,11 @@ __SCHEMA__
         pitfall_lines = [f"  - {p}" for p in pitfalls]
         coverage_hint = (
             "\n\n## 覆盖要求 (必须遵守)\n"
-            "- 从上面的 solution_steps 中选出 **至少 3 个关键阶段** 各配一张图,\n"
+            "- 从上面的 solution_steps / pitfalls / final_answer 中选出 **最重要的 2 个关键阶段或难点** 各配一张图,\n"
             "  并在每张图的 caption_cn 中明确写出对应的 step 编号 (例如 “对应解答 step 2”)。\n"
             "- 若某些 step 的 viz_ref 已给出, 优先为它们生成, id 必须同名。\n"
-            "- pitfalls 中的分类讨论/临界情形必须有一张可切换或可拖动的对比图覆盖。\n"
-            "- visualizations 数量 3-4 个; 绝不可交 1-2 个, 也不要超过 4 个。\n"
+            "- 若 pitfalls 中的分类讨论/临界情形属于最重要难点之一, 必须有一张可切换或可拖动的对比图覆盖。\n"
+            "- visualizations 数量必须正好 2 个; 绝不可交 1 个, 也不要超过 2 个。\n"
         )
         engine_hint = (
             '当前默认引擎: JSXGraph。优先输出 engine="jsxgraph"，'
@@ -386,12 +435,14 @@ __SCHEMA__
         return (
             "## ParsedQuestion\n"
             + json.dumps(parsed_question, indent=2, ensure_ascii=False)
+            + "\n\n"
+            + curriculum_boundary_block(parsed_question, language="zh")
             + "\n\n## AnswerPackage (不含 visualizations)\n"
             + json.dumps(answer_package, indent=2, ensure_ascii=False)
             + steps_block
             + pitfalls_block
             + coverage_hint
-            + "\n请基于上面的 AnswerPackage 生成 3-4 个交互式可视化。"
+            + "\n请基于上面的 AnswerPackage 只生成 2 个交互式可视化。"
             + "\n" + engine_hint
             + "\n要求:"
             + "\n- 在写代码/命令前, 先列出 ParsedQuestion / AnswerPackage 中已经"

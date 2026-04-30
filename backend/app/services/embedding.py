@@ -1,13 +1,14 @@
 """Embedding service (§3.6.2 step 4, §5.4).
 
-Two dense-embedding providers share a `DenseEmbedder` protocol:
+Three dense-embedding providers share a `DenseEmbedder` protocol:
 
-  - `EmbeddingService` — Gemini embedding API (default).
+  - `OpenAIEmbeddingService` — OpenAI-compatible embedding API (default).
+  - `EmbeddingService` — Gemini embedding API.
   - `BGEM3DenseEmbedder` — local BAAI/bge-m3 dense head (optional dep).
 
 Both normalize output to `list[float]` so callers never branch on
 backend. The factory `build_dense_embedder()` picks the right one
-based on `settings.retrieval.embedder`.
+based on `settings.embedding.provider`.
 
 `gemini-embedding-2-preview` exposes several knobs we use:
 
@@ -104,8 +105,8 @@ class DenseEmbedder(Protocol):
 # ── helpers ─────────────────────────────────────────────────────────
 
 
-def _is_v2_model() -> bool:
-    return settings.gemini.model_embed in _V2_EMBED_MODELS
+def _is_v2_model(model: str | None = None) -> bool:
+    return (model or settings.embedding.model) in _V2_EMBED_MODELS
 
 
 def _format_v2_payload(*, text: str, task_kind: TaskKind, title: str) -> str:
@@ -220,7 +221,7 @@ def _mean_pool(vectors: list[list[float]]) -> list[float]:
 
 @dataclass
 class EmbeddingService:
-    """Gemini-backed dense embedder (default).
+    """Gemini-backed dense embedder.
 
     All public methods are safe against oversize inputs: long texts are
     chunked + mean-pooled rather than truncated.
@@ -269,7 +270,8 @@ class EmbeddingService:
         #    inside the payload, so we still only need to group by
         #    task_kind for the legacy task_type API path.
         grouped: dict[TaskKind, list[tuple[int, str]]] = {}
-        v2 = _is_v2_model()
+        model = settings.embedding.model
+        v2 = _is_v2_model(model)
         for global_idx, chunk in enumerate(all_chunks):
             kind = items[chunk.item_idx].task_kind
             title = items[chunk.item_idx].title
@@ -286,7 +288,7 @@ class EmbeddingService:
             payloads = [e[1] for e in entries]
             vecs = await self.llm.embed(
                 payloads,
-                model=settings.gemini.model_embed,
+                model=model,
                 task_type=None if v2 else kind,
                 prompt_context=self.prompt_context,
             )
@@ -312,7 +314,78 @@ class EmbeddingService:
 
     @property
     def dim(self) -> int:
-        return settings.gemini.embed_dim
+        return settings.embedding.dimensions
+
+
+@dataclass
+class OpenAIEmbeddingService:
+    """OpenAI-compatible dense embedder.
+
+    The transport applies the configured output dimensionality and
+    normalizes vectors so Milvus can keep using inner product.
+    """
+
+    llm: GeminiClient
+    prompt_context: PromptLogContext | None = None
+    _max_chars: int = _MAX_CHARS_PER_CALL
+
+    async def embed_one(self, text: str) -> list[float]:
+        rows = await self.embed_documents([EmbedItem(text=text, task_kind="RETRIEVAL_QUERY")])
+        return rows[0]
+
+    async def embed_many(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        return await self.embed_documents([EmbedItem(text=t) for t in texts])
+
+    async def embed_documents(self, items: list[EmbedItem]) -> list[list[float]]:
+        if not items:
+            return []
+
+        per_item_chunks: list[list[_Chunk]] = []
+        all_chunks: list[_Chunk] = []
+        for idx, item in enumerate(items):
+            pieces = _chunk_text(item.text or "", self._max_chars)
+            if len(pieces) > 1:
+                log.info(
+                    "openai embedding: oversize text on item %d split into %d chunks (len=%d)",
+                    idx,
+                    len(pieces),
+                    len(item.text or ""),
+                )
+            chunks = [_Chunk(item_idx=idx, text=piece) for piece in pieces]
+            per_item_chunks.append(chunks)
+            all_chunks.extend(chunks)
+
+        payloads: list[str] = []
+        for chunk in all_chunks:
+            item = items[chunk.item_idx]
+            if item.task_kind == "RETRIEVAL_QUERY":
+                payloads.append(f"query: {chunk.text}")
+            elif item.title:
+                payloads.append(f"title: {item.title} | text: {chunk.text}")
+            else:
+                payloads.append(chunk.text)
+
+        flat_vecs = await self.llm.embed(
+            payloads,
+            model=settings.embedding.model,
+            prompt_context=self.prompt_context,
+        )
+
+        global_index = 0
+        out: list[list[float]] = []
+        for chunks in per_item_chunks:
+            piece_vecs: list[list[float]] = []
+            for _ in chunks:
+                piece_vecs.append(flat_vecs[global_index])
+                global_index += 1
+            out.append(_mean_pool(piece_vecs))
+        return out
+
+    @property
+    def dim(self) -> int:
+        return settings.embedding.dimensions
 
 
 class BGEM3DenseEmbedder:
@@ -377,19 +450,26 @@ class BGEM3DenseEmbedder:
 
 
 def build_dense_embedder(
-    llm: GeminiClient,
+    llm: GeminiClient | None = None,
     *,
     prompt_context: PromptLogContext | None = None,
 ) -> DenseEmbedder:
-    """Factory used by routers; picks provider per `retrieval.embedder`."""
-    if settings.retrieval.embedder == "bge-m3":
+    """Factory used by routers; picks provider per `[embedding]` config."""
+    del llm  # Embeddings use their own client; kept for backwards-compatible callers.
+    if settings.embedding.provider == "bge-m3":
         return BGEM3DenseEmbedder()
-    return EmbeddingService(llm=llm, prompt_context=prompt_context)
+    from app.services.embedding_deps import get_embedding_client
+
+    embedding_llm = get_embedding_client()
+    if settings.embedding.provider == "openai":
+        return OpenAIEmbeddingService(llm=embedding_llm, prompt_context=prompt_context)
+    return EmbeddingService(llm=embedding_llm, prompt_context=prompt_context)
 
 
 __all__ = [
     "DenseEmbedder",
     "EmbedItem",
+    "OpenAIEmbeddingService",
     "EmbeddingService",
     "BGEM3DenseEmbedder",
     "build_dense_embedder",

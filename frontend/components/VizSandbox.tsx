@@ -1,48 +1,28 @@
 'use client';
 
 import GeoGebraSandbox from './GeoGebraSandbox';
-import JsxgraphSandbox from './JsxgraphSandbox';
 import type { VizParam } from './vizCommon';
 
 type Props = {
+  questionId?: string;
   vizId: string;
   engine?: string | null;
-  jsxCode?: string | null;
-  ggbCommands?: string[] | null;
-  ggbSettings?: Record<string, unknown> | null;
+  executionPayload?: Record<string, unknown> | null;
   params?: VizParam[];
+  specJson?: Record<string, unknown> | null;
   height?: number;
 };
 
-/**
- * Dispatcher for visualization rendering.
- *
- * Picks the runtime based on the persisted ``engine`` discriminator:
- * - "jsxgraph"  → JsxgraphSandbox
- * - "geogebra"  → GeoGebraSandbox
- *
- * Older payloads without an explicit engine default to "jsxgraph"
- * for backward compatibility with already-confirmed visualizations.
- */
+/** GeoGebra-only visualization host. */
 export default function VizSandbox(props: Props) {
-  const engine = (props.engine || 'jsxgraph').toLowerCase();
   const params = props.params ?? [];
-  if (engine === 'geogebra') {
-    return (
-      <GeoGebraSandbox
-        vizId={props.vizId}
-        ggbCommands={props.ggbCommands ?? []}
-        ggbSettings={props.ggbSettings ?? null}
-        params={params}
-        height={props.height}
-      />
-    );
-  }
   return (
-    <JsxgraphSandbox
+    <GeoGebraSandbox
+      questionId={props.questionId}
       vizId={props.vizId}
-      jsxCode={props.jsxCode ?? ''}
+      executionPayload={props.executionPayload ?? null}
       params={params}
+      specJson={props.specJson ?? null}
       height={props.height}
     />
   );

@@ -10,8 +10,8 @@
 
   Protocol (host -> iframe):
     { type: 'init',          boardOptions?: {...} }
-    { type: 'render',        jsxCode: string, params: object }
-    { type: 'update-params', params: object }
+    { type: 'render',        jsxCode: string, params: object, spec?: object }
+    { type: 'update-params', params: object, spec?: object }
     { type: 'dispose' }
 
   Protocol (iframe -> host):
@@ -113,17 +113,24 @@
     // --- 2. Render controller ----------------------------------------
     let board = null;
     let controller = null;
+    let lastRenderRequest = null;
+    let traceSeq = 0;
 
     function escapeForInlineFunctionBody(src) {
       return String(src || '').replace(/<\/script/gi, '<\\/script');
     }
 
-    function normalizeJsxCode(src) {
+    function stripCodeFence(src) {
       let text = String(src || '').trim();
       const fence = text.match(/^\s*```(?:javascript|js)?\s*([\s\S]*?)\s*```\s*$/i);
       if (fence) {
         text = String(fence[1] || '').trim();
       }
+      return text;
+    }
+
+    function normalizeLegacyJsxCode(src) {
+      const text = stripCodeFence(src);
       const fullFn = text.match(
         /^\s*\(?\s*function(?:\s+[A-Za-z_$][A-Za-z0-9_$]*)?\s*\(\s*board\s*,\s*JXG\s*,\s*H\s*,\s*params\s*\)\s*\{([\s\S]*)\}\s*\)?\s*;?\s*$/
       );
@@ -135,14 +142,147 @@
       return text;
     }
 
+    function usesRenderVisualizationContract(src) {
+      const text = stripCodeFence(src);
+      return /function\s+renderVisualization\s*\(|const\s+renderVisualization\s*=|let\s+renderVisualization\s*=|var\s+renderVisualization\s*=/.test(text);
+    }
+
+    function detectBoardInstance() {
+      const boards = window.JXG && window.JXG.JSXGraph && window.JXG.JSXGraph.boards;
+      if (!boards) return null;
+      for (const key of Object.keys(boards)) {
+        const candidate = boards[key];
+        const containerId = candidate && candidate.containerObj && candidate.containerObj.id;
+        if (containerId === 'board') return candidate;
+      }
+      return null;
+    }
+
+    function clonePayload(value) {
+      return value ? JSON.parse(JSON.stringify(value)) : value;
+    }
+
+    function shortText(value, limit) {
+      const text = String(value || '');
+      return text.length <= limit ? text : text.slice(0, limit) + '...<truncated>';
+    }
+
+    function summarizeAttrs(attrs) {
+      if (!attrs || typeof attrs !== 'object') return {};
+      const out = {};
+      if (typeof attrs.name === 'string') out.name = attrs.name;
+      if (typeof attrs.visible === 'boolean') out.visible = attrs.visible;
+      if (typeof attrs.color === 'string') out.color = attrs.color;
+      if (typeof attrs.strokeColor === 'string') out.strokeColor = attrs.strokeColor;
+      if (typeof attrs.dash === 'number') out.dash = attrs.dash;
+      return out;
+    }
+
+    function summarizeCreateArgs(args) {
+      const attrs = args[2];
+      return {
+        element_type: typeof args[0] === 'string' ? args[0] : shortText(args[0], 80),
+        name: attrs && typeof attrs.name === 'string' ? attrs.name : null,
+        attrs: summarizeAttrs(attrs),
+      };
+    }
+
+    function summarizeReturnValue(value) {
+      if (value === null) return { kind: 'null' };
+      if (typeof value === 'undefined') return { kind: 'undefined' };
+      if (typeof value === 'function') return { kind: 'function' };
+      if (typeof value !== 'object') return { kind: typeof value, value: shortText(value, 120) };
+      let keys = [];
+      try { keys = Object.keys(value).slice(0, 12); } catch (_) {}
+      return {
+        kind: Array.isArray(value) ? 'array' : 'object',
+        keys: keys,
+        has_update: typeof value.update === 'function',
+        has_destroy: typeof value.destroy === 'function',
+      };
+    }
+
+    function postTrace(action, details, status, error) {
+      parent.postMessage({
+        type: 'trace',
+        event: {
+          timestamp: new Date().toISOString(),
+          source: 'sandbox',
+          phase: 'runtime',
+          action: action,
+          status: status || 'info',
+          engine: 'jsxgraph',
+          component: 'sandbox',
+          details: details || {},
+          error: error || null,
+          seq: ++traceSeq,
+        },
+      }, parentOrigin || '*');
+    }
+
+    function wrapBoard(candidateBoard) {
+      if (!candidateBoard || candidateBoard.__hanswerTraceWrapped) return candidateBoard;
+      candidateBoard.__hanswerTraceWrapped = true;
+      const originalCreate = typeof candidateBoard.create === 'function'
+        ? candidateBoard.create.bind(candidateBoard)
+        : null;
+      if (originalCreate) {
+        candidateBoard.create = function () {
+          const args = Array.prototype.slice.call(arguments);
+          const summary = summarizeCreateArgs(args);
+          postTrace('board.create.start', summary, 'info');
+          try {
+            const result = originalCreate.apply(candidateBoard, args);
+            postTrace('board.create.ok', {
+              element_type: summary.element_type,
+              name: summary.name,
+              element_id: result && result.id ? result.id : null,
+            }, 'ok');
+            return result;
+          } catch (e) {
+            postTrace('board.create.error', summary, 'error', String(e && e.message || e));
+            throw e;
+          }
+        };
+      }
+      return candidateBoard;
+    }
+
+    function installJsxgraphTracing() {
+      const api = window.JXG && window.JXG.JSXGraph;
+      if (!api || api.__hanswerInitWrapped || typeof api.initBoard !== 'function') return;
+      const originalInitBoard = api.initBoard.bind(api);
+      api.initBoard = function (containerId, options) {
+        postTrace('init_board.start', {
+          container_id: containerId,
+          has_axis: !!(options && options.axis),
+        }, 'info');
+        try {
+          const createdBoard = wrapBoard(originalInitBoard(containerId, options));
+          postTrace('init_board.ok', { container_id: containerId }, 'ok');
+          return createdBoard;
+        } catch (e) {
+          postTrace('init_board.error', { container_id: containerId }, 'error', String(e && e.message || e));
+          throw e;
+        }
+      };
+      api.__hanswerInitWrapped = true;
+    }
+
     function postError(msg) {
       document.getElementById('err').style.display = 'block';
       document.getElementById('err').textContent = msg;
+      postTrace('sandbox.error', { message: msg }, 'error', msg);
       parent.postMessage({ type: 'error', message: msg }, parentOrigin || '*');
     }
 
     function dispose(options) {
       const preserveDisabled = !!(options && options.preserveDisabled);
+      postTrace('sandbox.dispose', {
+        preserve_disabled: preserveDisabled,
+        had_controller: !!controller,
+        had_board: !!board,
+      }, 'info');
       if (controller && typeof controller.destroy === 'function') {
         try { controller.destroy(); } catch (_) {}
       }
@@ -170,54 +310,139 @@
 
     function handleRuntimeError(error) {
       vizDisabled = true;
+      postTrace('runtime.error', { message: String(error && error.message || error) }, 'error', String(error && error.message || error));
       postError(String(error && error.message || error));
       dispose({ preserveDisabled: true });
     }
 
-    function render(jsxCode, params) {
+    function render(jsxCode, params, spec) {
       dispose();
+      lastRenderRequest = {
+        jsxCode: jsxCode || '',
+        params: clonePayload(params || {}),
+        spec: clonePayload(spec || null),
+      };
       const t0 = performance.now();
-      const normalizedCode = normalizeJsxCode(jsxCode);
-      board = JXG.JSXGraph.initBoard('board', {
-        boundingbox: [-5, 5, 5, -5],
-        axis: true,
-        showNavigation: false,
-        showCopyright: false,
-        keepAspectRatio: true,
-      });
-      if (window.H && typeof window.H._setBoard === 'function') {
-        window.H._setBoard(board);
+      const contractIsRenderVisualization = usesRenderVisualizationContract(jsxCode);
+      const normalizedCode = contractIsRenderVisualization
+        ? stripCodeFence(jsxCode)
+        : normalizeLegacyJsxCode(jsxCode);
+      postTrace('render.start', {
+        contract_mode: contractIsRenderVisualization ? 'renderVisualization' : 'legacy',
+        code_length: normalizedCode.length,
+        has_spec: !!spec,
+        parameter_names: Object.keys(params || {}),
+      }, 'info');
+      installJsxgraphTracing();
+      if (!contractIsRenderVisualization) {
+        board = wrapBoard(JXG.JSXGraph.initBoard('board', {
+          boundingbox: [-5, 5, 5, -5],
+          axis: true,
+          showNavigation: false,
+          showCopyright: false,
+          keepAspectRatio: true,
+        }));
+        if (window.H && typeof window.H._setBoard === 'function') {
+          window.H._setBoard(board);
+        }
       }
       if (window.H && typeof window.H._setRuntimeGuards === 'function') {
         window.H._setRuntimeGuards({ onError: handleRuntimeError });
       }
       try {
         const runtimeKey = '__hanswerRuntime_' + Math.random().toString(36).slice(2);
-        const runtime = { board, JXG: window.JXG, H: window.H, params: params || {}, result: null, error: null };
+        const runtime = {
+          board,
+          JXG: window.JXG,
+          H: window.H,
+          params: params || {},
+          spec: spec || null,
+          result: null,
+          error: null,
+          trace(event) {
+            parent.postMessage({ type: 'trace', event: event }, parentOrigin || '*');
+          },
+        };
         window[runtimeKey] = runtime;
         try {
           const script = document.createElement('script');
-          script.textContent = `
-            (function() {
-              const __runtime = window[${JSON.stringify(runtimeKey)}];
-              const __done = function(value) { __runtime.result = value; };
-              const __fail = function(message) { __runtime.error = message; };
-              try {
-                const __result = (function(board, JXG, H, params) {
-                  "use strict";
-                  var window=undefined,document=undefined,globalThis=undefined,self=undefined,
-                      top=undefined,parent=undefined,fetch=undefined,XMLHttpRequest=undefined,
-                      eval=undefined,Function=undefined,WebSocket=undefined,
-                      Worker=undefined,importScripts=undefined,localStorage=undefined,
-                      sessionStorage=undefined,indexedDB=undefined,navigator=undefined;
-                  ${escapeForInlineFunctionBody(normalizedCode)}
-                })(__runtime.board, __runtime.JXG, __runtime.H, __runtime.params);
-                __done(__result || null);
-              } catch (e) {
-                __fail(String(e && e.message || e));
-              }
-            })();
-          `;
+          if (contractIsRenderVisualization) {
+            script.textContent = `
+              (function() {
+                const __runtime = window[${JSON.stringify(runtimeKey)}];
+                const __done = function(value) { __runtime.result = value; };
+                const __fail = function(message) { __runtime.error = message; };
+                try {
+                  const __result = (function(JXG, H, spec, __trace) {
+                    "use strict";
+                    var window=undefined,document=undefined,globalThis=undefined,self=undefined,
+                        top=undefined,parent=undefined,fetch=undefined,XMLHttpRequest=undefined,
+                        eval=undefined,Function=undefined,WebSocket=undefined,
+                        Worker=undefined,importScripts=undefined,localStorage=undefined,
+                        sessionStorage=undefined,indexedDB=undefined,navigator=undefined;
+                    ${escapeForInlineFunctionBody(normalizedCode)}
+                    __trace({
+                      timestamp: new Date().toISOString(),
+                      source: 'sandbox',
+                      phase: 'runtime',
+                      action: 'render.contract.checked',
+                      status: typeof renderVisualization === 'function' ? 'ok' : 'error',
+                      engine: 'jsxgraph',
+                      component: 'sandbox',
+                      details: { renderVisualization_type: typeof renderVisualization },
+                      error: null,
+                    });
+                    if (typeof renderVisualization !== 'function') {
+                      throw new Error('renderVisualization is not defined');
+                    }
+                    const __invoked = renderVisualization('board', spec);
+                    __trace({
+                      timestamp: new Date().toISOString(),
+                      source: 'sandbox',
+                      phase: 'runtime',
+                      action: 'render.function.returned',
+                      status: 'info',
+                      engine: 'jsxgraph',
+                      component: 'sandbox',
+                      details: {
+                        kind: __invoked === null ? 'null' : Array.isArray(__invoked) ? 'array' : typeof __invoked,
+                        keys: __invoked && typeof __invoked === 'object' ? Object.keys(__invoked).slice(0, 12) : [],
+                        has_update: !!(__invoked && typeof __invoked.update === 'function'),
+                        has_destroy: !!(__invoked && typeof __invoked.destroy === 'function'),
+                      },
+                      error: null,
+                    });
+                    return __invoked;
+                  })(__runtime.JXG, __runtime.H, __runtime.spec || {}, __runtime.trace);
+                  __done(__result || null);
+                } catch (e) {
+                  __fail(String(e && e.message || e));
+                }
+              })();
+            `;
+          } else {
+            script.textContent = `
+              (function() {
+                const __runtime = window[${JSON.stringify(runtimeKey)}];
+                const __done = function(value) { __runtime.result = value; };
+                const __fail = function(message) { __runtime.error = message; };
+                try {
+                  const __result = (function(board, JXG, H, params) {
+                    "use strict";
+                    var window=undefined,document=undefined,globalThis=undefined,self=undefined,
+                        top=undefined,parent=undefined,fetch=undefined,XMLHttpRequest=undefined,
+                        eval=undefined,Function=undefined,WebSocket=undefined,
+                        Worker=undefined,importScripts=undefined,localStorage=undefined,
+                        sessionStorage=undefined,indexedDB=undefined,navigator=undefined;
+                    ${escapeForInlineFunctionBody(normalizedCode)}
+                  })(__runtime.board, __runtime.JXG, __runtime.H, __runtime.params);
+                  __done(__result || null);
+                } catch (e) {
+                  __fail(String(e && e.message || e));
+                }
+              })();
+            `;
+          }
           document.body.appendChild(script);
           script.remove();
         } finally {
@@ -228,7 +453,44 @@
           controller = runtime.result || null;
           delete window[runtimeKey];
         }
+        if (!board && controller && typeof controller === 'object' && controller.board) {
+          board = wrapBoard(controller.board);
+          if (board && window.H && typeof window.H._setBoard === 'function') {
+            window.H._setBoard(board);
+          }
+        }
+        if (!board) {
+          board = detectBoardInstance();
+          if (board && window.H && typeof window.H._setBoard === 'function') {
+            window.H._setBoard(board);
+          }
+        }
+        const controllerSummary = summarizeReturnValue(controller);
+        const invalidRenderResult = contractIsRenderVisualization
+          ? !(controller && typeof controller === 'object' && board)
+          : !board;
+        if (invalidRenderResult) {
+          postTrace('render.invalid_result', {
+            contract_mode: contractIsRenderVisualization ? 'renderVisualization' : 'legacy',
+            return_summary: controllerSummary,
+            has_controller: !!controller,
+            has_board: !!board,
+            board_from_controller: !!(controller && typeof controller === 'object' && controller.board),
+            parameter_names: Object.keys(params || {}),
+          }, 'error');
+          throw new Error(
+            contractIsRenderVisualization
+              ? 'renderVisualization returned without a live board/controller'
+              : 'render completed without a live board'
+          );
+        }
         const renderMs = performance.now() - t0;
+        postTrace('render.success', {
+          has_controller: !!controller,
+          has_board: !!board,
+          return_summary: controllerSummary,
+          render_ms: renderMs,
+        }, 'ok');
         parent.postMessage({ type: 'metric', renderMs }, parentOrigin || '*');
         if (renderMs > INITIAL_RENDER_BUDGET_MS) {
           vizDisabled = true;
@@ -236,6 +498,12 @@
           dispose({ preserveDisabled: true });
         }
       } catch (e) {
+        postTrace('render.exception', {
+          contract_mode: contractIsRenderVisualization ? 'renderVisualization' : 'legacy',
+          has_controller: !!controller,
+          has_board: !!board,
+          return_summary: summarizeReturnValue(controller),
+        }, 'error', String(e && e.message || e));
         postError(String(e && e.message || e));
       }
     }
@@ -250,12 +518,32 @@
           parent.postMessage({ type: 'ready' }, parentOrigin || '*');
           break;
         case 'render':
-          render(msg.jsxCode || '', msg.params || {});
+          render(msg.jsxCode || '', msg.params || {}, msg.spec || null);
           break;
         case 'update-params':
+          postTrace('update_params.received', {
+            parameter_names: Object.keys(msg.params || {}),
+          }, 'info');
           if (controller && typeof controller.update === 'function') {
-            try { controller.update(msg.params || {}); }
-            catch (e) { postError(String(e && e.message || e)); }
+            try {
+              controller.update(msg.params || {}, msg.spec || null);
+              postTrace('update_params.applied', {
+                parameter_names: Object.keys(msg.params || {}),
+              }, 'ok');
+            }
+            catch (e) {
+              postTrace('update_params.error', {}, 'error', String(e && e.message || e));
+              postError(String(e && e.message || e));
+            }
+          } else if (lastRenderRequest) {
+            postTrace('update_params.rerender', {
+              parameter_names: Object.keys(msg.params || {}),
+            }, 'info');
+            render(
+              lastRenderRequest.jsxCode,
+              msg.params || lastRenderRequest.params || {},
+              msg.spec || lastRenderRequest.spec || null,
+            );
           }
           break;
         case 'dispose':

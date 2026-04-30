@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from app.config import settings
 from app.services.vector_store import MilvusVectorStore
 
 
@@ -36,6 +37,22 @@ async def test_milvus_upsert_replaces_by_ref_id():
     assert client.calls[0][1]["filter"] == 'question_id == "abc-123"'
     assert client.calls[1][0] == "insert"
     assert client.calls[1][1]["data"][0]["question_id"] == "abc-123"
+    assert [name for name, _kwargs in client.calls] == ["delete", "insert"]
+
+
+@pytest.mark.asyncio
+async def test_milvus_upsert_flushes_only_when_configured(monkeypatch):
+    monkeypatch.setattr(settings.milvus, "flush_on_write", True)
+    client = _FakeMilvusClient()
+    store = MilvusVectorStore(client=client)
+    await store.upsert(
+        "question_full_emb",
+        ref_id="abc-123",
+        vector=[0.1, 0.2],
+        subject="math",
+        grade_band="senior",
+        difficulty=2,
+    )
     assert client.calls[2][0] == "flush"
     assert client.calls[2][1]["collection_name"] == "question_full_emb"
 
@@ -56,5 +73,4 @@ async def test_milvus_upsert_sparse_replaces_by_ref_id():
     assert client.calls[0][1]["filter"] == 'pattern_id == "pat-1"'
     assert client.calls[1][0] == "insert"
     assert client.calls[1][1]["data"][0]["sparse_vector"] == {1: 0.5}
-    assert client.calls[2][0] == "flush"
-    assert client.calls[2][1]["collection_name"] == "pattern_emb_sparse"
+    assert [name for name, _kwargs in client.calls] == ["delete", "insert"]

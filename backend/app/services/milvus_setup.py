@@ -139,10 +139,10 @@ _SPARSE_INDEX = {"index_type": "SPARSE_INVERTED_INDEX", "metric_type": "IP", "pa
 def _extract_vector_dim(desc: dict | None) -> int | None:
     if not isinstance(desc, dict):
         return None
-    for field in desc.get("fields", []):
-        if field.get("name") != "vector":
+    for schema_field in desc.get("fields", []):
+        if schema_field.get("name") != "vector":
             continue
-        params = field.get("params")
+        params = schema_field.get("params")
         if isinstance(params, dict) and "dim" in params:
             try:
                 return int(params["dim"])
@@ -268,7 +268,7 @@ def doctor() -> dict:
         "uri": f"http://{settings.milvus.host}:{settings.milvus.port}",
         "database": settings.milvus.database,
         "expected_dense_dim": settings.retrieval_dense_dim,
-        "active_embedder": settings.retrieval.embedder,
+        "active_embedder": settings.embedding.provider,
         "collections": {},
         "missing": [],
         "dense_dim_mismatches": {},

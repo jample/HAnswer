@@ -8,8 +8,8 @@ Covers:
     (view directives in commands, ``P=K+(...)`` shorthand, ``Vector((a),(b))``,
     color names in ``SetColor``, oversized payloads). Failures raise
     ``ValidationError`` so the LLM repair loop can fix them.
-  - ``_persist_viz`` writes the new columns and ``_serialize_viz_row``
-    surfaces them in the answer-resume payload.
+  - ``_persist_viz`` writes legacy columns while the main answer-resume
+    serializer exposes only the GeoGebra-first spec/execution-payload shape.
 """
 
 from __future__ import annotations
@@ -36,14 +36,28 @@ from app.schemas.llm import (
     VisualizationStoryboardItem,
 )
 from app.services.answer_job_service import _serialize_viz_row
-from app.services.llm_client import FakeTransport, GeminiClient
+from app.services.llm_client import FakeTransport, GeminiClient, LLMError
+from app.services.geogebra_validator import (
+    GeoGebraValidationError,
+    GeoGebraValidationReport,
+    sanitize_geogebra_visualization,
+)
 from app.services.question_solution_service import bootstrap_solution_from_question
 from app.services.vizcoder_service import (
     _generate_visualization_for_storyboard_item,
     _persist_viz,
     generate_visualizations,
+    generate_visualizations_batch,
     plan_visualization_storyboard,
 )
+
+
+@pytest.fixture(autouse=True)
+def _stub_geogebra_runtime_validator(monkeypatch):
+    async def _ok(viz, *, timeout_s=20.0):
+        return GeoGebraValidationReport(ok=True, render_ms=1.0)
+
+    monkeypatch.setattr("app.services.vizcoder_service.validate_geogebra_visualization", _ok)
 
 
 def _seed_question(session, marker: str) -> uuid.UUID:
@@ -97,14 +111,6 @@ def _answer_package_json() -> dict:
                 "why_this_step": "最值与顶点直接相关。",
                 "viz_ref": "viz-2",
             },
-            {
-                "step_index": 3,
-                "statement": "回扣最终结论。",
-                "rationale": "把图像观察转成答案。",
-                "formula": "",
-                "why_this_step": "形成最终结论。",
-                "viz_ref": "viz-3",
-            },
         ],
         "key_points_of_answer": ["先构造图像", "再看顶点"],
         "method_pattern": {
@@ -143,14 +149,14 @@ class _SequenceTransport(FakeTransport):
 def _storyboard_payload() -> dict:
     return {
         "theme_cn": "从图像关系到最值结论",
-        "selection_rationale_cn": "选择三个关键跳跃。",
+        "selection_rationale_cn": "选择两个关键跳跃。",
         "symbol_map": [
             {"symbol": "A", "meaning_cn": "交点A"},
             {"symbol": "B", "meaning_cn": "交点B"},
         ],
         "shared_params": [],
         "coverage_summary": [],
-        "sequence": ["viz-1", "viz-2", "viz-3"],
+        "sequence": ["viz-1", "viz-2"],
         "items": [
             {
                 "id": "viz-1",
@@ -184,27 +190,9 @@ def _storyboard_payload() -> dict:
                 "shared_params": [],
                 "depends_on": ["viz-1"],
                 "relation_to_prev_cn": "承接",
-                "relation_to_next_cn": "过渡",
+                "relation_to_next_cn": "",
                 "caption_outline_cn": "说明2",
                 "geo_target_cn": "目标2",
-            },
-            {
-                "id": "viz-3",
-                "title_cn": "图3",
-                "anchor_refs": [{"kind": "final_answer", "ref": "final_answer", "excerpt_cn": ""}],
-                "difficulty_reason_cn": "难点3",
-                "student_confusion_risk": "low",
-                "conceptual_jump_cn": "跳跃3",
-                "why_visualization_needed_cn": "需要图示3",
-                "learning_goal_cn": "目标3",
-                "engine": "geogebra",
-                "shared_symbols": ["A"],
-                "shared_params": [],
-                "depends_on": ["viz-2"],
-                "relation_to_prev_cn": "承接",
-                "relation_to_next_cn": "",
-                "caption_outline_cn": "说明3",
-                "geo_target_cn": "目标3",
             },
         ],
     }
@@ -306,7 +294,6 @@ def test_visualization_list_round_trips_geogebra():
         "visualizations": [
             _v("v1", "a=Slider(-3,3,0.1)"),
             _v("v2", "f(x)=x^2"),
-            _v("v3", "g(x)=x^3"),
         ]
     }
     parsed = VisualizationList.model_validate(payload)
@@ -319,7 +306,7 @@ def test_visualization_list_round_trips_geogebra():
     assert v0["jsx_code"] == ""
 
 
-def test_visualization_list_rejects_fewer_than_three():
+def test_visualization_list_accepts_single_visualization():
     payload = {
         "visualizations": [
             {
@@ -332,14 +319,14 @@ def test_visualization_list_rejects_fewer_than_three():
             }
         ]
     }
-    with pytest.raises(ValidationError, match="at least 3"):
-        VisualizationList.model_validate(payload)
+    parsed = VisualizationList.model_validate(payload)
+    assert len(parsed.visualizations) == 1
 
 
 def test_visualization_storyboard_accepts_valid_sequence():
     storyboard = VisualizationStoryboard(
         theme_cn="从图像关系到最值结论",
-        selection_rationale_cn="选择三个最难直接脑补的关键跳跃。",
+        selection_rationale_cn="选择两个最难直接脑补的关键跳跃。",
         symbol_map=[
             StoryboardSymbol(symbol="A", meaning_cn="与 x 轴交点 A"),
             StoryboardSymbol(symbol="B", meaning_cn="与 x 轴交点 B"),
@@ -352,7 +339,7 @@ def test_visualization_storyboard_accepts_valid_sequence():
                 anchor_refs=[VisualizationAnchorRef(kind="question_given", ref="given:0")],
             ),
         ],
-        sequence=["viz-1", "viz-2", "viz-3"],
+        sequence=["viz-1", "viz-2"],
         items=[
             VisualizationStoryboardItem(
                 id="viz-1",
@@ -385,25 +372,9 @@ def test_visualization_storyboard_accepts_valid_sequence():
                 caption_outline_cn="对应解答中的顶点推理。",
                 geo_target_cn="显示顶点与最值位置。",
             ),
-            VisualizationStoryboardItem(
-                id="viz-3",
-                title_cn="结论回扣",
-                anchor_refs=[VisualizationAnchorRef(kind="final_answer", ref="final_answer")],
-                difficulty_reason_cn="学生可能只记答案不理解由来。",
-                student_confusion_risk="medium",
-                conceptual_jump_cn="把图像观察回扣到最终结论。",
-                why_visualization_needed_cn="帮助建立结果与图像证据的联系。",
-                learning_goal_cn="理解 final answer 为什么成立。",
-                shared_symbols=["A"],
-                shared_params=[],
-                depends_on=["viz-2"],
-                relation_to_prev_cn="把最值观察总结为结论。",
-                caption_outline_cn="对应最终答案。",
-                geo_target_cn="标出最终结论对应的图上证据。",
-            ),
         ],
     )
-    assert storyboard.sequence == ["viz-1", "viz-2", "viz-3"]
+    assert storyboard.sequence == ["viz-1", "viz-2"]
 
 
 def test_visualization_storyboard_rejects_unknown_shared_symbol():
@@ -414,7 +385,7 @@ def test_visualization_storyboard_rejects_unknown_shared_symbol():
             symbol_map=[StoryboardSymbol(symbol="A", meaning_cn="点 A")],
             shared_params=[],
             coverage_summary=[],
-            sequence=["viz-1", "viz-2", "viz-3"],
+            sequence=["viz-1", "viz-2"],
             items=[
                 VisualizationStoryboardItem(
                     id="viz-1",
@@ -446,12 +417,49 @@ def test_visualization_storyboard_rejects_unknown_shared_symbol():
                     caption_outline_cn="cap",
                     geo_target_cn="geo",
                 ),
+            ],
+        )
+
+
+def test_visualization_storyboard_rejects_grouped_symbol_aliases():
+    with pytest.raises(ValidationError, match="Do not combine symbols like 'P, Q'"):
+        VisualizationStoryboard(
+            theme_cn="t",
+            selection_rationale_cn="r",
+            symbol_map=[
+                StoryboardSymbol(symbol="P, Q", meaning_cn="线段端点"),
+                StoryboardSymbol(symbol="P', Q'", meaning_cn="平移后的端点"),
+                StoryboardSymbol(symbol="⊙T", meaning_cn="目标圆"),
+                StoryboardSymbol(symbol="k", meaning_cn="最远平移距离"),
+                StoryboardSymbol(symbol="M", meaning_cn="中点"),
+                StoryboardSymbol(symbol="M'", meaning_cn="平移后的中点"),
+                StoryboardSymbol(symbol="r'", meaning_cn="弦心距"),
+            ],
+            shared_params=[],
+            coverage_summary=[],
+            sequence=["viz-1", "viz-2"],
+            items=[
                 VisualizationStoryboardItem(
-                    id="viz-3",
-                    title_cn="3",
-                    anchor_refs=[VisualizationAnchorRef(kind="final_answer", ref="fa")],
+                    id="viz-1",
+                    title_cn="1",
+                    anchor_refs=[VisualizationAnchorRef(kind="question_given", ref="g1")],
                     difficulty_reason_cn="d",
-                    student_confusion_risk="low",
+                    student_confusion_risk="high",
+                    conceptual_jump_cn="c",
+                    why_visualization_needed_cn="w",
+                    learning_goal_cn="l",
+                    shared_symbols=["P", "Q", "P'", "Q'", "r"],
+                    shared_params=[],
+                    depends_on=[],
+                    caption_outline_cn="cap",
+                    geo_target_cn="geo",
+                ),
+                VisualizationStoryboardItem(
+                    id="viz-2",
+                    title_cn="2",
+                    anchor_refs=[VisualizationAnchorRef(kind="solution_step", ref="1")],
+                    difficulty_reason_cn="d",
+                    student_confusion_risk="medium",
                     conceptual_jump_cn="c",
                     why_visualization_needed_cn="w",
                     learning_goal_cn="l",
@@ -640,12 +648,16 @@ async def test_persist_and_serialize_geogebra_row(session):
     assert row.ggb_settings_json["app_name"] == "graphing"
     assert row.ggb_settings_json["grid_visible"] is False
 
-    # Frontend payload mirrors the DB row.
+    # The main frontend payload no longer exposes legacy GeoGebra command fields.
     serialized = _serialize_viz_row(row)
     assert serialized["engine"] == "geogebra"
-    assert serialized["ggb_commands"] == row.ggb_commands_json
-    assert serialized["ggb_settings"] == row.ggb_settings_json
-    assert serialized["jsx_code"] == ""
+    assert "ggb_commands" not in serialized
+    assert "ggb_settings" not in serialized
+    assert "jsx_code" not in serialized
+    assert serialized["spec_json"] is None
+    assert serialized["execution_payload"] is None
+    assert serialized["degraded"] is False
+    assert serialized["interactive_hints"] == ["拖动 P 观察坐标"]
 
 
 @pytest.mark.asyncio
@@ -672,10 +684,7 @@ async def test_persist_and_serialize_jsxgraph_row_backward_compat(session):
     assert row.ggb_commands_json == []
     assert row.ggb_settings_json is None
 
-    serialized = _serialize_viz_row(row)
-    assert serialized["engine"] == "jsxgraph"
-    assert serialized["ggb_commands"] == []
-    assert serialized["ggb_settings"] is None
+    assert _serialize_viz_row(row) is None
 
 
 @pytest.mark.asyncio
@@ -695,136 +704,78 @@ async def test_bootstrap_solution_preserves_engine_specific_fields(session):
     await _persist_viz(session, q.id, viz)
     await session.flush()
 
+    row = (
+        await session.execute(
+            select(VisualizationRow)
+            .where(VisualizationRow.question_id == q.id)
+            .limit(1)
+        )
+    ).scalar_one()
+    row.spec_json = {
+        "id": "spec-bootstrap",
+        "title": "单位圆动点",
+        "recommended": True,
+        "pedagogical_purpose": "观察动点参数变化",
+    }
+    await session.flush()
+
     solution = await bootstrap_solution_from_question(session, question=q)
     assert solution.visualizations_json
     first = solution.visualizations_json[0]
     assert first["engine"] == "geogebra"
-    assert first["ggb_commands"] == ["c=Circle((0,0),1)", "P=Point(c)"]
-    assert first["ggb_settings"]["app_name"] == "graphing"
+    assert "ggb_commands" not in first
+    assert "ggb_settings" not in first
+    assert first["execution_payload"] is None
+    assert first["degraded"] is False
+    assert first["spec_json"]["id"] == "spec-bootstrap"
+    assert solution.visualization_plan_json is not None
+    assert solution.visualization_plan_json["selected_visualization"]["id"] == "spec-bootstrap"
 
 
 @pytest.mark.asyncio
-async def test_generate_visualizations_uses_storyboard_then_per_item_codegen(session):
-    q = _seed_question(session, f"viz-plan-{uuid.uuid4().hex[:8]}")
+async def test_generate_visualizations_uses_single_batch_call_without_repair(session):
+    """The batch path should use one generation call and local validation only."""
+    q = _seed_question(session, f"viz-batch-{uuid.uuid4().hex[:8]}")
     q.answer_package_json = _answer_package_json()
     await session.flush()
 
-    storyboard = {
-        "theme_cn": "从交点到最值",
-        "selection_rationale_cn": "选择三个关键跳跃",
-        "symbol_map": [{"symbol": "A", "meaning_cn": "交点 A"}],
-        "shared_params": [
-            {
-                "name": "t",
-                "label_cn": "参数 t",
-                "kind": "slider",
-                "min": -2,
-                "max": 2,
-                "step": 0.1,
-                "default": 0,
-            }
-        ],
-        "coverage_summary": [
-            {
-                "item_id": "viz-1",
-                "summary_cn": "建立交点关系",
-                "anchor_refs": [{"kind": "question_given", "ref": "given:0"}],
-            }
-        ],
-        "sequence": ["viz-1", "viz-2", "viz-3"],
-        "items": [
+    batch_response = {
+        "visualizations": [
             {
                 "id": "viz-1",
                 "title_cn": "交点示意",
-                "anchor_refs": [{"kind": "question_given", "ref": "given:0"}],
-                "difficulty_reason_cn": "条件难映射",
-                "student_confusion_risk": "high",
-                "conceptual_jump_cn": "从题设到图像",
-                "why_visualization_needed_cn": "帮助形成对象",
-                "learning_goal_cn": "理解交点位置",
+                "caption_cn": "对应解答 step 1",
+                "learning_goal": "理解交点位置",
                 "engine": "geogebra",
-                "shared_symbols": ["A"],
-                "shared_params": ["t"],
-                "depends_on": [],
-                "caption_outline_cn": "对应 step 1",
-                "geo_target_cn": "显示交点 A,B",
+                "ggb_commands": ["f(x)=x^2-1", "A=(-1,0)", "B=(1,0)"],
             },
             {
                 "id": "viz-2",
                 "title_cn": "顶点比较",
-                "anchor_refs": [{"kind": "solution_step", "ref": "2"}],
-                "difficulty_reason_cn": "顶点决定最值",
-                "student_confusion_risk": "medium",
-                "conceptual_jump_cn": "从交点到顶点",
-                "why_visualization_needed_cn": "需要补出顶点",
-                "learning_goal_cn": "理解顶点与最值",
+                "caption_cn": "对应解答 step 2",
+                "learning_goal": "理解顶点与最值",
                 "engine": "geogebra",
-                "shared_symbols": ["A"],
-                "shared_params": ["t"],
-                "depends_on": ["viz-1"],
-                "caption_outline_cn": "对应 step 2",
-                "geo_target_cn": "显示顶点",
+                "ggb_commands": ["f(x)=x^2-1", "V=(0,-1)"],
             },
-            {
-                "id": "viz-3",
-                "title_cn": "结论回扣",
-                "anchor_refs": [{"kind": "final_answer", "ref": "final_answer"}],
-                "difficulty_reason_cn": "需要把图像观察变成答案",
-                "student_confusion_risk": "medium",
-                "conceptual_jump_cn": "从图像到结论",
-                "why_visualization_needed_cn": "帮助回扣答案",
-                "learning_goal_cn": "理解最终结论",
-                "engine": "geogebra",
-                "shared_symbols": ["A"],
-                "shared_params": ["t"],
-                "depends_on": ["viz-2"],
-                "caption_outline_cn": "对应 step 3",
-                "geo_target_cn": "标出最终证据",
-            },
-        ],
+        ]
     }
-    viz_responses = [
-        {
-            "id": "wrong-id-will-be-overridden",
-            "title_cn": "交点示意",
-            "caption_cn": "对应解答 step 1",
-            "learning_goal": "理解交点位置",
-            "engine": "geogebra",
-            "ggb_commands": ["f(x)=x^2-1", "A=(-1,0)", "B=(1,0)", "t=Slider(-2,2,0.1)"],
-        },
-        {
-            "id": "viz-2",
-            "title_cn": "顶点比较",
-            "caption_cn": "对应解答 step 2",
-            "learning_goal": "理解顶点与最值",
-            "engine": "geogebra",
-            "ggb_commands": ["f(x)=x^2-1", "V=(0,-1)", "t=Slider(-2,2,0.1)"],
-        },
-        {
-            "id": "viz-3",
-            "title_cn": "结论回扣",
-            "caption_cn": "对应解答 step 3",
-            "learning_goal": "理解最终结论",
-            "engine": "geogebra",
-            "ggb_commands": ["f(x)=x^2-1", "V=(0,-1)", "Text(\"min=-1\", (0,-1))", "t=Slider(-2,2,0.1)"],
-        },
-    ]
     transport = _SequenceTransport([
-        json.dumps(storyboard, ensure_ascii=False),
-        *(json.dumps(item, ensure_ascii=False) for item in viz_responses),
+        json.dumps(batch_response, ensure_ascii=False),
+        json.dumps(batch_response, ensure_ascii=False),
     ])
     client = GeminiClient(transport)
 
     events = [
-        ev async for ev in generate_visualizations(
+        ev async for ev in generate_visualizations_batch(
             session,
             question_id=q.id,
             llm=client,
         )
     ]
 
-    assert [ev.name for ev in events] == ["visualization", "visualization", "visualization"]
-    assert [ev.data["id"] for ev in events] == ["viz-1", "viz-2", "viz-3"]
+    assert [ev.name for ev in events] == ["visualization", "visualization"]
+    assert [ev.data["id"] for ev in events] == ["viz-1", "viz-2"]
+    assert len(transport.calls) == 1
     rows = (
         await session.execute(
             select(VisualizationRow)
@@ -832,9 +783,139 @@ async def test_generate_visualizations_uses_storyboard_then_per_item_codegen(ses
             .order_by(VisualizationRow.created_at)
         )
     ).scalars().all()
-    assert [row.viz_ref for row in rows] == ["viz-1", "viz-2", "viz-3"]
+    assert [row.viz_ref for row in rows] == ["viz-1", "viz-2"]
     assert all(row.engine == "geogebra" for row in rows)
-    assert rows[0].params_json[0]["name"] == "t"
+
+
+@pytest.mark.asyncio
+async def test_generate_visualizations_sanitizes_geogebra_identifiers_locally(session):
+    q = _seed_question(session, f"viz-batch-sanitize-{uuid.uuid4().hex[:8]}")
+    q.answer_package_json = _answer_package_json()
+    await session.flush()
+
+    batch_response = {
+        "visualizations": [
+            {
+                "id": "viz-1",
+                "title_cn": "参数滑块",
+                "caption_cn": "对应解答 step 1",
+                "learning_goal": "观察参数变化",
+                "engine": "geogebra",
+                "ggb_commands": ["alpha=Slider(-3,3,0.1)", "f(x)=x^2+alpha"],
+                "params": [
+                    {
+                        "name": "alpha",
+                        "label_cn": "参数 alpha",
+                        "kind": "slider",
+                        "default": 0,
+                        "min": -3,
+                        "max": 3,
+                        "step": 0.1,
+                    }
+                ],
+            },
+            {
+                "id": "viz-2",
+                "title_cn": "顶点比较",
+                "caption_cn": "对应解答 step 2",
+                "learning_goal": "理解顶点变化",
+                "engine": "geogebra",
+                "ggb_commands": ["f(x)=x^2", "V=(0,0)"],
+            },
+        ]
+    }
+    transport = _SequenceTransport([json.dumps(batch_response, ensure_ascii=False)])
+    client = GeminiClient(transport)
+
+    events = [
+        ev async for ev in generate_visualizations_batch(
+            session,
+            question_id=q.id,
+            llm=client,
+        )
+    ]
+
+    assert [ev.name for ev in events] == ["visualization", "visualization"]
+    assert events[0].data["ggb_commands"] == [
+        "param_alpha=Slider(-3,3,0.1)",
+        "f(x)=x^2+param_alpha",
+    ]
+    assert events[0].data["params"][0]["name"] == "param_alpha"
+    assert events[0].data["title_cn"] == "参数滑块"
+    rows = (
+        await session.execute(
+            select(VisualizationRow)
+            .where(VisualizationRow.question_id == q.id)
+            .order_by(VisualizationRow.created_at)
+        )
+    ).scalars().all()
+    assert rows[0].ggb_commands_json == [
+        "param_alpha=Slider(-3,3,0.1)",
+        "f(x)=x^2+param_alpha",
+    ]
+    assert rows[0].params_json[0]["name"] == "param_alpha"
+    assert len(transport.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_generate_visualizations_reports_local_runtime_validation_failure(session, monkeypatch):
+    q = _seed_question(session, f"viz-batch-runtime-fail-{uuid.uuid4().hex[:8]}")
+    q.answer_package_json = _answer_package_json()
+    await session.flush()
+
+    batch_response = {
+        "visualizations": [
+            {
+                "id": "viz-1",
+                "title_cn": "交点示意",
+                "caption_cn": "对应解答 step 1",
+                "learning_goal": "理解交点位置",
+                "engine": "geogebra",
+                "ggb_commands": ["A=(0,0)", "B=(1,0)"],
+            },
+            {
+                "id": "viz-2",
+                "title_cn": "顶点比较",
+                "caption_cn": "对应解答 step 2",
+                "learning_goal": "理解顶点变化",
+                "engine": "geogebra",
+                "ggb_commands": ["f(x)=x^2", "V=(0,0)"],
+            },
+        ]
+    }
+
+    async def _fail(viz, *, timeout_s=20.0):
+        raise GeoGebraValidationError([
+            {"kind": "runtime", "message": f"runtime failed for {viz.id}"},
+        ])
+
+    monkeypatch.setattr("app.services.vizcoder_service.validate_geogebra_visualization", _fail)
+
+    transport = _SequenceTransport([json.dumps(batch_response, ensure_ascii=False)])
+    client = GeminiClient(transport)
+
+    events = [
+        ev async for ev in generate_visualizations_batch(
+            session,
+            question_id=q.id,
+            llm=client,
+        )
+    ]
+
+    assert events[0].name == "error"
+    assert events[0].data["stage"] == "viz_validator"
+    assert events[0].data["viz_id"] == "viz-1"
+    assert events[1].name == "error"
+    assert events[1].data["stage"] == "viz_validator"
+    assert events[1].data["viz_id"] == "viz-2"
+    rows = (
+        await session.execute(
+            select(VisualizationRow)
+            .where(VisualizationRow.question_id == q.id)
+            .order_by(VisualizationRow.created_at)
+        )
+    ).scalars().all()
+    assert rows == []
 
 
 @pytest.mark.asyncio
@@ -888,3 +969,64 @@ async def test_vizitem_uses_streaming_when_enabled(session):
     assert viz.id == "viz-1"
     assert transport.calls
     assert transport.calls[-1].get("stream") is True
+
+
+def test_sanitize_geogebra_visualization_rewrites_reserved_names_and_bindings():
+    viz = sanitize_geogebra_visualization({
+        "id": "viz-1",
+        "title_cn": "坐标轴冲突",
+        "caption_cn": "测试",
+        "learning_goal": "测试",
+        "engine": "geogebra",
+        "jsx_code": "",
+        "ggb_commands": ["xAxis=Slider(-3,3,0.1)", "P=(xAxis,0)"],
+        "params": [
+            {
+                "name": "xAxis",
+                "label_cn": "参数 xAxis",
+                "kind": "slider",
+                "default": 0,
+                "min": -3,
+                "max": 3,
+                "step": 0.1,
+            }
+        ],
+        "animation": {"kind": "loop", "duration_ms": 1200, "drives": ["xAxis"]},
+    })
+
+    assert viz.ggb_commands == ["obj_xAxis=Slider(-3,3,0.1)", "P=(obj_xAxis,0)"]
+    assert viz.params[0].name == "obj_xAxis"
+    assert viz.animation is not None
+    assert viz.animation.drives == ["obj_xAxis"]
+
+
+@pytest.mark.asyncio
+async def test_vizitem_does_not_retry_invalid_payload_when_repairs_are_disabled(session):
+    q = _seed_question(session, f"vizitem-no-repair-{uuid.uuid4().hex[:8]}")
+    q.answer_package_json = _answer_package_json()
+    await session.flush()
+
+    storyboard = VisualizationStoryboard.model_validate(_storyboard_payload())
+    item = storyboard.items[0]
+    bad_payload = _single_viz_payload().copy()
+    bad_payload.pop("caption_cn")
+    transport = _SequenceTransport([json.dumps(bad_payload, ensure_ascii=False)])
+    client = GeminiClient(transport)
+
+    old_stream = settings.llm.stream_vizcoder_json
+    settings.llm.stream_vizcoder_json = True
+    try:
+        with pytest.raises(LLMError, match="caption_cn"):
+            await _generate_visualization_for_storyboard_item(
+                session,
+                question_id=q.id,
+                llm=client,
+                storyboard=storyboard,
+                item=item,
+                previous_items=[],
+            )
+    finally:
+        settings.llm.stream_vizcoder_json = old_stream
+
+    assert len(transport.calls) == 1
+    assert transport.calls[0].get("stream") is True

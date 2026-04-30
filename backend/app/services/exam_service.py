@@ -178,7 +178,7 @@ async def _synthesize_variants(
     template = VariantSynthPrompt()
     result = await llm.call_structured(
         template=template,
-        model=settings.gemini.model_solver,
+        model=settings.llm_model("solver"),
         model_cls=VariantList,
         template_kwargs={
             "source": source_payload,

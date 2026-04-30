@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from app.config import settings
 from app.services.embedding import EmbeddingService
 from app.services.gemini_transport import GoogleGeminiTransport
 from app.services.llm_client import FakeTransport, GeminiClient
@@ -20,8 +21,9 @@ class _TaskTypeTransport(FakeTransport):
 
 
 @pytest.mark.asyncio
-async def test_embedding_service_uses_v2_task_prefixes():
+async def test_embedding_service_uses_v2_task_prefixes(monkeypatch):
     """gemini-embedding-2-preview: task_type is None, text gets prefixed."""
+    monkeypatch.setattr(settings.embedding, "model", "gemini-embedding-2-preview")
     transport = _TaskTypeTransport()
     llm = GeminiClient(transport)
     svc = EmbeddingService(llm=llm)

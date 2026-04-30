@@ -56,7 +56,9 @@ def _extract_transient_message(err: Exception) -> str:
             return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
     except Exception:  # noqa: BLE001
         pass
-    return collapsed
+    if collapsed:
+        return collapsed
+    return err.__class__.__name__
 
 
 def _l2_renormalize(vec: list[float]) -> list[float]:
@@ -111,7 +113,7 @@ def _flatten_messages(messages: list[dict]) -> tuple[str, list[dict]]:
 class GoogleGeminiTransport(GeminiTransport):
     """Adapter over google-genai. Real network IO happens here."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, api_key: str | None = None, embed_dim: int | None = None) -> None:
         try:
             from google import genai  # type: ignore
         except ImportError as e:
@@ -122,7 +124,9 @@ class GoogleGeminiTransport(GeminiTransport):
             import google.generativeai as legacy_genai  # type: ignore
         except ImportError:
             legacy_genai = None
-        self._client = genai.Client(api_key=settings.gemini.api_key)
+        self._api_key = settings.gemini.api_key if api_key is None else api_key
+        self._embed_dim = settings.gemini.embed_dim if embed_dim is None else embed_dim
+        self._client = genai.Client(api_key=self._api_key)
         self._legacy_genai = legacy_genai
         self._text_embedding_004_available: bool | None = None
 
@@ -132,6 +136,10 @@ class GoogleGeminiTransport(GeminiTransport):
         ptok = int(getattr(usage, "prompt_token_count", 0) or 0)
         ctok = int(getattr(usage, "candidates_token_count", 0) or 0)
         return ptok, ctok
+
+    @staticmethod
+    def _automatic_function_calling_disabled(types_module):
+        return types_module.AutomaticFunctionCallingConfig(disable=True)
 
     async def generate_json(
         self,
@@ -153,6 +161,7 @@ class GoogleGeminiTransport(GeminiTransport):
             # `response_schema` makes the Gemini API reject keys such as
             # `additionalProperties`.
             response_json_schema=response_schema,
+            automatic_function_calling=self._automatic_function_calling_disabled(types),
         )
         try:
             async with _acquire_gemini_call_slot():
@@ -166,6 +175,40 @@ class GoogleGeminiTransport(GeminiTransport):
                 )
         except Exception as e:  # noqa: BLE001
             # Classify a handful of transient errors; everything else is fatal.
+            if _looks_transient_error(e):
+                raise TransientLLMError(_extract_transient_message(e)) from e
+            raise
+
+        raw = resp.text or ""
+        ptok, ctok = self._usage_counts(resp)
+        return raw, ptok, ctok
+
+    async def generate_text(
+        self,
+        *,
+        model: str,
+        messages: list[dict],
+        timeout_s: int,
+    ) -> tuple[str, int, int]:
+        from google.genai import types  # type: ignore
+
+        system_instruction, contents = _flatten_messages(messages)
+        cfg = types.GenerateContentConfig(
+            system_instruction=system_instruction or None,
+            response_mime_type="text/plain",
+            automatic_function_calling=self._automatic_function_calling_disabled(types),
+        )
+        try:
+            async with _acquire_gemini_call_slot():
+                resp = await asyncio.wait_for(
+                    self._client.aio.models.generate_content(  # type: ignore[attr-defined]
+                        model=model,
+                        contents=contents,
+                        config=cfg,
+                    ),
+                    timeout=timeout_s,
+                )
+        except Exception as e:  # noqa: BLE001
             if _looks_transient_error(e):
                 raise TransientLLMError(_extract_transient_message(e)) from e
             raise
@@ -189,6 +232,7 @@ class GoogleGeminiTransport(GeminiTransport):
             system_instruction=system_instruction or None,
             response_mime_type="application/json",
             response_json_schema=response_schema,
+            automatic_function_calling=self._automatic_function_calling_disabled(types),
         )
         try:
             async with _acquire_gemini_call_slot():
@@ -246,6 +290,7 @@ class GoogleGeminiTransport(GeminiTransport):
             system_instruction=system_instruction or None,
             response_mime_type="application/json",
             response_json_schema=response_schema,
+            automatic_function_calling=self._automatic_function_calling_disabled(types),
         )
 
         max_stream_retries = settings.llm.max_retries
@@ -299,7 +344,7 @@ class GoogleGeminiTransport(GeminiTransport):
             )
 
         def _run() -> list[list[float]]:
-            self._legacy_genai.configure(api_key=settings.gemini.api_key)
+            self._legacy_genai.configure(api_key=self._api_key)
             result = self._legacy_genai.embed_content(
                 model=model if model.startswith("models/") else f"models/{model}",
                 content=texts,
@@ -339,7 +384,7 @@ class GoogleGeminiTransport(GeminiTransport):
 
         async def _embed_chunk(model_name: str, chunk: list[str], use_task_type: bool) -> list[list[float]]:
             config_kwargs: dict = {
-                "output_dimensionality": settings.gemini.embed_dim,
+                "output_dimensionality": self._embed_dim,
             }
             if use_task_type and task_type:
                 config_kwargs["task_type"] = task_type

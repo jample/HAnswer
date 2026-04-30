@@ -67,6 +67,31 @@ def test_parser_handles_byte_by_byte_streaming():
     assert dict(out) == {"a": [1, 2, 3], "b": {"x": 1, "y": 2}}
 
 
+def test_parser_emits_solution_steps_items_incrementally():
+    text = json.dumps({
+        "question_understanding": {"restated_question": "x"},
+        "solution_steps": [
+            {"step_index": 1, "statement": "s1"},
+            {"step_index": 2, "statement": "s2"},
+        ],
+        "self_check": ["done"],
+    })
+    parser = TopLevelStreamParser()
+    out: list[tuple[str, object]] = []
+    for ch in text:
+        out.extend(parser.feed(ch))
+
+    solution_step_items = [value for key, value in out if key == "solution_steps[]"]
+    assert solution_step_items == [
+        {"step_index": 1, "statement": "s1"},
+        {"step_index": 2, "statement": "s2"},
+    ]
+    assert ("solution_steps", [
+        {"step_index": 1, "statement": "s1"},
+        {"step_index": 2, "statement": "s2"},
+    ]) in out
+
+
 # ── GeminiClient streaming integration ──────────────────────────────
 
 
@@ -117,6 +142,64 @@ async def test_call_structured_streaming_yields_tuples_then_model():
     assert ("b", "hi") in items
     assert isinstance(items[-1], _Model)
     assert items[-1].a == 1 and items[-1].b == "hi"
+
+
+@pytest.mark.asyncio
+async def test_call_structured_streaming_emits_solution_step_items_before_full_array():
+    from pydantic import BaseModel
+
+    from app.prompts.base import PromptTemplate
+    from app.services.llm_client import FakeTransport, GeminiClient
+
+    class _Model(BaseModel):
+        question_understanding: dict
+        solution_steps: list[dict]
+
+    class _Tpl(PromptTemplate):
+        name = "test"
+        version = "v0"
+        purpose = "test"
+        input_description = "x"
+        output_description = "y"
+        design_decisions: list = []
+
+        def system_message(self, **kwargs):
+            return "sys"
+
+        def user_message(self, **kwargs):
+            return "x"
+
+        @property
+        def schema(self):
+            return {"type": "object"}
+
+    transport = FakeTransport(
+        json_by_model={
+            "m": json.dumps({
+                "question_understanding": {"restated_question": "x"},
+                "solution_steps": [
+                    {"step_index": 1, "statement": "s1"},
+                    {"step_index": 2, "statement": "s2"},
+                ],
+            })
+        }
+    )
+    client = GeminiClient(transport)
+
+    items: list = []
+    async for item in client.call_structured_streaming(
+        template=_Tpl(),
+        model="m",
+        model_cls=_Model,
+    ):
+        items.append(item)
+
+    step_items = [item for item in items if isinstance(item, tuple) and item[0] == "solution_steps[]"]
+    assert step_items == [
+        ("solution_steps[]", {"step_index": 1, "statement": "s1"}),
+        ("solution_steps[]", {"step_index": 2, "statement": "s2"}),
+    ]
+    assert isinstance(items[-1], _Model)
 
 
 @pytest.mark.asyncio
@@ -256,6 +339,70 @@ async def test_call_structured_streaming_falls_back_on_transient_stream_error():
 
 
 @pytest.mark.asyncio
+async def test_call_structured_streaming_falls_back_even_when_retries_disabled():
+    from pydantic import BaseModel
+
+    from app.prompts.base import PromptTemplate
+    from app.services.llm_client import FakeTransport, GeminiClient, StreamChunk, TransientLLMError
+
+    class _Model(BaseModel):
+        a: int
+        b: str
+
+    class _Tpl(PromptTemplate):
+        name = "test"
+        version = "v0"
+        purpose = "test"
+        input_description = "x"
+        output_description = "y"
+        design_decisions: list = []
+
+        def system_message(self, **kwargs):
+            return "sys"
+
+        def user_message(self, **kwargs):
+            return "x"
+
+        @property
+        def schema(self):
+            return {"type": "object"}
+
+    class _Flaky(FakeTransport):
+        def __init__(self):
+            super().__init__()
+            self.bulk_calls = 0
+
+        async def generate_json(self, *, model, messages, response_schema, timeout_s):
+            self.bulk_calls += 1
+            return json.dumps({"a": 1, "b": "ok"}), 0, 0
+
+        async def generate_json_stream_iter(
+            self, *, model, messages, response_schema, timeout_s,
+        ):
+            yield StreamChunk(text='{"a":1')
+            raise TransientLLMError("stream stalled")
+
+    old_retries = settings.llm.max_retries
+    settings.llm.max_retries = 0
+    try:
+        transport = _Flaky()
+        client = GeminiClient(transport)
+        items: list = []
+        async for item in client.call_structured_streaming(
+            template=_Tpl(),
+            model="m",
+            model_cls=_Model,
+        ):
+            items.append(item)
+    finally:
+        settings.llm.max_retries = old_retries
+
+    assert transport.bulk_calls == 1
+    assert isinstance(items[-1], _Model)
+    assert items[-1].a == 1 and items[-1].b == "ok"
+
+
+@pytest.mark.asyncio
 async def test_call_structured_stream_flag_falls_back_to_non_stream_on_transient_error():
     from pydantic import BaseModel
 
@@ -316,7 +463,7 @@ async def test_call_structured_stream_flag_falls_back_to_non_stream_on_transient
 
 
 @pytest.mark.asyncio
-async def test_call_structured_stream_flag_does_not_fallback_when_retries_disabled():
+async def test_call_structured_stream_flag_falls_back_even_when_retries_disabled():
     from pydantic import BaseModel
 
     from app.prompts.base import PromptTemplate
@@ -363,18 +510,19 @@ async def test_call_structured_stream_flag_does_not_fallback_when_retries_disabl
     try:
         transport = _Transport()
         client = GeminiClient(transport)
-        with pytest.raises(TransientLLMError):
-            await client.call_structured(
-                template=_Tpl(),
-                model="m",
-                model_cls=_Model,
-                stream=True,
-            )
+        parsed = await client.call_structured(
+            template=_Tpl(),
+            model="m",
+            model_cls=_Model,
+            stream=True,
+        )
     finally:
         settings.llm.max_retries = old_retries
 
     assert transport.stream_calls == 1
-    assert transport.bulk_calls == 0
+    assert transport.bulk_calls == 1
+    assert parsed.a == 1
+    assert parsed.b == "ok"
 
 
 @pytest.mark.asyncio
@@ -434,7 +582,7 @@ async def test_call_structured_streaming_does_not_repair_when_disabled():
     from pydantic import BaseModel
 
     from app.prompts.base import PromptTemplate
-    from app.services.llm_client import FakeTransport, GeminiClient, StreamChunk, LLMError
+    from app.services.llm_client import FakeTransport, GeminiClient, LLMError, StreamChunk
 
     class _Model(BaseModel):
         a: int

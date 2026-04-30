@@ -78,13 +78,20 @@ async def test_admin_config_masks_secrets():
         assert "model_parser" in g and "model_solver" in g
         assert "model_vizcoder" in g and "model_embed" in g
 
+        e = body["embedding"]
+        assert "api_key_masked" in e
+        assert "api_key" not in e
+        assert "provider" in e and "endpoint" not in e
+        assert "endpoint_configured" in e
+        assert "model" in e and "dimensions" in e
+
         # DSN password (if any) must not appear in cleartext.
         assert "dsn_masked" in body["postgres"]
         assert "password" not in body["postgres"]["dsn_masked"].lower()
 
         # Retrieval config echoed; required keys present.
         r_cfg = body["retrieval"]
-        for k in ("embedder", "sparse_encoder", "multi_route", "rrf_k", "active_dense_dim"):
+        for k in ("sparse_encoder", "multi_route", "rrf_k", "active_dense_dim"):
             assert k in r_cfg
 
         viz_cfg = body["viz"]

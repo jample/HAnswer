@@ -19,7 +19,8 @@ Stage‑1 locked decisions:
 | UI language | Chinese (Simplified) |
 | Frontend | Next.js (App Router, TypeScript) |
 | Backend | FastAPI (Python 3.11+) |
-| LLM | Google Gemini (multimodal + text + embedding) |
+| LLM | Configurable OpenAI-compatible or Gemini transports |
+| Embeddings | Dedicated `[embedding]` provider (OpenAI-compatible by default; Gemini and bge-m3 supported) |
 | Image parsing | Gemini multimodal directly |
 | Vector DB | Milvus standalone (`milvus-standalone:19530`, default DB, no auth) |
 | Relational DB | PostgreSQL (local, `psql -p5432 -U jianbo jianbo`) |
@@ -202,7 +203,7 @@ The LLM is prompted with a cheatsheet of `H`; free JSXGraph via `JXG` / `board` 
 
 ### 3.4 Similar‑Question Retrieval
 - **Query modes**: auto (from current question), free text, by knowledge point, by method pattern.
-- **Embedding model**: the system supports two operator-selectable dense engines. Fast remote mode uses Gemini `text-embedding-004` (or `gemini-embedding-001`) with BM25 sparse retrieval. Stronger local mixed-language recall uses **BAAI/bge-m3** for both dense and sparse signals. bge-m3 is a unified model that produces dense + sparse (lexical) + multi-vector signals in a single forward pass. Dense + sparse heads should reuse the same loaded model instance so memory does not double when both routes are enabled.
+- **Embedding model**: the system supports a dedicated `[embedding]` service config with operator-selectable dense engines. Remote embedding endpoint/key are supplied only through `EMB_URL` and `EMB_API_KEY`. Fast remote mode defaults to an OpenAI-compatible embedding model such as `text-embedding-3-large` with BM25 sparse retrieval; Gemini embeddings remain available by setting `[embedding].provider="gemini"`. Stronger local mixed-language recall uses **BAAI/bge-m3** for both dense and sparse signals. bge-m3 is a unified model that produces dense + sparse (lexical) + multi-vector signals in a single forward pass. Dense + sparse heads should reuse the same loaded model instance so memory does not double when both routes are enabled.
 - **Retrieval task typing**: when Gemini embeddings are active, query-time vectors should use `RETRIEVAL_QUERY` and indexed corpus vectors should use `RETRIEVAL_DOCUMENT`; this avoids the quality loss of embedding both sides with a single generic task type.
 - **Dependency constraint**: the local bge-m3 path depends on `FlagEmbedding` and must pin a `transformers<5` compatible stack. The Gemini dense path may also need both Google SDKs in the same environment: `google-genai` for current Gemini APIs and `google-generativeai` for explicit `text-embedding-004` support.
 - **Multi-route retrieval (RRF fusion)** is the production strategy:
@@ -535,10 +536,10 @@ This preserves inspectability:
 ### 5.3 Backend (FastAPI, Python 3.11+)
 - **Routers**: `ingest`, `answer`, `dialog`, `retrieve`, `practice`, `knowledge`, `admin`.
 - **Services**:
-  - `llm_client` — Gemini gateway; model routing (`gemini-*-pro` vision, text, `text-embedding-*`); JSON mode enforcement; repair loop; task-specific timeouts; optional structured-output streaming for long Solver/VizCoder calls; cost log writer.
+  - `llm_client` — provider-neutral LLM gateway; model routing for parser/solver/viz/dialog; JSON mode enforcement; repair loop; task-specific timeouts; optional structured-output streaming for long Solver/VizCoder calls; cost log writer.
   - `dialog_service` — multi-turn session persistence, question-anchor compaction, rolling-memory refresh.
   - `viz_validator` — wraps Node helper (child process) running `acorn` per 3.3.3.
-  - `embedding` — pluggable; default Gemini embeddings; interface leaves room for local bge‑m3.
+  - `embedding` / `embedding_deps` — pluggable dedicated embedding service; default OpenAI-compatible remote embeddings, with Gemini and local bge‑m3 options.
   - `vector_store` — pymilvus; collection management & query helpers.
   - `db` — async SQLAlchemy 2.x + asyncpg; Alembic migrations.
 - **Schema validation**: pydantic models mirror `AnswerPackage` exactly; LLM forced into JSON structured output.
@@ -604,7 +605,7 @@ Companion sparse collections for M5 multi-route retrieval (`SPARSE_INVERTED_INDE
 - `pattern_emb_sparse`, `kp_emb_sparse` — same scalar fields as their dense siblings but with `sparse_vector (SPARSE_FLOAT_VECTOR)` instead of a fixed-dim dense vector. Populated by the active `SparseEncoder` (`bge-m3` lexical head or online BM25) during the same sediment step (§3.6.2).
 - `question_full_emb_sparse`, `answer_full_emb_sparse`, `retrieval_unit_emb_sparse` — sparse lexical companions for the whole-question, whole-answer, and semantic-facet routes from §3.4.1–§3.4.7.
 
-`embed_dim` comes from `retrieval.embedder`: 1536 for Gemini embeddings, 1024 for `bge-m3`. Swapping embedders changes dense dim but not the sparse schema, so sparse indexes remain schema-compatible across migrations. Even so, operators should recreate dense collections when the dense dim changes, and should recreate sparse collections as well when the sparse encoder family changes (`bge-m3` lexical head ↔ BM25) to avoid stale lexical rows. In the current repo defaults, startup can recreate stale dense collections and rebuild Milvus from PostgreSQL automatically.
+Dense vector dimensionality comes from `[embedding].dimensions` for remote providers or `retrieval.bge_m3_dense_dim` when `[embedding].provider="bge-m3"`. Swapping embedding providers or dimensions changes the dense schema but not the sparse schema, so sparse indexes remain schema-compatible across migrations. Even so, operators should recreate dense collections when the dense dim changes, and should recreate sparse collections as well when the sparse encoder family changes (`bge-m3` lexical head ↔ BM25) to avoid stale lexical rows. In the current repo defaults, startup can recreate stale dense collections and rebuild Milvus from PostgreSQL automatically.
 
 ---
 

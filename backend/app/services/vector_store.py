@@ -284,10 +284,11 @@ class MilvusVectorStore:
             collection_name=collection_name,
             data=[row],
         )
-        await asyncio.to_thread(
-            client.flush,
-            collection_name=collection_name,
-        )
+        if settings.milvus.flush_on_write:
+            await asyncio.to_thread(
+                client.flush,
+                collection_name=collection_name,
+            )
 
     async def _delete_row(
         self,
@@ -305,10 +306,11 @@ class MilvusVectorStore:
             collection_name=collection_name,
             filter=expr,
         )
-        await asyncio.to_thread(
-            client.flush,
-            collection_name=collection_name,
-        )
+        if settings.milvus.flush_on_write:
+            await asyncio.to_thread(
+                client.flush,
+                collection_name=collection_name,
+            )
 
     async def upsert(
         self,

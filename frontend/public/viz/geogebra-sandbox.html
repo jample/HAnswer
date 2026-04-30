@@ -9,7 +9,7 @@
     Host -> iframe:
       { type: 'init' }
       { type: 'render', engine: 'geogebra',
-        ggbCommands: string[], ggbSettings?: object, params?: object }
+        executionPayload?: object, spec?: object, params?: object }
       { type: 'update-params', params: object }
       { type: 'dispose' }
 
@@ -22,8 +22,9 @@
   - CSP (set in next.config.js) allows scripts only from 'self' and
     https://www.geogebra.org / https://cdn.geogebra.org.
   - The sandbox attribute is "allow-scripts allow-same-origin"; the
-    LLM never emits JavaScript here, only GeoGebra command strings
-    interpreted by the GeoGebra runtime.
+    primary execution path is ordered GeoGebra commands, with optional
+    minimal host-side script attachment when the validated payload
+    explicitly requests it.
 -->
 <html lang="zh-CN">
 <head>
@@ -50,6 +51,26 @@
   var ggbApp = null;          // GGBApplet instance (so we can dispose it)
   var currentAppName = null;  // remembers which app surface is mounted
   var pendingRender = null;   // last render request while applet is still loading
+  var scriptListeners = [];
+  var scriptListenerCounter = 0;
+  var activeSpec = null;
+
+  function postTrace(action, details, status, error) {
+    parent.postMessage({
+      type: 'trace',
+      event: {
+        timestamp: new Date().toISOString(),
+        source: 'sandbox',
+        phase: 'runtime',
+        action: action,
+        status: status || 'info',
+        engine: 'geogebra',
+        component: 'sandbox',
+        details: details || {},
+        error: error || null,
+      }
+    }, '*');
+  }
 
   function postReady() {
     parent.postMessage({ type: 'ready' }, '*');
@@ -58,10 +79,13 @@
     var el = document.getElementById('err');
     el.style.display = 'block';
     el.textContent = String(msg);
+    postTrace('runtime.error', { message: String(msg) }, 'error', String(msg));
     parent.postMessage({ type: 'error', message: String(msg) }, '*');
   }
-  function postMetric(renderMs) {
-    parent.postMessage({ type: 'metric', renderMs: renderMs }, '*');
+  function postMetric(renderMs, details) {
+    var payload = Object.assign({ render_ms: renderMs }, details || {});
+    postTrace('runtime.metric', payload, 'ok', null);
+    parent.postMessage({ type: 'metric', renderMs: renderMs, details: details || {} }, '*');
   }
   function clearError() {
     var el = document.getElementById('err');
@@ -149,31 +173,39 @@
     return null;
   }
 
-  function isGeometryHeavy(commands) {
-    var geometryPattern = /(Circle|Segment|Polygon|Tangent|Perpendicular|Parallel|Midpoint|Reflect|Rotate|Bisector|Ray|Line|Intersect|Point|Vector)\s*\(/;
-    for (var i = 0; i < (commands || []).length; i++) {
-      if (geometryPattern.test(String(commands[i] || ''))) return true;
-    }
-    return false;
-  }
-
-  function inferAppName(settings, commands) {
-    var explicit = settings && typeof settings.app_name === 'string'
-      ? settings.app_name.trim().toLowerCase()
+  function inferAppNameFromRequest(req) {
+    var explicit = req
+      && req.executionPayload
+      && typeof req.executionPayload.preferred_geogebra_app === 'string'
+      ? req.executionPayload.preferred_geogebra_app.trim().toLowerCase()
       : '';
-    if (explicit === '3d') return '3d';
-    if (explicit === 'geometry' || explicit === 'classic' || explicit === 'suite') return explicit;
-    if (explicit === 'graphing') {
-      return isGeometryHeavy(commands) ? 'classic' : 'graphing';
+    if (explicit === 'geometry' || explicit === 'graphing' || explicit === 'classic') {
+      return explicit;
     }
-    return isGeometryHeavy(commands) ? 'classic' : 'classic';
+    var fromSpec = req && req.spec && typeof req.spec.preferred_geogebra_app === 'string'
+      ? req.spec.preferred_geogebra_app.trim().toLowerCase()
+      : '';
+    if (fromSpec === 'geometry' || fromSpec === 'graphing' || fromSpec === 'classic') {
+      return fromSpec;
+    }
+    return 'classic';
   }
 
   function inferPerspective(settings, appName) {
-    if (settings && typeof settings.perspective === 'string' && settings.perspective.trim()) {
-      return settings.perspective.trim();
+    var explicit = settings && typeof settings.perspective === 'string'
+      ? settings.perspective.trim()
+      : '';
+    if (explicit) return explicit;
+    switch (String(appName || 'classic').toLowerCase()) {
+      case 'graphing':
+        return 'G';
+      case 'geometry':
+        return 'D';
+      case '3d':
+        return 'T';
+      default:
+        return 'G';
     }
-    return appName === '3d' ? 'T' : 'G';
   }
 
   function maybeApplyApiCommand(cmd) {
@@ -472,10 +504,137 @@
     conditionRegistry.push({ boolName: boolName, listener: listener });
     return true;
   }
+
+  function extractAssignedName(cmd) {
+    var match = /^([A-Za-z_][A-Za-z0-9_]*)\s*(?:\([^)]*\))?\s*=/.exec(String(cmd || '').trim());
+    return match ? match[1] : '';
+  }
+
+  function inferCommandTier(row, index) {
+    var purpose = String(row && row.purpose || '').trim().toLowerCase();
+    if (purpose.indexOf('[core]') === 0) return 'core';
+    if (purpose.indexOf('[support]') === 0) return 'support';
+    if (purpose.indexOf('[annotation]') === 0) return 'annotation';
+    var cmd = String(row && row.command || '').trim();
+    if (/^\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*Text\s*\(/.test(cmd) || /^\s*Text\s*\(/.test(cmd)) {
+      return 'annotation';
+    }
+    return index < 8 ? 'core' : 'support';
+  }
+
+  function objectExists(name) {
+    if (!name || !ggbApi || typeof ggbApi.exists !== 'function') return false;
+    try { return !!ggbApi.exists(name); } catch (_) { return false; }
+  }
+
+  function getObjectNames() {
+    if (!ggbApi) return [];
+    try {
+      if (typeof ggbApi.getAllObjectNames === 'function') {
+        var names = ggbApi.getAllObjectNames();
+        if (Array.isArray(names)) return names.map(function (name) {
+          return String(name || '').trim();
+        }).filter(Boolean);
+        if (typeof names === 'string') return names.split(',').map(function (name) {
+          return name.trim();
+        }).filter(Boolean);
+      }
+    } catch (_) {}
+    return [];
+  }
+
+  function getObjectCount() {
+    var names = getObjectNames();
+    if (Array.isArray(names)) return names.length;
+    return 0;
+  }
+
+  function createdLabelsFrom(raw) {
+    return raw
+      ? String(raw).split(',').map(function (name) { return name.trim(); }).filter(Boolean)
+      : [];
+  }
+
+  function nameSetFrom(names) {
+    var out = {};
+    if (!Array.isArray(names)) return out;
+    names.forEach(function (name) {
+      var key = String(name || '').trim();
+      if (key) out[key] = true;
+    });
+    return out;
+  }
+
+  function tryRenameCreatedObjectToLhs(labels, lhs) {
+    if (!lhs || objectExists(lhs) || !ggbApi || typeof ggbApi.renameObject !== 'function') {
+      return objectExists(lhs);
+    }
+    if (!Array.isArray(labels) || !labels.length) return false;
+    for (var i = 0; i < labels.length; i++) {
+      var candidate = String(labels[i] || '').trim();
+      if (!candidate || candidate === lhs || !objectExists(candidate)) continue;
+      try {
+        if (ggbApi.renameObject(candidate, lhs) && objectExists(lhs)) {
+          labels[i] = lhs;
+          postTrace('payload.create.step.renamed', {
+            from: candidate,
+            to: lhs,
+          }, 'degraded', 'GeoGebra auto-named an assigned object; renamed it to the requested label');
+          return true;
+        }
+      } catch (_) {}
+    }
+    return objectExists(lhs);
+  }
+
   // ── 1. Bootstrap the GeoGebra applet ───────────────────────────────
-  function bootstrap(settings, commands) {
-    var appName = inferAppName(settings || {}, commands || []);
-    var perspective = inferPerspective(settings || {}, appName);
+  function disposeScriptListeners() {
+    if (!ggbApi) {
+      scriptListeners = [];
+      return;
+    }
+    for (var i = 0; i < scriptListeners.length; i++) {
+      var entry = scriptListeners[i];
+      try {
+        if (entry.kind === 'click' && typeof ggbApi.unregisterObjectClickListener === 'function') {
+          ggbApi.unregisterObjectClickListener(entry.name);
+        }
+        if (entry.kind === 'update' && typeof ggbApi.unregisterObjectUpdateListener === 'function') {
+          ggbApi.unregisterObjectUpdateListener(entry.name);
+        }
+      } catch (_) {}
+      try {
+        if (entry.fnName && Object.prototype.hasOwnProperty.call(window, entry.fnName)) {
+          delete window[entry.fnName];
+        }
+      } catch (_) {}
+    }
+    scriptListeners = [];
+  }
+
+  function buildSettingsFromSpec(spec, appName) {
+    var viewport = spec
+      && spec.visual_design
+      && spec.visual_design.coordinate_system
+      && spec.visual_design.coordinate_system.suggested_viewport
+      ? spec.visual_design.coordinate_system.suggested_viewport
+      : null;
+    return {
+      perspective: appName === '3d' ? 'T' : 'G',
+      coord_system: viewport
+        ? [viewport.xmin, viewport.xmax, viewport.ymin, viewport.ymax]
+        : null,
+      axes_visible: true,
+      grid_visible: false,
+      show_algebra_input: false,
+      show_tool_bar: false,
+      show_menu_bar: false,
+    };
+  }
+
+  function bootstrap(req) {
+    var appName = inferAppNameFromRequest(req);
+    var settings = buildSettingsFromSpec(req.spec || null, appName);
     if (ggbApp) {
       try { if (ggbApi && ggbApi.remove) ggbApi.remove(); } catch (_) {}
       ggbApp = null;
@@ -487,7 +646,7 @@
     }
     var params = {
       appName: appName,
-      perspective: perspective,
+      perspective: settings.perspective,
       width: window.innerWidth || 600,
       height: window.innerHeight || 400,
       showToolBar: false,
@@ -568,35 +727,327 @@
     }
   }
 
-  function runCommands(commands) {
-    if (!commands || !commands.length) return;
-    var failures = [];
-    for (var i = 0; i < commands.length; i++) {
-      var cmd = String(commands[i] || '').trim();
+  function runCommandSteps(steps) {
+    if (!steps || !steps.length) {
+      return { createdObjects: [], partialFailures: [], coreFailures: [] };
+    }
+    postTrace('payload.create.start', { command_count: steps.length }, 'info', null);
+    var partialFailures = [];
+    var coreFailures = [];
+    var createdObjects = [];
+    for (var i = 0; i < steps.length; i++) {
+      var row = steps[i] || {};
+      var cmd = String(row.command || '').trim();
       if (!cmd) continue;
+      var tier = inferCommandTier(row, i);
+      var lhs = extractAssignedName(cmd);
+      var beforeNameSet = nameSetFrom(getObjectNames());
+      postTrace('payload.create.step.start', {
+        step: row.step,
+        command: cmd,
+        purpose: row.purpose || '',
+        tier: tier,
+        lhs: lhs || null,
+      }, 'info', null);
       try {
-        // Some style/view directives must go through the Apps API
-        // (evalCommand doesn't support setCoordSystem etc.). For everything
-        // else we hand the verbatim command to the GeoGebra parser.
-        if (maybeApplyApiCommand(cmd)) continue;
-        if (maybeCreateImplicitLine(cmd)) continue;
-        if (maybeApplyShowCondition(cmd)) continue;
-        var ok = ggbApi.evalCommand(cmd);
-        if (ok === false) failures.push({ index: i, cmd: cmd });
+        var handledByBridge = false;
+        if (maybeApplyApiCommand(cmd) || maybeCreateImplicitLine(cmd) || maybeApplyShowCondition(cmd)) {
+          handledByBridge = true;
+        }
+        var created = '';
+        if (!handledByBridge) {
+          if (typeof ggbApi.evalCommandGetLabels === 'function') {
+            created = String(ggbApi.evalCommandGetLabels(cmd) || '');
+          } else {
+            var ok = ggbApi.evalCommand(cmd);
+            if (ok === false) {
+              throw new Error('evalCommand returned false');
+            }
+          }
+        }
+        var labels = createdLabelsFrom(created);
+        var existsLhs = lhs ? objectExists(lhs) : true;
+        if (lhs && !existsLhs) {
+          getObjectNames().forEach(function (name) {
+            if (!beforeNameSet[name] && labels.indexOf(name) < 0) labels.push(name);
+          });
+        }
+        if (lhs && !existsLhs) {
+          existsLhs = tryRenameCreatedObjectToLhs(labels, lhs);
+        }
+        if (lhs && !existsLhs) {
+          throw new Error('assigned object was not created: ' + lhs);
+        }
+        if (lhs && labels.indexOf(lhs) < 0) labels.push(lhs);
+        createdObjects = createdObjects.concat(labels);
+        postTrace('payload.create.step.ok', {
+          step: row.step,
+          command: cmd,
+          created_labels: labels,
+          tier: tier,
+          lhs: lhs || null,
+          exists_lhs: existsLhs,
+        }, 'ok', null);
       } catch (e) {
-        failures.push({ index: i, cmd: cmd, err: String(e && e.message || e) });
+        var failure = {
+          phase: 'create',
+          step: row.step,
+          cmd: cmd,
+          tier: tier,
+          lhs: lhs || null,
+          err: String(e && e.message || e),
+        };
+        postTrace('payload.create.step.error', {
+          step: row.step,
+          command: cmd,
+          tier: tier,
+          lhs: lhs || null,
+          continued_after_failure: tier !== 'core',
+        }, 'error', String(e && e.message || e));
+        if (tier === 'core') {
+          coreFailures.push(failure);
+          break;
+        }
+        partialFailures.push(failure);
+      }
+    }
+    if (coreFailures.length) {
+      var preview = coreFailures.slice(0, 3).map(function (f) {
+        return '#' + f.step + ' "' + f.cmd + '"' + (f.err ? ' (' + f.err + ')' : '');
+      }).join('; ');
+      postTrace('payload.create.error', {
+        command_count: steps.length,
+        failure_count: coreFailures.length,
+        failures: coreFailures.slice(0, 5)
+      }, 'error', preview);
+      throw new Error(preview);
+    }
+    if (partialFailures.length) {
+      var partialPreview = partialFailures.slice(0, 3).map(function (f) {
+        return '#' + f.step + ' "' + f.cmd + '"' + (f.err ? ' (' + f.err + ')' : '');
+      }).join('; ');
+      postTrace('payload.create.partial', {
+        command_count: steps.length,
+        failure_count: partialFailures.length,
+        failures: partialFailures.slice(0, 5),
+      }, 'degraded', partialPreview);
+    }
+    postTrace('payload.create.ok', {
+      command_count: steps.length,
+      created_labels: createdObjects,
+      partial_failure_count: partialFailures.length,
+    }, 'ok', null);
+    return { createdObjects: createdObjects, partialFailures: partialFailures, coreFailures: coreFailures };
+  }
+
+  function runPropertyCommandSteps(steps) {
+    if (!steps || !steps.length) return;
+    postTrace('payload.property.start', { command_count: steps.length }, 'info', null);
+    var failures = [];
+    for (var i = 0; i < steps.length; i++) {
+      var row = steps[i] || {};
+      var cmd = String(row.command || '').trim();
+      if (!cmd) continue;
+      postTrace('payload.property.step.start', { step: row.step, command: cmd, purpose: row.purpose || '' }, 'info', null);
+      try {
+        if (maybeApplyApiCommand(cmd) || maybeCreateImplicitLine(cmd) || maybeApplyShowCondition(cmd)) {
+          postTrace('payload.property.step.ok', { step: row.step, command: cmd }, 'ok', null);
+          continue;
+        }
+        var ok = ggbApi.evalCommand(cmd);
+        if (ok === false) {
+          failures.push({ phase: 'property', step: row.step, cmd: cmd });
+          continue;
+        }
+        postTrace('payload.property.step.ok', { step: row.step, command: cmd }, 'ok', null);
+      } catch (e) {
+        failures.push({ phase: 'property', step: row.step, cmd: cmd, err: String(e && e.message || e) });
+        postTrace('payload.property.step.error', { step: row.step, command: cmd }, 'error', String(e && e.message || e));
       }
     }
     if (failures.length) {
       var preview = failures.slice(0, 3).map(function (f) {
-        return '#' + f.index + ' "' + f.cmd + '"' + (f.err ? ' (' + f.err + ')' : '');
+        return '#' + f.step + ' "' + f.cmd + '"' + (f.err ? ' (' + f.err + ')' : '');
       }).join('; ');
-      postError('GeoGebra 命令失败 ' + failures.length + '/' + commands.length + ': ' + preview);
+      postTrace('payload.property.degraded', {
+        command_count: steps.length,
+        failure_count: failures.length,
+        failures: failures.slice(0, 5)
+      }, 'degraded', preview);
+      return;
+    }
+    postTrace('payload.property.ok', { command_count: steps.length }, 'ok', null);
+  }
+
+  function checkExpectedCreatedObjects(payload, createdObjects) {
+    var expected = payload && Array.isArray(payload.expected_created_objects)
+      ? payload.expected_created_objects
+      : [];
+    var commandTiers = buildCommandTierMap(payload && payload.commands || []);
+    var createdSet = nameSetFrom(createdObjects || []);
+    if (!expected.length || !ggbApi) {
+      return { missingCore: [], missingSupport: [], missingSoft: [], coreExpectedCount: 0 };
+    }
+    var missing = [];
+    var supportMissing = [];
+    var softMissing = [];
+    var coreExpectedCount = 0;
+    for (var i = 0; i < expected.length; i++) {
+      var row = expected[i] || {};
+      var name = String(row.name || '').trim();
+      if (!name) continue;
+      var tier = expectedObjectTier(row, commandTiers);
+      if (tier === 'core') coreExpectedCount += 1;
+      try {
+        if (!ggbApi.exists(name) && !createdSet[name]) {
+          if (tier === 'annotation') softMissing.push(name);
+          else if (tier === 'support') supportMissing.push(name);
+          else missing.push(name);
+        } else if (!ggbApi.exists(name) && createdSet[name]) {
+          postTrace('payload.expected_objects.check.created_only', {
+            name: name,
+            tier: tier,
+          }, 'degraded', 'Expected object was reported as created but no longer answers exists()');
+        }
+      } catch (_) {
+        if (createdSet[name]) {
+          postTrace('payload.expected_objects.check.created_only', {
+            name: name,
+            tier: tier,
+          }, 'degraded', 'Expected object was reported as created but exists() check failed');
+        } else if (tier === 'annotation') softMissing.push(name);
+        else if (tier === 'support') supportMissing.push(name);
+        else missing.push(name);
+      }
+    }
+    if (supportMissing.length) {
+      postTrace('payload.expected_objects.check.partial', {
+        missing: supportMissing
+      }, 'degraded', 'Missing support expected GeoGebra objects');
+    }
+    if (softMissing.length) {
+      postTrace('payload.expected_objects.check.degraded', {
+        missing: softMissing
+      }, 'degraded', 'Missing non-core expected GeoGebra display objects');
+    }
+    if (missing.length) {
+      postTrace('payload.expected_objects.check.error', { missing: missing }, 'error', 'Missing expected GeoGebra objects');
+      throw new Error('Missing expected GeoGebra objects: ' + missing.join(', '));
+    }
+    postTrace('payload.expected_objects.check.ok', {
+      names: expected.map(function (row) { return row.name; })
+    }, 'ok', null);
+    return {
+      missingCore: missing,
+      missingSupport: supportMissing,
+      missingSoft: softMissing,
+      coreExpectedCount: coreExpectedCount,
+    };
+  }
+
+  function buildCommandTierMap(steps) {
+    var tiers = {};
+    if (!Array.isArray(steps)) return tiers;
+    for (var i = 0; i < steps.length; i++) {
+      var row = steps[i] || {};
+      var lhs = extractAssignedName(row.command || '');
+      if (lhs && !tiers[lhs]) tiers[lhs] = inferCommandTier(row, i);
+    }
+    return tiers;
+  }
+
+  function expectedObjectTier(row, commandTiers) {
+    var name = String(row && row.name || '').trim();
+    var fromCommand = name && commandTiers ? commandTiers[name] : '';
+    if (fromCommand === 'core' || fromCommand === 'support' || fromCommand === 'annotation') {
+      return fromCommand;
+    }
+    if (isSoftExpectedObject(row)) return 'annotation';
+    if (isSupportExpectedObject(row)) return 'support';
+    return 'core';
+  }
+
+  function isSoftExpectedObject(row) {
+    var name = String(row && row.name || '').trim().toLowerCase();
+    var type = String(row && row.type || '').trim().toLowerCase();
+    var role = String(row && row.role || '').trim().toLowerCase();
+    if (type === 'text' || type === 'label' || type === 'caption' || type === 'dynamic_text') return true;
+    if (name.endsWith('_text') || name.endsWith('text')) return true;
+    return role.indexOf('text') >= 0
+      || role.indexOf('label') >= 0
+      || role.indexOf('caption') >= 0
+      || role.indexOf('display') >= 0
+      || role.indexOf('annotation') >= 0;
+  }
+
+  function isSupportExpectedObject(row) {
+    var role = String(row && row.role || '').trim().toLowerCase();
+    var type = String(row && row.type || '').trim().toLowerCase();
+    return role.indexOf('support') >= 0
+      || role.indexOf('helper') >= 0
+      || role.indexOf('auxiliary') >= 0
+      || type === 'helper'
+      || type === 'auxiliary';
+  }
+
+  function runOptionalScriptNow(optionalScript, params) {
+    if (!optionalScript || !optionalScript.needed || !ggbApi) return;
+    if (optionalScript.script_type === 'ggbscript') {
+      var body = String(optionalScript.script_body || '').trim();
+      if (body) {
+        ggbApi.evalCommand(body);
+      }
+      return;
+    }
+    if (optionalScript.script_type === 'javascript') {
+      var fn = new Function('ggbApi', 'spec', 'params', String(optionalScript.script_body || ''));
+      fn(ggbApi, activeSpec || {}, params || {});
+    }
+  }
+
+  function attachOptionalScript(optionalScript, params) {
+    if (!optionalScript || !optionalScript.needed || !ggbApi) return;
+    postTrace('payload.script.attach.start', {
+      script_type: optionalScript.script_type,
+      trigger: optionalScript.trigger,
+      target_object: optionalScript.target_object,
+    }, 'info', null);
+    try {
+      if (optionalScript.trigger === 'on_load' || optionalScript.trigger === 'none') {
+        runOptionalScriptNow(optionalScript, params);
+        postTrace('payload.script.attach.ok', { trigger: optionalScript.trigger }, 'ok', null);
+        return;
+      }
+      var target = String(optionalScript.target_object || '').trim();
+      if (!target) throw new Error('optional_script.target_object is required for event triggers');
+      var handler = function () { runOptionalScriptNow(optionalScript, params); };
+      scriptListenerCounter += 1;
+      var fnName = '__hanswerScriptListener_' + scriptListenerCounter;
+      window[fnName] = handler;
+      if (optionalScript.trigger === 'on_click' && typeof ggbApi.registerObjectClickListener === 'function') {
+        ggbApi.registerObjectClickListener(target, fnName);
+        scriptListeners.push({ kind: 'click', name: target, fnName: fnName });
+      } else if ((optionalScript.trigger === 'on_update' || optionalScript.trigger === 'on_drag_end')
+        && typeof ggbApi.registerObjectUpdateListener === 'function') {
+        ggbApi.registerObjectUpdateListener(target, fnName);
+        scriptListeners.push({ kind: 'update', name: target, fnName: fnName });
+      } else {
+        try { delete window[fnName]; } catch (_) {}
+        throw new Error('unsupported script trigger: ' + optionalScript.trigger);
+      }
+      postTrace('payload.script.attach.ok', { trigger: optionalScript.trigger, target_object: target }, 'ok', null);
+    } catch (e) {
+      postTrace('payload.script.attach.error', {
+        trigger: optionalScript.trigger,
+        target_object: optionalScript.target_object,
+      }, 'error', String(e && e.message || e));
+      throw e;
     }
   }
 
   function applyParams(params) {
     if (!params || !ggbApi) return;
+    postTrace('params.apply.start', { names: Object.keys(params) }, 'info', null);
     Object.keys(params).forEach(function (name) {
       if (!ggbApi.exists(name)) return;
       var v = params[name];
@@ -612,6 +1063,7 @@
         console.warn('setValue failed for', name, e);
       }
     });
+    postTrace('params.apply.finished', { names: Object.keys(params) }, 'ok', null);
   }
 
   function renderNow(req) {
@@ -621,23 +1073,68 @@
     }
     clearError();
     var t0 = performance.now();
+    var payload = req.executionPayload || {};
+    activeSpec = req.spec || null;
+    postTrace('render.start', {
+      command_count: (payload.commands || []).length,
+      property_command_count: (payload.property_commands || []).length,
+      parameter_names: Object.keys(req.params || {}),
+      app_name: currentAppName,
+      execution_mode: payload.execution_mode || 'command_only'
+    }, 'info', null);
     try {
       // Wipe prior construction so re-renders are deterministic.
       try { ggbApi.reset(); } catch (_) {
         try { ggbApi.newConstruction(); } catch (_) {}
       }
       disposeConditions();
+      disposeScriptListeners();
       ggbApi.setRepaintingActive(false);
-      applySettings(req.ggbSettings);
-      runCommands(req.ggbCommands);
+      applySettings(buildSettingsFromSpec(req.spec || null, currentAppName || 'classic'));
+      if (!payload.commands || !payload.commands.length) {
+        postTrace('render.empty', { command_count: 0 }, 'degraded', 'GeoGebra command list is empty');
+      }
+      var createResult = runCommandSteps(payload.commands || []);
+      runPropertyCommandSteps(payload.property_commands || []);
+      attachOptionalScript(payload.optional_script || null, req.params || {});
+      var expectedResult = checkExpectedCreatedObjects(payload, createResult.createdObjects || []);
       applyParams(req.params);
-      ggbApi.setRepaintingActive(true);
       try { ggbApi.showAllObjects && ggbApi.showAllObjects(); } catch (_) {}
+      var objectCount = getObjectCount();
+      if (objectCount === 0 && createResult.createdObjects && createResult.createdObjects.length > 0) {
+        objectCount = createResult.createdObjects.length;
+      }
+      if (objectCount === 0 && (payload.commands || []).length > 0) {
+        postTrace('render.empty_runtime', {
+          command_count: (payload.commands || []).length,
+          created_labels: createResult.createdObjects || [],
+        }, 'error', 'GeoGebra runtime contains no objects after command execution');
+        throw new Error('GeoGebra runtime contains no objects after command execution');
+      }
+      var partialFailureCount = (createResult.partialFailures || []).length
+        + ((expectedResult && expectedResult.missingSupport) ? expectedResult.missingSupport.length : 0)
+        + ((expectedResult && expectedResult.missingSoft) ? expectedResult.missingSoft.length : 0);
+      if (partialFailureCount > 0) {
+        postTrace('runtime.partial_passed', {
+          object_count: objectCount,
+          partial_failure_count: partialFailureCount,
+          created_labels: createResult.createdObjects || [],
+        }, 'degraded', 'Core GeoGebra objects rendered with partial support/annotation failures');
+      }
+      postMetric(performance.now() - t0, {
+        object_count: objectCount,
+        core_expected_count: expectedResult && typeof expectedResult.coreExpectedCount === 'number'
+          ? expectedResult.coreExpectedCount
+          : 0,
+        missing_core_count: 0,
+        partial_failure_count: partialFailureCount,
+      });
     } catch (e) {
       postError('渲染异常: ' + (e && e.message || e));
       return;
+    } finally {
+      try { ggbApi && ggbApi.setRepaintingActive(true); } catch (_) {}
     }
-    postMetric(performance.now() - t0);
     postReady();
   }
 
@@ -649,17 +1146,16 @@
         postReady();
         break;
       case 'render': {
-        var settings = msg.ggbSettings || {};
-        var appName = inferAppName(settings, msg.ggbCommands || []);
         var req = {
-          ggbCommands: msg.ggbCommands || [],
-          ggbSettings: settings,
+          executionPayload: msg.executionPayload || null,
+          spec: msg.spec || null,
           params: msg.params || {},
         };
+        var appName = inferAppNameFromRequest(req);
         // (Re)bootstrap if no applet yet, or app type changed.
         if (!ggbApi || currentAppName !== appName) {
           pendingRender = req;
-          bootstrap(settings, req.ggbCommands);
+          bootstrap(req);
         } else {
           renderNow(req);
         }
@@ -669,6 +1165,7 @@
         applyParams(msg.params || {});
         break;
       case 'dispose':
+        disposeScriptListeners();
         try { if (ggbApi && ggbApi.remove) ggbApi.remove(); } catch (_) {}
         ggbApi = null; ggbApp = null; currentAppName = null;
         break;

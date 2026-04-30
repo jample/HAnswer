@@ -8,11 +8,64 @@ validation (repair loop).
 
 from __future__ import annotations
 
+from copy import deepcopy
+
+from app.schemas.llm import (
+    GeoGebraExecutionPayload,
+    GeoGebraExecutionPayloadDraft,
+)
+from app.schemas.visualization_spec import VisualizationSpec, VisualizationSpecBundle
+
+
+def _compact_schema_for_gemini(schema: dict) -> dict:
+    """Remove high-state JSON Schema constraints that Gemini rejects.
+
+    Gemini response_json_schema is more fragile than runtime Pydantic validation.
+    For large nested contracts like VisualizationSpecBundle, keep the object shape
+    and required fields, but strip enums, numeric/string bounds, and verbose
+    metadata. The strict semantic checks still run later via model_validate_json().
+    """
+
+    STRIP_KEYS = {
+        "title",
+        "description",
+        "default",
+        "examples",
+        "enum",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "minItems",
+        "maxItems",
+        "minLength",
+        "maxLength",
+        "pattern",
+        "format",
+    }
+
+    def _visit(node, *, inside_properties: bool = False):
+        if isinstance(node, dict):
+            compact: dict = {}
+            for key, value in node.items():
+                # Inside a "properties" dict the keys are real field names,
+                # not JSON Schema metadata — keep them even if they collide
+                # (e.g. a model field literally named "title").
+                if not inside_properties and key in STRIP_KEYS:
+                    continue
+                compact[key] = _visit(value, inside_properties=(key == "properties"))
+            return compact
+        if isinstance(node, list):
+            return [_visit(item) for item in node]
+        return node
+
+    return _visit(deepcopy(schema))
+
 # ── ParsedQuestion ──────────────────────────────────────────────────
 
 PARSED_QUESTION_SCHEMA: dict = {
     "type": "object",
-    "description": "Gemini 从题目图片中解析出的结构化题目信息",
+    "description": "Structured problem information parsed by Gemini from a problem image.",
     "required": [
         "subject", "grade_band", "topic_path", "question_text",
         "given", "find", "difficulty", "confidence",
@@ -20,43 +73,43 @@ PARSED_QUESTION_SCHEMA: dict = {
     "properties": {
         "subject": {
             "type": "string", "enum": ["math", "physics"],
-            "description": "学科: math=数学, physics=物理",
+            "description": "Subject: math or physics.",
         },
         "grade_band": {
             "type": "string", "enum": ["junior", "senior"],
-            "description": "学段: junior=初中(7-9年级), senior=高中(10-12年级)",
+            "description": "Grade band: junior=middle school (grades 7-9), senior=high school (grades 10-12).",
         },
         "topic_path": {
             "type": "array", "items": {"type": "string"},
-            "description": "知识点分类路径, 由粗到细, 如 ['几何','三角形','全等三角形']",
+            "description": "Knowledge-point path from coarse to fine, for example ['几何', '三角形', '全等三角形'].",
         },
         "question_text": {
             "type": "string",
-            "description": "完整题目文本, 数学公式用 LaTeX 并以 $ 包裹",
+            "description": "Full problem text. Math expressions should use LaTeX wrapped in $...$.",
         },
         "given": {
             "type": "array", "items": {"type": "string"},
-            "description": "已知条件列表, 每条一条, 可含 LaTeX",
+            "description": "List of given conditions, one fact per string. May contain LaTeX.",
         },
         "find": {
             "type": "array", "items": {"type": "string"},
-            "description": "求解目标列表",
+            "description": "List of target unknowns / tasks to solve.",
         },
         "diagram_description": {
             "type": "string",
-            "description": "题目中图形/示意图的文字描述; 没有图则为空字符串",
+            "description": "Text description of the figure / diagram in the problem. Empty string if there is no figure.",
         },
         "difficulty": {
             "type": "integer", "minimum": 1, "maximum": 5,
-            "description": "难度: 1基础 2偏易 3中等 4偏难 5竞赛/压轴",
+            "description": "Difficulty level: 1 basic, 2 easy, 3 medium, 4 hard, 5 competition / olympiad style.",
         },
         "tags": {
             "type": "array", "items": {"type": "string"},
-            "description": "自由标签, 如 ['辅助线','分类讨论']",
+            "description": "Free-form tags, for example ['辅助线', '分类讨论'].",
         },
         "confidence": {
             "type": "number", "minimum": 0, "maximum": 1,
-            "description": "整体解析置信度, 低于 0.5 时会触发 UI 确认",
+            "description": "Overall parsing confidence. The UI may ask for confirmation when it is below 0.5.",
         },
     },
     "additionalProperties": False,
@@ -66,7 +119,7 @@ PARSED_QUESTION_SCHEMA: dict = {
 
 ANSWER_PACKAGE_SCHEMA: dict = {
     "type": "object",
-    "description": "教学型答案包; 方法模式是首要产出, 数值答案次之",
+    "description": "Teaching-oriented answer package. The primary deliverable is the reusable method pattern, not just the numeric answer.",
     "required": [
         "question_understanding",
         "key_points_of_question",
@@ -90,7 +143,7 @@ ANSWER_PACKAGE_SCHEMA: dict = {
         },
         "key_points_of_question": {
             "type": "array", "items": {"type": "string"},
-            "description": "这道题的难点/易错点 (让学生知道'难在哪')",
+            "description": "Key bottlenecks / common mistakes in the problem so the student knows where the real difficulty lies.",
         },
         "solution_steps": {
             "type": "array",
@@ -100,19 +153,19 @@ ANSWER_PACKAGE_SCHEMA: dict = {
                 "properties": {
                     "step_index": {"type": "integer"},
                     "statement": {"type": "string"},
-                    "rationale": {"type": "string", "description": "这一步为什么成立"},
+                    "rationale": {"type": "string", "description": "Why this step is valid."},
                     "formula": {"type": "string"},
                     "why_this_step": {
                         "type": "string",
-                        "description": "为什么选这个方法而非其他 (教学核心)",
+                        "description": "Why this method / step is chosen instead of another one. This is the core teaching field.",
                     },
-                    "viz_ref": {"type": "string", "description": "对应可视化 id (可选)"},
+                    "viz_ref": {"type": "string", "description": "Suggested visualization id for this step (optional)."},
                 },
             },
         },
         "key_points_of_answer": {
             "type": "array", "items": {"type": "string"},
-            "description": "学生必须掌握的核心结论/洞见",
+            "description": "Core conclusions / insights the student should retain after reading the answer.",
         },
         "method_pattern": {
             "type": "object",
@@ -127,7 +180,7 @@ ANSWER_PACKAGE_SCHEMA: dict = {
                 "general_procedure": {"type": "array", "items": {"type": "string"}},
                 "pitfalls": {"type": "array", "items": {"type": "string"}},
             },
-            "description": "解题方法模式 — 本应用最核心的教学产出",
+            "description": "Reusable solving pattern. This is the most important teaching deliverable in the app.",
         },
         "similar_questions": {
             "type": "array", "minItems": 3, "maxItems": 3,
@@ -144,7 +197,7 @@ ANSWER_PACKAGE_SCHEMA: dict = {
                     "difficulty_delta": {"type": "integer", "minimum": -2, "maximum": 2},
                 },
             },
-            "description": "3 道同类题: 一易一同一难, 用相同方法模式",
+            "description": "Exactly 3 same-pattern questions: one easier, one same level, one harder.",
         },
         "knowledge_points": {
             "type": "array",
@@ -154,7 +207,7 @@ ANSWER_PACKAGE_SCHEMA: dict = {
                 "properties": {
                     "node_ref": {
                         "type": "string",
-                        "description": "已有 id 或 'new:路径' (如 'new:二次函数>顶点式')",
+                        "description": "Existing id or a newly suggested path in the format 'new:path', for example 'new:二次函数>顶点式'.",
                     },
                     "weight": {"type": "number", "minimum": 0, "maximum": 1},
                 },
@@ -173,16 +226,16 @@ CONVERSATION_TURN_RESULT_SCHEMA: dict = {
     "properties": {
         "title_suggested": {
             "type": "string",
-            "description": "为当前会话建议的简短标题; 若不需要更新则返回空字符串",
+            "description": "Suggested short title for the current session. Return an empty string when no update is needed.",
         },
         "assistant_reply": {
             "type": "string",
-            "description": "给用户的最终回答, 使用简体中文, 可包含 Markdown 和 LaTeX",
+            "description": "Final reply shown to the user. Must be in Simplified Chinese and may contain Markdown and LaTeX.",
         },
         "follow_up_suggestions": {
             "type": "array",
             "items": {"type": "string"},
-            "description": "建议用户继续追问的 0-3 个方向",
+            "description": "0-3 suggested follow-up directions for the user.",
         },
         "memory": {
             "type": "object",
@@ -190,17 +243,17 @@ CONVERSATION_TURN_RESULT_SCHEMA: dict = {
             "properties": {
                 "summary": {
                     "type": "string",
-                    "description": "当前对话的滚动摘要, 用于下一轮上下文压缩",
+                    "description": "Rolling summary of the current conversation for next-turn context compression.",
                 },
                 "key_facts": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "应跨轮保留的稳定事实、结论、用户偏好或约束",
+                    "description": "Stable facts, conclusions, user preferences, or constraints worth preserving across turns.",
                 },
                 "open_questions": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "仍待澄清或后续要继续回答的问题",
+                    "description": "Questions that remain unresolved and may need follow-up later.",
                 },
             },
             "additionalProperties": False,
@@ -225,47 +278,32 @@ VISUALIZATION_SCHEMA: dict = {
             "type": "string",
             "enum": ["geogebra", "jsxgraph"],
             "description": (
-                "渲染引擎。服务端会通过配置决定默认偏好; 当前可选"
-                " 'geogebra' (GeoGebra Apps API) 或 'jsxgraph'。"
+                "Rendering engine. The server chooses the default preference by configuration. Currently supported values are 'geogebra' (GeoGebra Apps API) and 'jsxgraph'."
             ),
         },
         "ggb_commands": {
             "type": "array",
             "items": {"type": "string"},
             "description": (
-                "GeoGebra 命令字符串列表 (engine=geogebra 时必须), 按顺序传给"
-                "ggbApplet.evalCommand()。每条一个完整命令, 例如:"
-                " 'f(x)=x^2', 'A=(1,2)', 'C=Circle((0,0),1)',"
-                " 'a=Slider(-3,3,0.1)', 'SetAnimating(a,true)',"
-                " 'StartAnimation()'。命令名必须是英文。"
-                " 这里只放创建对象/样式/动画命令; SetCoordSystem /"
-                " SetGridVisible / SetAxesVisible / SetPerspective 这类视图或"
-                " 布局控制应写入 ggb_settings。对象标签尽量使用简短 ASCII 名称,"
-                " 若某个交互参数出现在 params 中, 这里只定义同名对象, 不要"
-                " 再写 SetValue(name, value) 初始化; 初始值统一放到"
-                " params[].default。"
-                " 避免下划线和中文。"
-                "禁止换行符 (一行一个命令); 单条命令最长 512 字符; 总数 ≤ 64。"
+                "List of GeoGebra command strings (required when engine=geogebra), executed in order via ggbApplet.evalCommand(). Each entry must be one full command such as 'f(x)=x^2', 'A=(1,2)', 'C=Circle((0,0),1)', 'a=Slider(-3,3,0.1)', 'SetAnimating(a,true)', or 'StartAnimation()'. Command names must be English. Only object / style / animation commands belong here; view controls such as SetCoordSystem / SetGridVisible / SetAxesVisible / SetPerspective belong in ggb_settings. Prefer short ASCII object labels. If an interactive parameter appears in params, define only the same-name object here and do not initialize it again with SetValue(name, value); use params[].default instead. Avoid underscores and Chinese labels. No newline characters inside a single command. Max 512 characters per command, max 64 commands total."
             ),
         },
         "ggb_settings": {
             "type": "object",
-            "description": "GeoGebra applet 配置 (engine=geogebra 时可选)。",
+            "description": "GeoGebra applet configuration (optional when engine=geogebra).",
             "properties": {
                 "app_name": {
                     "type": "string",
                     "enum": ["graphing", "geometry", "3d", "classic", "suite"],
                     "description": (
-                        "选哪个 GeoGebra app: classic=大多数 2D 题推荐默认值,"
-                        " geometry=平面几何作图, graphing=纯函数/坐标图,"
-                        " 3d=立体几何/3D 物理, suite=多视图。"
+                        "Which GeoGebra app to use: classic is the recommended default for most 2D problems, geometry for plane construction, graphing for pure function / coordinate plots, 3d for solid geometry or 3D physics, suite for multi-view use cases."
                     ),
                 },
                 "perspective": {"type": "string"},
                 "coord_system": {
                     "type": "array",
                     "items": {"type": "number"},
-                    "description": "可视区: 2D 给 [xmin,xmax,ymin,ymax], 3D 给 6 个数。",
+                    "description": "Visible coordinate range: use [xmin, xmax, ymin, ymax] for 2D, or 6 numbers for 3D.",
                 },
                 "axes_visible": {"type": "boolean"},
                 "grid_visible": {"type": "boolean"},
@@ -278,14 +316,7 @@ VISUALIZATION_SCHEMA: dict = {
         "jsx_code": {
             "type": "string",
             "description": (
-                "JSXGraph 渲染函数体 (engine=jsxgraph 时必须, 否则留空字符串)。"
-                "这里只放函数体本身, 不要再包一层"
-                " `function(board, JXG, H, params) { ... }`。"
-                "仅可用: board, JXG, H, params, Math, Number, Array, Object, "
-                "Boolean, String, JSON, console, requestAnimationFrame, cancelAnimationFrame。"
-                "禁止: window, document, fetch, XMLHttpRequest, WebSocket, Worker, "
-                "eval, Function, import, setTimeout(字符串), setInterval(字符串), with。"
-                "返回 { update(params), destroy() } 或 undefined。"
+                "JSXGraph render function body (required when engine=jsxgraph, otherwise empty string). Provide only the function body itself, not an outer wrapper such as `function(board, JXG, H, params) { ... }`. Allowed globals are board, JXG, H, params, Math, Number, Array, Object, Boolean, String, JSON, console, requestAnimationFrame, and cancelAnimationFrame. Forbidden globals include window, document, fetch, XMLHttpRequest, WebSocket, Worker, eval, Function, import, string-based setTimeout / setInterval, and with. Return { update(params), destroy() } or undefined."
             ),
         },
         "params": {
@@ -303,9 +334,7 @@ VISUALIZATION_SCHEMA: dict = {
                     "default": {},
                 },
                 "description": (
-                    "前端交互参数。name 必须对应 ggb_commands 中已经定义的同名"
-                    "滑块/开关对象; default 是其初始值。不要额外生成"
-                    "SetValue(name, value) 命令。"
+                    "Frontend interaction parameters. name must match a same-name slider / toggle object already defined in ggb_commands. default is the initial value. Do not generate extra SetValue(name, value) commands."
                 ),
             },
         },
@@ -328,11 +357,10 @@ VISUALIZATION_LIST_SCHEMA: dict = {
         "visualizations": {
             "type": "array",
             "items": VISUALIZATION_SCHEMA,
-            "minItems": 3,
-            "maxItems": 4,
+            "minItems": 2,
+            "maxItems": 2,
             "description": (
-                "面向中学应考场景, 3-4 个可视化; 需覆盖解答中不同"
-                "的关键阶段/分类讨论/最终结论。"
+                "For exam-oriented middle-school / high-school teaching, generate exactly 2 visualizations focused on the two most important learning bottlenecks, key stages, case splits, or final conclusion in the answer."
             ),
         },
     },
@@ -422,13 +450,13 @@ VISUALIZATION_STORYBOARD_SCHEMA: dict = {
         "sequence": {
             "type": "array",
             "items": {"type": "string"},
-            "minItems": 3,
-            "maxItems": 4,
+            "minItems": 2,
+            "maxItems": 2,
         },
         "items": {
             "type": "array",
-            "minItems": 3,
-            "maxItems": 4,
+            "minItems": 2,
+            "maxItems": 2,
             "items": {
                 "type": "object",
                 "required": [
@@ -511,13 +539,28 @@ VISUALIZATION_STORYBOARD_SCHEMA: dict = {
 }
 
 
+VISUALIZATION_SPEC_SCHEMA: dict = _compact_schema_for_gemini(
+    VisualizationSpec.model_json_schema()
+)
+
+VISUALIZATION_SPEC_BUNDLE_SCHEMA: dict = _compact_schema_for_gemini(
+    VisualizationSpecBundle.model_json_schema()
+)
+
+GEOGEBRA_EXECUTION_PAYLOAD_SCHEMA: dict = _compact_schema_for_gemini(
+    GeoGebraExecutionPayload.model_json_schema()
+)
+GEOGEBRA_EXECUTION_PAYLOAD_DRAFT_SCHEMA: dict = _compact_schema_for_gemini(
+    GeoGebraExecutionPayloadDraft.model_json_schema()
+)
+
+
 # ── Variant synthesis (M7 practice exams, §3.5) ─────────────────────
 
 VARIANT_QUESTION_SCHEMA: dict = {
     "type": "object",
     "description": (
-        "保留给定方法模式 (method_pattern) 但改变表面特征 (数值/命名对象/情境)"
-        "的新题, 用于在题库不足时填充练习卷。"
+        "A new question that preserves the given method_pattern while changing surface features such as numbers, named objects, or context. Used to fill practice sets when the local bank is insufficient."
     ),
     "required": [
         "statement", "answer_outline", "rubric",
@@ -526,20 +569,20 @@ VARIANT_QUESTION_SCHEMA: dict = {
     "properties": {
         "statement": {
             "type": "string",
-            "description": "新题目完整题面, 公式用 LaTeX 并以 $ 包裹",
+            "description": "Full text of the new question. Use LaTeX wrapped in $...$ for formulas.",
         },
         "answer_outline": {
             "type": "string",
-            "description": "答案要点, 步骤提纲 (不必完整解答)",
+            "description": "Outline of the answer: key steps only, not necessarily a full solution.",
         },
         "rubric": {
             "type": "string",
-            "description": "评分提示: 关键得分点 / 易错点, 3-5 行",
+            "description": "Scoring rubric: key credit points / common mistakes, in about 3-5 lines.",
         },
         "difficulty": {"type": "integer", "minimum": 1, "maximum": 5},
         "same_pattern": {
             "type": "boolean",
-            "description": "必须为 true; 变体不能换方法模式",
+            "description": "Must be true. A variant is not allowed to change the solving pattern.",
         },
     },
     "additionalProperties": False,

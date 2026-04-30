@@ -52,6 +52,9 @@ class TopLevelStreamParser:
     _val_start: int | None = None  # offset where current top-level value begins
     _current_key: str | None = None
     _emitted_keys: list[str] = field(default_factory=list)
+    incremental_list_keys: set[str] = field(default_factory=lambda: {"solution_steps"})
+    _list_stream_key: str | None = None
+    _list_item_start: int | None = None
 
     def feed(self, chunk: str) -> Iterator[tuple[str, object]]:
         """Append chunk and yield any newly-completed top-level pairs."""
@@ -92,6 +95,12 @@ class TopLevelStreamParser:
                 continue
 
             if c == '"':
+                if (
+                    self.depth == 2
+                    and self._list_stream_key is not None
+                    and self._list_item_start is None
+                ):
+                    self._list_item_start = i
                 self.in_string = True
                 # Beginning of a top-level key (when depth==1 and no
                 # value started yet).
@@ -124,6 +133,15 @@ class TopLevelStreamParser:
                     and self._val_start is None
                 ):
                     self._val_start = i
+                    if self._current_key in self.incremental_list_keys:
+                        self._list_stream_key = None
+                        self._list_item_start = None
+                elif (
+                    self.depth == 2
+                    and self._list_stream_key is not None
+                    and self._list_item_start is None
+                ):
+                    self._list_item_start = i
                 self.depth += 1
                 i += 1
                 continue
@@ -135,6 +153,15 @@ class TopLevelStreamParser:
                     and self._val_start is None
                 ):
                     self._val_start = i
+                    if self._current_key in self.incremental_list_keys:
+                        self._list_stream_key = self._current_key
+                        self._list_item_start = None
+                elif (
+                    self.depth == 2
+                    and self._list_stream_key is not None
+                    and self._list_item_start is None
+                ):
+                    self._list_item_start = i
                 self.depth += 1
                 i += 1
                 continue
@@ -142,6 +169,14 @@ class TopLevelStreamParser:
             if c == "}":
                 self.depth -= 1
                 i += 1
+                if (
+                    self.depth == 2
+                    and self._list_stream_key is not None
+                    and self._list_item_start is not None
+                ):
+                    pair = self._emit_list_item(end=i)
+                    if pair is not None:
+                        yield pair
                 if self.depth == 1 and self._val_start is not None:
                     # Object value just closed.
                     pair = self._emit_value(end=i)
@@ -162,10 +197,30 @@ class TopLevelStreamParser:
             if c == "]":
                 self.depth -= 1
                 i += 1
+                if (
+                    self.depth == 2
+                    and self._list_stream_key is not None
+                    and self._list_item_start is not None
+                ):
+                    pair = self._emit_list_item(end=i)
+                    if pair is not None:
+                        yield pair
                 if self.depth == 1 and self._val_start is not None:
                     pair = self._emit_value(end=i)
                     if pair is not None:
                         yield pair
+                continue
+
+            if (
+                c == ","
+                and self.depth == 2
+                and self._list_stream_key is not None
+                and self._list_item_start is not None
+            ):
+                pair = self._emit_list_item(end=i)
+                if pair is not None:
+                    yield pair
+                i += 1
                 continue
 
             if c == "," and self.depth == 1:
@@ -187,20 +242,47 @@ class TopLevelStreamParser:
                 and c != ":"
             ):
                 self._val_start = i
+            elif (
+                self.depth == 2
+                and self._list_stream_key is not None
+                and self._list_item_start is None
+                and not c.isspace()
+                and c != ","
+                and c != "]"
+            ):
+                self._list_item_start = i
 
             i += 1
 
         self.pos = i
 
+    def _emit_list_item(self, *, end: int) -> tuple[str, object] | None:
+        if self._list_stream_key is None or self._list_item_start is None:
+            self._list_item_start = None
+            return None
+        snippet = self.buf[self._list_item_start : end].strip().rstrip(",").strip()
+        self._list_item_start = None
+        if not snippet:
+            return None
+        try:
+            value = json.loads(snippet)
+        except json.JSONDecodeError:
+            return None
+        return (f"{self._list_stream_key}[]", value)
+
     def _emit_value(self, *, end: int) -> tuple[str, object] | None:
         if self._current_key is None or self._val_start is None:
             self._current_key = None
             self._val_start = None
+            self._list_stream_key = None
+            self._list_item_start = None
             return None
         snippet = self.buf[self._val_start : end].strip().rstrip(",").strip()
         key = self._current_key
         self._current_key = None
         self._val_start = None
+        self._list_stream_key = None
+        self._list_item_start = None
         if not snippet:
             return None
         try:

@@ -1,142 +1,236 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file is the primary instruction file for Claude Code when working in this repository.
 
-## Project Overview
+Use it as the fast operational guide. For full product and system detail, follow the linked project documents instead of duplicating them here.
 
-HAnswer is a local-first learning companion for Chinese middle/high-school math and physics students. It takes a photo of a problem, uses Google Gemini to parse it into structured data, generates teaching-oriented answers with interactive JSXGraph visualizations, and sediments every solved question into a personal knowledge base with semantic retrieval.
+## 1. What this repository is
 
-## Common Commands
+HAnswer is a local-first learning companion for Chinese middle/high-school math and physics students.
+
+Core flow:
+
+1. Parse a photographed problem into `ParsedQuestion`
+2. Generate a teaching-first `AnswerPackage`
+3. Generate visualization specs and JSXGraph code
+4. Sediment the solved question into the retrieval / knowledge system
+
+Primary stack:
+
+- Backend: FastAPI + async SQLAlchemy + asyncpg + Alembic + Pydantic v2
+- Frontend: Next.js App Router + React + TypeScript
+- Database: PostgreSQL
+- Vector store: Milvus dense + sparse collections
+- LLM provider: Google Gemini
+- Visualization runtime: sandboxed JSXGraph, AST-validated by Node/acorn
+
+Start with these docs when you need more context:
+
+- `README.md`: current product overview, commands, API surface, architecture snapshot, troubleshooting
+- `HAnswerR.md`: detailed spec / system requirements
+- `P2S.md`: known issues and bug backlog
+- `Unfinished.md`: audit log and remaining gaps
+- `AGENTS.md`: repository guidelines for structure, testing, and security
+
+## 2. How Claude Code should behave here
+
+These rules are merged from `AClaude.md` and adapted for this repository.
+
+### Think before coding
+
+- Do not assume unclear intent.
+- State assumptions explicitly when they matter to implementation.
+- If multiple interpretations are possible, surface them instead of silently choosing one.
+- Prefer one clear local hypothesis and validate it quickly.
+
+### Simplicity first
+
+- Write the minimum code that solves the request.
+- Do not add speculative abstractions, configuration, or future-proofing.
+- Do not widen scope unless the current approach is blocked.
+- Match the existing style and architecture of the touched module.
+
+### Surgical edits only
+
+- Touch only the files and lines required for the task.
+- Do not refactor unrelated nearby code.
+- Remove only the imports / variables / helpers made unnecessary by your own change.
+- If you notice unrelated issues, mention them separately instead of silently changing them.
+
+### Goal-driven execution
+
+- Convert requests into verifiable outcomes.
+- Prefer tests or narrow validation commands over reasoning-only confidence.
+- After the first substantive edit, run the narrowest relevant validation immediately.
+- Keep iterating in the same slice until the validation is green or the hypothesis is disproven.
+
+## 3. Working style for this repo
+
+### Change strategy
+
+- Start from the most concrete anchor available: file, symbol, failing test, failing endpoint, or visible behavior.
+- For backend bugs, prefer the owning service or router, not broad repo exploration.
+- For frontend bugs, prefer the route component or the specific sandbox/runtime component involved.
+- For prompt / schema / stage-flow issues, inspect the prompt template, the schema, and the orchestrating service together.
+
+### Validation expectations
+
+- Backend changes: run focused `pytest` targets first; use full `pytest` only if needed.
+- Frontend changes: run `npm run lint` or `npm run typecheck` for the touched slice when applicable.
+- Prompt / visualization changes: prefer targeted tests under `backend/tests/` for prompts, validators, and stage integration.
+- Documentation-only changes usually do not require tests.
+
+### Editing constraints
+
+- Preserve public API shape unless the task explicitly requires changing it.
+- Do not commit secrets, generated local data, or `backend/config.toml`.
+- Settings are file-driven; the Settings page is read-only and does not edit runtime config.
+
+## 4. High-value repository facts
+
+### Important backend areas
+
+- `backend/app/routers/`: HTTP surface for ingest, answer, dialog, retrieve, practice, knowledge, admin
+- `backend/app/services/answer_job_service.py`: background 4-stage pipeline with review / confirm / rerun
+- `backend/app/services/solver_service.py`: solver generation and incremental section persistence
+- `backend/app/services/visualization_spec_service.py`: HAVizNew Stage 1 visualization spec generation
+- `backend/app/services/jsxgraph_codegen_service.py`: HAVizNew Stage 2 JSXGraph code generation
+- `backend/app/services/sediment_service.py`: taxonomy resolution, dedup, indexing, vector upsert
+- `backend/app/services/retrieval_service.py`: multi-route retrieval with RRF fusion
+- `backend/app/services/dialog_service.py`: multi-turn tutoring sessions with rolling memory
+- `backend/app/prompts/`: all LLM prompts go through versioned `PromptTemplate` subclasses
+- `backend/viz_validator/validate.mjs`: AST validator for generated JSXGraph code
+
+### Important frontend areas
+
+- `frontend/app/page.tsx`: Ask flow
+- `frontend/app/q/[id]/page.tsx`: answer page, review flow, visualization panel, polling `/resume`
+- `frontend/components/VizSandbox.tsx`: visualization dispatcher
+- `frontend/components/JsxgraphSandbox.tsx`: JSXGraph iframe host
+- `frontend/public/viz/sandbox.html`: CSP-locked visualization runtime
+
+### Data model landmarks
+
+- Questions / answers: `questions`, `question_solutions`, `answer_packages`, `question_stage_reviews`
+- Retrieval: `question_retrieval_profiles`, `retrieval_units`, `solution_steps`
+- Visualization: `visualizations`
+- Knowledge: `knowledge_points`, `method_patterns`, `pitfalls`, link tables
+- Dialog: `conversation_sessions`, `conversation_messages`, `conversation_memory_snapshots`
+- Tracking: `llm_calls`, `ingest_images`
+
+## 5. Current visualization architecture
+
+The active visualization path is the HAVizNew two-stage flow:
+
+1. Stage 1: generate `VisualizationSpecBundle`
+2. Validate with Pydantic / JSON Schema
+3. Select one recommended visualization
+4. Stage 2: generate `function renderVisualization(containerId, spec)` JSXGraph code
+5. Validate generated code with the Node AST validator
+6. Execute inside the sandboxed frontend runtime
+
+Important implementation detail:
+
+- Stage 2 generated code must follow the `renderVisualization(containerId, spec)` contract.
+- Do not assume direct DOM access inside generated code; runtime and validator constraints are stricter than a normal browser page.
+
+## 6. Commands Claude Code should prefer
 
 ### Infrastructure
+
 ```bash
-docker compose up -d                    # Milvus + etcd + MinIO + Attu
-docker compose ps                       # Check service health
+docker compose up -d
+docker compose ps
 ```
 
-### Backend (Python 3.11+, FastAPI)
+### Backend setup / run
+
 ```bash
 cd backend
 python -m venv .venv && source .venv/bin/activate
-pip install -e .                        # Install dependencies
-pip install -e '.[dev]'                 # Install with dev tools (pytest, ruff, mypy)
-pip install -e '.[retrieval]'           # Install bge-m3 local embeddings (optional)
-cp config.example.toml config.toml      # First-time config
-alembic upgrade head                    # Run DB migrations
-python -m scripts.seed_knowledge        # Seed ~60 curriculum knowledge points
-python -m scripts.rebuild_retrieval_index  # Rebuild Milvus from PostgreSQL
-uvicorn app.main:app --reload --port 8787  # Run API server
+pip install -e .
+pip install -e '.[dev]'
+pip install -e '.[retrieval]'
+cp config.example.toml config.toml
+alembic upgrade head
+python -m scripts.seed_knowledge
+python -m scripts.rebuild_retrieval_index
+uvicorn app.main:app --reload --port 8787
 ```
 
-### Backend Testing & Linting
+### Backend validation
+
 ```bash
 cd backend
-pytest                                  # Run all tests (requires local PostgreSQL)
-pytest tests/test_prompts.py            # Run specific test file
-ruff check .                            # Lint
-python -m app.prompts.cli list          # List registered prompt templates
-python -m app.prompts.cli explain solver  # Explain prompt design decisions
+pytest
+pytest tests/test_prompts.py
+ruff check .
+python -m app.prompts.cli list
+python -m app.prompts.cli explain solver
 ```
 
-### Frontend (Next.js 16, React 19, TypeScript)
+### Frontend
+
 ```bash
 cd frontend
 npm install
-npm run dev                             # Dev server on :3333
-npm run build                           # Production build
-npm run lint                            # ESLint
-npm run typecheck                       # TypeScript type check
+npm run dev
+npm run build
+npm run lint
+npm run typecheck
 ```
 
-### Viz AST Validator (Node.js)
+### Visualization validator runtime
+
 ```bash
-cd backend/viz_validator && npm install  # Installs acorn for AST validation
+cd backend/viz_validator
+npm install
 ```
 
-## Architecture
+## 7. Conventions Claude Code must preserve
 
-### Stack
-- **Backend**: FastAPI + async SQLAlchemy + asyncpg + Alembic + Pydantic v2
-- **Frontend**: Next.js 16 App Router + React 19 + TypeScript
-- **Database**: PostgreSQL (all structured data + cost ledger)
-- **Vector DB**: Milvus 2.6 (12 collections: 6 dense HNSW + 6 sparse)
-- **LLM**: Google Gemini (sole provider) for parsing, solving, visualization code, dialog, and embeddings
-- **Infra**: Docker Compose runs Milvus stack (etcd + MinIO + milvus-standalone + Attu GUI on :1212)
+- Python: snake_case, 4-space indentation, Ruff-driven style, target 3.11+
+- Frontend: PascalCase components, lowercase route folders
+- Keep code comments sparse and only where they clarify non-obvious behavior
+- No ad-hoc prompt strings in app code; use the prompt framework
+- Tests use real local PostgreSQL with SAVEPOINT rollback, not mocks as the default system behavior
 
-### Backend Structure (`backend/app/`)
-- **`routers/`** — 7 API routers (ingest, answer, dialog, retrieve, practice, knowledge, admin). All routes are in `backend/app/routers/`.
-- **`services/`** — Business logic layer, fully decoupled from routes. Key services:
-  - `llm_client.py` + `gemini_transport.py` — Gemini gateway with retry, repair loop, structured output validation, cost tracking, true incremental streaming (`call_structured_streaming`)
-  - `streaming_json.py` — `TopLevelStreamParser`: incremental JSON parser that yields each top-level field the moment it completes
-  - `answer_job_service.py` — Background 4-stage pipeline (parsed → solving → visualizing → indexing) with stage review/confirm/rerun workflow. Persists sections incrementally so `/resume` polls see progress during streaming.
-  - `solver_service.py` — Solver orchestration with true incremental SSE: streams each `AnswerPackage` field as it completes via `TopLevelStreamParser`, falls back to bulk+repair on validation failure. Also `vizcoder_service.py`, `ingest_service.py` — other per-LLM-call orchestration
-  - `sediment_service.py` — Pattern/KP resolution, near-dup detection (τ=0.96), Milvus upsert
-  - `retrieval_service.py` — Multi-route hybrid retrieval (dense + sparse + structural) with RRF fusion
-  - `embedding.py` + `sparse_encoder.py` — Dense (Gemini or bge-m3) and sparse (BM25 or bge-m3) encoders
-  - `vector_store.py` — Milvus + InMemory abstraction
-  - `dialog_service.py` — Persistent multi-turn dialog with rolling memory snapshots
-- **`prompts/`** — PromptTemplate framework: every LLM call goes through a versioned `PromptTemplate` subclass with documented `DesignDecision`s. 5 registered prompts: `parser`, `solver`, `vizcoder`, `variant_synth`, `dialog`. Few-shot examples in `prompts/fewshot/<subject>/<grade_band>/*.json`.
-- **`schemas/llm.py`** — Pydantic models for all LLM I/O contracts (ParsedQuestion, AnswerPackage, Visualization, etc.)
-- **`db/models.py`** — 20 SQLAlchemy ORM models
-- **`db/repo.py`** — Repository layer (CRUD functions)
-- **`db/session.py`** — Async engine + session factory
-- **`config.py`** — Pydantic settings loader from `config.toml`, API key from `$GEMINI_API_KEY` env var only
-- **`viz_validator/`** — Node.js subprocess using acorn for AST validation of LLM-generated visualization code
+## 8. Known operational constraints
 
-### Frontend Structure (`frontend/`)
-- **App Router pages**: `/` (Ask — camera capture + recent uploads strip), `/q/[id]` (Answer view), `/library` (with date range filters), `/knowledge` (with pattern detail panel + pitfalls), `/practice` (with search-add to basket), `/dialog`, `/settings`
-- **Components**: `MathText.tsx` (MathJax rendering), `VizSandbox.tsx` (sandboxed iframe for JSXGraph)
-- **`public/viz/`** — CSP-locked sandbox runtime (`sandbox.html`), H helper library (`h-library.js`), JSXGraph vendor files
-- API proxy: `next.config.js` proxies `/api/*` to backend on :8787
+- `backend/config.toml` is git-ignored and must not be committed
+- Gemini API key must come from `$GEMINI_API_KEY`
+- Node is required for visualization validator execution
+- Frontend proxies `/api/*` to backend on port `8787`
+- Long-running answer generation is background-job driven; the UI mainly uses `/api/answer/{id}/start` and `/resume`
 
-### Answer Pipeline (4 stages)
-1. **parsed** — Image → Gemini Parser → ParsedQuestion (user can edit)
-2. **solving** — ParsedQuestion → Gemini Solver → AnswerPackage (teaching-first: method pattern before numeric answer)
-3. **visualizing** — AnswerPackage → Gemini VizCoder → JSXGraph visualizations (AST-validated, rendered in sandboxed iframe)
-4. **indexing** — Sediment: resolve patterns/KPs, build retrieval profile, batch embed, near-dup check, upsert Milvus
+## 9. Current known issue areas
 
-Each stage has a review/confirm/rerun workflow. The frontend polls `GET /api/answer/{id}/resume` for progress. The solving stage uses true incremental streaming: each `AnswerPackage` field appears as an SSE event within ~1.5s of generation, and `answer_job_service` persists each section in its own transaction so polls see progressive results.
+Use `P2S.md` as the source of truth. Historically important open areas include:
 
-### Retrieval Strategy
-Multi-route hybrid: dense (4 embedding surfaces) + sparse (BM25/bge-m3) + structural (shared pattern + KP overlap) → RRF fusion → PG hydrate. Configurable via `[retrieval]` in config.toml.
+- in-memory job state loss across process restart
+- pagination / list scaling gaps in some routes
+- frontend loading / virtualization gaps
+- long-running pipeline edge cases around retries and review flow
 
-### Database Schema (20 tables)
-Core: `questions`, `question_solutions`, `answer_packages`, `question_stage_reviews`. Taxonomy: `knowledge_points`, `method_patterns`, `pitfalls`, `question_kp_link`, `question_pattern_link`. Retrieval: `question_retrieval_profiles`, `retrieval_units`, `solution_steps`. Visualization: `visualizations`. Exam: `exams`, `exam_items`. Dialog: `conversation_sessions`, `conversation_messages`, `conversation_memory_snapshots`. Tracking: `llm_calls`, `ingest_images`.
+Do not assume a surface is broken just because it appears in `P2S.md`; confirm locally before changing it.
 
-## Key Conventions
+## 10. Preferred way to use the docs
 
-- Python: snake_case, 4-space indent, 100-char line length (Ruff), target 3.11+
-- Frontend: PascalCase components, lowercase route folders per Next.js conventions
-- All backend config in `config.toml` (git-ignored), API key only via `$GEMINI_API_KEY`
-- Settings page is read-only; editing requires file changes + uvicorn restart
-- Tests run against real local PostgreSQL with SAVEPOINT rollback (not mocks)
-- Viz validator requires Node.js + acorn at runtime; tests auto-skip if `node` is absent
-- No ad-hoc prompt strings in application code — all LLM prompts go through the PromptTemplate framework
+- Read `CLAUDE.md` first for working rules and repository map
+- Use `README.md` for commands, architecture snapshot, API routes, and troubleshooting
+- Use `HAnswerR.md` for feature / product requirements
+- Use `HAViz.md` and related visualization docs when touching the visualization pipeline
+- Use `Unfinished.md` and `P2S.md` to understand known gaps before proposing large changes
 
-## Configuration
+## 11. Definition of a good Claude Code change here
 
-Backend config (`config.toml`) sections: `[gemini]`, `[postgres]`, `[milvus]`, `[server]`, `[storage]`, `[llm]`, `[retrieval]`, `[dialog]`. Override path via `$HANSWER_CONFIG` env var. Embedding model can be Gemini (`gemini-embedding-2-preview`, default 1536-dim MRL prefix) or local bge-m3 (1024-dim); switching dense dimensions requires Milvus dense collection rebuild.
+A good change in this repository is:
 
-## Known Issues (from P2S.md)
+- localized
+- testable
+- consistent with the current stage-based architecture
+- respectful of the prompt-template and review-flow design
+- explicit about assumptions
+- validated with the narrowest relevant command or test
 
-See `P2S.md` for the full problem tracker. Key open items:
-- B2: In-memory job state lost on process restart — questions can get stuck in intermediate status
-- B5: `list_questions` fetches max 500 rows then filters in Python — no pagination
-- B7: SSE stream holds a single uncommitted transaction for the entire solve duration
-- F5/F6: No loading/error boundaries in routes; Library has no pagination or virtualization
-
-## Milestone Status
-
-| Milestone | Scope | Status |
-|---|---|---|
-| M1 | Prompt framework, Gemini gateway, schema, Milvus, viz sandbox | Done |
-| M2 | Ingest + Parser + Ask page | Done |
-| M3 | Solver SSE + Answer view | Done |
-| M4 | VizCoder + AST validator + iframe sandbox | Done |
-| M5 | Hybrid retrieval + RRF + Library page | Done |
-| M6 | Sediment + Knowledge tree + taxonomy seed | Done |
-| M7 | Practice exams + variant synthesis | Done |
-| M8 | Cost ledger + Admin API + Settings | Done |
-| M9 | Multi-turn dialog + rolling memory | Done |
-
-See `Unfinished.md` for remaining gaps.
+If a task is ambiguous, clarify it before making broad changes. If it is concrete, implement directly and verify.

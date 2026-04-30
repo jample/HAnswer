@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import uuid
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import delete
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from app.db import models
 from app.db.session import session_scope
@@ -94,7 +94,32 @@ async def test_resume_returns_stored_sections_and_viz():
         ))
         s.add(models.VisualizationRow(
             question_id=qid, viz_ref="viz-1", title="T", caption="C",
-            learning_goal="G", helpers_used_json=[], jsx_code="// js",
+            learning_goal="G", helpers_used_json=[], engine="geogebra", jsx_code="",
+            spec_json={"id": "spec-1", "recommended": True},
+            execution_payload_json={
+                "title": "T",
+                "preferred_geogebra_app": "geometry",
+                "execution_mode": "command_only",
+                "math_meaning_summary": "Resume test payload",
+                "object_naming_convention": "Use short English labels",
+                "commands": [{"step": 1, "purpose": "Create point", "command": "A=(0,0)"}],
+                "property_commands": [],
+                "interaction_objects": [],
+                "optional_script": {
+                    "needed": False,
+                    "script_type": "none",
+                    "reason": "",
+                    "target_object": "",
+                    "trigger": "none",
+                    "script_body": "",
+                },
+                "expected_created_objects": [{"name": "A", "type": "point", "role": "point"}],
+                "consistency_checks": [],
+                "fallback_used": False,
+                "fallback_reason": "",
+                "implementation_notes": [],
+            },
+            degraded=False,
             params_json=[], animation_json=None,
         ))
 
@@ -111,6 +136,10 @@ async def test_resume_returns_stored_sections_and_viz():
             assert "method_pattern" in sections
             assert len(body["visualizations"]) == 1
             assert body["visualizations"][0]["id"] == "viz-1"
+            assert body["visualizations"][0]["spec_json"] == {"id": "spec-1", "recommended": True}
+            assert body["visualizations"][0]["execution_payload"]["commands"] == [
+                {"step": 1, "purpose": "Create point", "command": "A=(0,0)"}
+            ]
             assert any(item["stage"] == "parsed" for item in body["stage_reviews"])
     finally:
         async with session_scope() as s:
@@ -138,8 +167,8 @@ async def test_resume_404_on_missing_question():
 
 
 @pytest.mark.asyncio
-async def test_resume_returns_storyboard_from_current_solution():
-    marker = f"resume-storyboard-{uuid.uuid4().hex[:8]}"
+async def test_resume_returns_visualization_plan_from_current_solution():
+    marker = f"resume-vizplan-{uuid.uuid4().hex[:8]}"
 
     async with session_scope() as s:
         q = models.Question(
@@ -163,12 +192,6 @@ async def test_resume_returns_storyboard_from_current_solution():
         s.add(q)
         await s.flush()
         qid = q.id
-        storyboard = {
-            "theme_cn": "从交点到最值",
-            "selection_rationale_cn": "选择关键跳跃",
-            "sequence": ["viz-1", "viz-2", "viz-3"],
-            "items": [{"id": "viz-1"}, {"id": "viz-2"}, {"id": "viz-3"}],
-        }
         s.add(models.QuestionSolution(
             question_id=qid,
             ordinal=1,
@@ -176,6 +199,7 @@ async def test_resume_returns_storyboard_from_current_solution():
             is_current=True,
             status="review_viz",
             answer_package_json={"method_pattern": {"name_cn": "图像法"}},
+            visualization_plan_json={"task_summary": {"source_math_topic": "function"}},
             visualizations_json=[{"id": "viz-1", "title_cn": "交点示意"}],
             sediment_json=None,
             stage_reviews_json={
@@ -185,7 +209,7 @@ async def test_resume_returns_storyboard_from_current_solution():
                     "artifact_version": 1,
                     "run_count": 1,
                     "summary": {"visualization_count": 1},
-                    "refs": {"storyboard": storyboard},
+                    "refs": {},
                     "review_note": "",
                     "reviewed_at": None,
                     "updated_at": None,
@@ -199,8 +223,9 @@ async def test_resume_returns_storyboard_from_current_solution():
             r = await c.get(f"/api/answer/{qid}/resume")
             assert r.status_code == 200, r.text
             body = r.json()
-            assert body["storyboard"]["theme_cn"] == "从交点到最值"
-            assert body["storyboard"]["sequence"] == ["viz-1", "viz-2", "viz-3"]
+            assert body["visualization_plan"] == {"task_summary": {"source_math_topic": "function"}}
+            assert "storyboard" not in body
+            assert body["solutions"][0]["has_visualization_plan"] is True
     finally:
         async with session_scope() as s:
             await s.execute(
@@ -209,6 +234,106 @@ async def test_resume_returns_storyboard_from_current_solution():
             await s.execute(
                 delete(models.QuestionStageReview)
                 .where(models.QuestionStageReview.question_id == qid)
+            )
+            await s.execute(delete(models.Question).where(models.Question.id == qid))
+            await s.commit()
+
+
+@pytest.mark.asyncio
+async def test_resume_prefers_visualization_rows_over_solution_cache_when_both_exist():
+    marker = f"resume-viz-rows-{uuid.uuid4().hex[:8]}"
+
+    async with session_scope() as s:
+        q = models.Question(
+            parsed_json={
+                "subject": "math",
+                "grade_band": "senior",
+                "topic_path": [],
+                "question_text": marker,
+                "given": [],
+                "find": [],
+                "diagram_description": "",
+                "difficulty": 2,
+                "tags": [],
+                "confidence": 0.9,
+            },
+            answer_package_json={"method_pattern": {"name_cn": "图像法"}},
+            subject="math", grade_band="senior", difficulty=2,
+            dedup_hash=hashlib.sha1(marker.encode()).hexdigest(),
+            seen_count=1, status="review_viz",
+        )
+        s.add(q)
+        await s.flush()
+        qid = q.id
+
+        s.add(models.QuestionSolution(
+            question_id=qid,
+            ordinal=1,
+            title="解法 1",
+            is_current=True,
+            status="review_viz",
+            answer_package_json={"method_pattern": {"name_cn": "图像法"}},
+            visualization_plan_json={"task_summary": {"source_math_topic": "function"}},
+            visualizations_json=[{"id": "cached-viz", "title_cn": "缓存图"}],
+            sediment_json=None,
+            stage_reviews_json={},
+        ))
+        s.add(models.VisualizationRow(
+            question_id=qid,
+            viz_ref="row-viz",
+            title="行存图",
+            caption="来自表",
+            learning_goal="优先读取表数据",
+            interactive_hints_json=["来自表"],
+            helpers_used_json=[],
+            engine="geogebra",
+            jsx_code="",
+            execution_payload_json={
+                "title": "行存图",
+                "preferred_geogebra_app": "geometry",
+                "execution_mode": "command_only",
+                "math_meaning_summary": "Row-backed payload",
+                "object_naming_convention": "Use short English labels",
+                "commands": [{"step": 1, "purpose": "Create point", "command": "A=(0,0)"}],
+                "property_commands": [],
+                "interaction_objects": [],
+                "optional_script": {
+                    "needed": False,
+                    "script_type": "none",
+                    "reason": "",
+                    "target_object": "",
+                    "trigger": "none",
+                    "script_body": "",
+                },
+                "expected_created_objects": [{"name": "A", "type": "point", "role": "point"}],
+                "consistency_checks": [],
+                "fallback_used": False,
+                "fallback_reason": "",
+                "implementation_notes": [],
+            },
+            degraded=False,
+            spec_json=None,
+            params_json=[],
+            animation_json=None,
+        ))
+        await s.commit()
+
+    try:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as c:
+            r = await c.get(f"/api/answer/{qid}/resume")
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert [item["id"] for item in body["visualizations"]] == ["row-viz"]
+            assert body["visualizations"][0]["interactive_hints"] == ["来自表"]
+            assert body["visualizations"][0]["execution_payload"]["preferred_geogebra_app"] == "geometry"
+    finally:
+        async with session_scope() as s:
+            await s.execute(
+                delete(models.VisualizationRow).where(models.VisualizationRow.question_id == qid)
+            )
+            await s.execute(
+                delete(models.QuestionSolution).where(models.QuestionSolution.question_id == qid)
             )
             await s.execute(delete(models.Question).where(models.Question.id == qid))
             await s.commit()
@@ -278,6 +403,45 @@ async def test_resume_restores_job_state_from_persisted_status_after_restart():
             )
             await s.execute(delete(models.Question).where(models.Question.id == qid))
             await s.commit()
+
+
+@pytest.mark.asyncio
+async def test_job_state_reports_not_running_after_review_state_even_before_task_cleanup():
+    qid = uuid.uuid4()
+    solution_id = uuid.uuid4()
+    key = answer_job_service._job_key(qid, solution_id)
+    blocker = asyncio.Event()
+    task = asyncio.create_task(blocker.wait())
+    answer_job_service._states[key] = answer_job_service.JobState(
+        question_id=str(qid),
+        solution_id=str(solution_id),
+        stage="visualizing",
+        call_index=3,
+        label="生成可视化",
+        message="可视化已生成，等待人工确认。",
+        done=True,
+    )
+    answer_job_service._tasks[key] = task
+
+    try:
+        async with session_scope() as s:
+            job = await answer_job_service.get_answer_job_state(
+                s,
+                qid,
+                solution_id,
+            )
+
+        assert job["done"] is True
+        assert job["running"] is False
+        assert job["stage"] == "visualizing"
+    finally:
+        answer_job_service._states.pop(key, None)
+        answer_job_service._tasks.pop(key, None)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 @pytest.mark.asyncio

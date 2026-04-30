@@ -1,6 +1,6 @@
 """Background answer-job orchestration.
 
-For long Gemini solves the browser should not own the entire request.
+For long LLM solves the browser should not own the entire request.
 This module runs answer generation in a background task, persists stage
 status to `answer_packages`, and lets the frontend poll `/resume`.
 """
@@ -8,10 +8,13 @@ status to `answer_packages`, and lets the frontend poll `/resume`.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 from copy import deepcopy
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,8 +23,11 @@ from app.config import settings
 from app.db import repo
 from app.db.models import AnswerPackageSection, RetrievalUnitRow, VisualizationRow
 from app.db.session import session_scope
-from app.schemas import AnswerPackage, VisualizationStoryboard
+from app.schemas import AnswerPackage, GeoGebraExecutionPayload, VisualizationSpec
 from app.services.embedding import build_dense_embedder
+from app.services.geogebra_codegen_service import (
+    generate_geogebra_visualization_or_fallback,
+)
 from app.services.llm_client import LLMError, PromptLogContext, TransientLLMError
 from app.services.llm_deps import get_llm_client
 from app.services.question_solution_service import (
@@ -52,12 +58,15 @@ from app.services.stage_review_service import (
     set_stage_review_status,
     summarize_answer,
     summarize_indexing,
+    summarize_visualization_plan,
     summarize_visualizations,
 )
 from app.services.vector_store import get_vector_store
-from app.services.vizcoder_service import (
-    generate_visualizations_from_storyboard,
-    plan_visualization_storyboard,
+from app.services.visual_action_logger import log_visual_action
+from app.services.visualization_spec_service import (
+    generate_visualization_spec_bundle,
+    persist_visualization_spec_bundle,
+    select_recommended_visualization,
 )
 
 log = logging.getLogger(__name__)
@@ -84,27 +93,29 @@ _CALL_STAGES: list[dict[str, object]] = [
         "key": "parsed",
         "call_index": 1,
         "label": "解析题面",
-        "description": "Gemini Parser 读取题图并抽取结构化题面。",
+        "description": f"{settings.active_llm_provider_label} Parser 读取题图并抽取结构化题面。",
     },
     {
         "key": "solving",
         "call_index": 2,
         "label": "生成解答",
-        "description": "Gemini Solver 生成完整教学型答案包。",
+        "description": f"{settings.active_llm_provider_label} Solver 生成完整教学型答案包。",
     },
     {
         "key": "visualizing",
         "call_index": 3,
         "label": "生成可视化",
-        "description": "Gemini 先规划 storyboard, 再逐张生成交互式图形。",
+        "description": "可视化阶段先规划 Stage 1 规格，再生成并校验 Stage 2 GeoGebra 指令。",
     },
     {
         "key": "indexing",
         "call_index": 4,
         "label": "建立索引",
-        "description": "Gemini Embedding 为问题、答案与检索单元建立向量索引。",
+        "description": f"{settings.active_llm_provider_label} Embedding 为问题、答案与检索单元建立向量索引。",
     },
 ]
+
+_TOTAL_CALLS = len(_CALL_STAGES)
 
 _STAGE_META = {
     str(item["key"]): {
@@ -135,6 +146,7 @@ async def clear_answer_job_state(
     *,
     solution_id: uuid.UUID | None = None,
     include_all_solutions: bool = False,
+    wait: bool = False,
 ) -> None:
     qid = str(question_id)
     if include_all_solutions:
@@ -146,6 +158,13 @@ async def clear_answer_job_state(
         task = _tasks.pop(key, None)
         if task is not None and not task.done():
             task.cancel()
+            if wait:
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:  # noqa: BLE001
+                    log.warning("cancelled answer job %s exited with an error", key)
         _states.pop(key, None)
 
 
@@ -158,20 +177,97 @@ def _parse_uuid(value: object) -> uuid.UUID | None:
         return None
 
 
-def _serialize_viz_row(row: VisualizationRow) -> dict:
+def _serialize_viz_row(row: VisualizationRow) -> dict | None:
+    if str(getattr(row, "engine", "") or "").lower() != "geogebra":
+        return None
     return {
         "id": row.viz_ref,
         "title_cn": row.title,
         "caption_cn": row.caption,
         "learning_goal": row.learning_goal,
+        "interactive_hints": list(getattr(row, "interactive_hints_json", None) or []),
         "helpers_used": list(row.helpers_used_json or []),
-        "engine": getattr(row, "engine", None) or "jsxgraph",
-        "jsx_code": row.jsx_code,
-        "ggb_commands": list(getattr(row, "ggb_commands_json", None) or []),
-        "ggb_settings": getattr(row, "ggb_settings_json", None),
-        "params": list(row.params_json or []),
-        "animation": row.animation_json,
+        "engine": "geogebra",
+        "spec_json": getattr(row, "spec_json", None),
+        "execution_payload": getattr(row, "execution_payload_json", None),
+        "degraded": bool(getattr(row, "degraded", False)),
     }
+
+def _build_visualization_row(
+    *,
+    question_id: uuid.UUID,
+    spec: VisualizationSpec,
+    generated: GeoGebraExecutionPayload | None,
+) -> VisualizationRow:
+    if generated is not None:
+        execution_payload = generated.model_dump(mode="json")
+        execution_payload["__meta"] = {
+            "validation_status": "static_passed",
+            "runtime_status": "unknown",
+            "static_validation_mode": "static",
+            "stage2_llm_retry_count": 0,
+            "partial_render_allowed": True,
+        }
+        return VisualizationRow(
+            question_id=question_id,
+            viz_ref=spec.id,
+            title=generated.title,
+            caption=spec.mathematical_claim_being_shown,
+            learning_goal=spec.pedagogical_purpose,
+            interactive_hints_json=[],
+            helpers_used_json=[],
+            engine="geogebra",
+            jsx_code="",
+            spec_json=spec.model_dump(mode="json"),
+            execution_payload_json=execution_payload,
+            degraded=False,
+            ggb_commands_json=[],
+            ggb_settings_json=None,
+            params_json=[],
+            animation_json=None,
+        )
+    return VisualizationRow(
+        question_id=question_id,
+        viz_ref=spec.id,
+        title=spec.title,
+        caption=spec.mathematical_claim_being_shown,
+        learning_goal=spec.pedagogical_purpose,
+        interactive_hints_json=[],
+        helpers_used_json=[],
+        engine="geogebra",
+        jsx_code="",
+        spec_json=spec.model_dump(mode="json"),
+        execution_payload_json=None,
+        degraded=True,
+        ggb_commands_json=[],
+        ggb_settings_json=None,
+        params_json=[],
+        animation_json=None,
+    )
+
+
+def _ordered_visualization_candidates(
+    *,
+    bundle,
+    selected_spec: VisualizationSpec,
+    min_stability_score: int = 80,
+) -> list[VisualizationSpec]:
+    candidates: list[VisualizationSpec] = [selected_spec]
+    for item in sorted(
+        bundle.visualizations,
+        key=lambda spec: (
+            spec.priority,
+            -spec.renderability_assessment.implementation_stability_score,
+        ),
+    ):
+        if item.id == selected_spec.id:
+            continue
+        if item.renderability_assessment.overall_readiness not in {"ready", "mostly_ready"}:
+            continue
+        if item.renderability_assessment.implementation_stability_score < min_stability_score:
+            continue
+        candidates.append(item)
+    return candidates
 
 
 def _friendly_llm_failure(message: str, *, failed_stage: str | None) -> dict:
@@ -181,7 +277,7 @@ def _friendly_llm_failure(message: str, *, failed_stage: str | None) -> dict:
     stage_label = str(_STAGE_META.get(stage, {}).get("label") or stage)
     if "timeout" in lowered:
         friendly = (
-            f"Gemini 在“{stage_label}”阶段超时"
+            f"{settings.active_llm_provider_label} 在“{stage_label}”阶段超时"
             + (f"（>{timeout_s} 秒）" if timeout_s else "")
             + "。这通常表示当前请求较大，或模型服务长时间没有返回结果。"
         )
@@ -213,11 +309,11 @@ def _friendly_llm_failure(message: str, *, failed_stage: str | None) -> dict:
         )
     ):
         friendly = (
-            f"Gemini 在“{stage_label}”阶段暂时繁忙。"
+            f"{settings.active_llm_provider_label} 在“{stage_label}”阶段暂时繁忙。"
             f"后端已自动重试 {settings.llm.max_retries} 次，但服务仍未恢复。"
         )
         hint = (
-            "这通常是 Gemini 服务端瞬时高负载，不是题目内容错误。"
+            f"这通常是 {settings.active_llm_provider_label} 服务端瞬时高负载，不是题目内容错误。"
             "建议等待 30 到 90 秒后重试；如果频繁出现，可减少并发，"
             "或改用更稳定的非预览模型。"
         )
@@ -229,12 +325,96 @@ def _friendly_llm_failure(message: str, *, failed_stage: str | None) -> dict:
             "hint": hint,
             "retryable": True,
         }
+    if any(
+        marker in lowered
+        for marker in (
+            "access denied",
+            "not authorized",
+            "permission denied",
+            "permissiondenied",
+            "unauthorized",
+        )
+    ):
+        return {
+            "kind": "provider_permission",
+            "failed_stage": stage,
+            "message": (
+                f"{settings.active_llm_provider_label} 在“{stage_label}”阶段拒绝了当前"
+                "模型或账号权限。"
+            ),
+            "raw_message": message,
+            "hint": (
+                "如果发生在“建立索引”阶段，请检查 EMB_URL、EMB_API_KEY、"
+                "[embedding].provider、[embedding].model、[embedding].dimensions "
+                "是否与当前网关支持的 embedding 服务一致；修改后重启后端。"
+            ),
+        }
     return {
         "kind": "llm_error",
         "failed_stage": stage,
         "message": message,
         "raw_message": message,
     }
+
+
+def _is_failed_prompt_log_status(status: object) -> bool:
+    value = str(status or "").strip().lower()
+    return bool(value) and value not in {"ok", "repaired"}
+
+
+def _is_visualization_prompt_log_row(row: dict) -> bool:
+    task = str(row.get("task") or "").strip().lower()
+    if task in {"vizplanner", "vizitem", "vizcoder", "vizspec", "geogebra_codegen"}:
+        return True
+    phase_description = str(row.get("phase_description") or "")
+    return "可视化" in phase_description or "GeoGebra" in phase_description
+
+
+def _latest_failed_visualization_phase_description_sync(
+    question_id: uuid.UUID,
+    *,
+    solution_id: uuid.UUID | None = None,
+) -> str | None:
+    path = Path(settings.storage.llm_prompt_log_file)
+    if not path.exists():
+        return None
+
+    latest_match: dict | None = None
+    question_id_str = str(question_id)
+    solution_id_str = str(solution_id) if solution_id is not None else None
+    with path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if str(row.get("question_id") or "") != question_id_str:
+                continue
+            if solution_id_str is not None and str(row.get("solution_id") or "") != solution_id_str:
+                continue
+            if not _is_visualization_prompt_log_row(row):
+                continue
+            latest_match = row
+
+    if latest_match is None or not _is_failed_prompt_log_status(latest_match.get("status")):
+        return None
+    phase_description = str(latest_match.get("phase_description") or "").strip()
+    return phase_description or None
+
+
+async def _latest_failed_visualization_phase_description(
+    question_id: uuid.UUID,
+    *,
+    solution_id: uuid.UUID | None = None,
+) -> str | None:
+    return await asyncio.to_thread(
+        _latest_failed_visualization_phase_description_sync,
+        question_id,
+        solution_id=solution_id,
+    )
 
 
 async def _append_section(
@@ -294,9 +474,69 @@ async def _set_stage(
             "stage": stage,
             "message": message,
             "call_index": int(meta["call_index"]),
-            "total_calls": 4,
+            "total_calls": _TOTAL_CALLS,
             "label": str(meta["label"]),
             "description": str(meta["description"]),
+            "solution_id": str(solution_id) if solution_id else None,
+        },
+        clear_prior_status=True,
+    )
+
+
+def _solver_progress_message(section: str, payload: dict[str, Any] | None = None) -> str | None:
+    row = payload or {}
+    if section == "question_understanding":
+        return "正在生成解答：已完成题目理解。"
+    if section == "key_points_of_question":
+        return "正在生成解答：已提炼题目关键点。"
+    if section == "solution_step":
+        step_index = row.get("step_index")
+        if isinstance(step_index, int):
+            return f"正在生成解答：已输出第 {step_index} 步。"
+        return "正在生成解答：正在输出分步解答。"
+    if section == "key_points_of_answer":
+        return "正在生成解答：已整理答案关键点。"
+    if section == "method_pattern":
+        return "正在生成解答：已生成方法模式。"
+    if section == "similar_questions":
+        return "正在生成解答：已生成同类题目。"
+    if section == "knowledge_points":
+        return "正在生成解答：已整理知识点。"
+    if section == "self_check":
+        return "正在生成解答：已生成自我检查。"
+    return None
+
+
+def _solver_heartbeat_message(elapsed_s: int) -> str:
+    return f"正在生成解答：{settings.active_llm_provider_label} 正在推理，已等待约 {elapsed_s} 秒。"
+
+
+async def _update_solver_progress_status(
+    question_id: uuid.UUID,
+    *,
+    solution_id: uuid.UUID | None,
+    section: str,
+    payload: dict[str, Any] | None = None,
+) -> None:
+    key = _job_key(question_id, solution_id)
+    state = _states.get(key)
+    if state is None or state.stage != "solving" or state.done:
+        return
+    message = _solver_progress_message(section, payload)
+    if not message or message == state.message:
+        return
+    state.message = message
+    await _append_section(
+        question_id,
+        section="status",
+        payload={
+            "stage": "solving",
+            "message": message,
+            "call_index": state.call_index,
+            "total_calls": _TOTAL_CALLS,
+            "label": state.label,
+            "description": _STAGE_META["solving"]["description"],
+            "progress_section": section,
             "solution_id": str(solution_id) if solution_id else None,
         },
         clear_prior_status=True,
@@ -312,19 +552,28 @@ async def _append_error(
 ) -> None:
     key = _job_key(question_id, solution_id)
     last = _states.get(key)
+    failed_stage = last.stage if stage == "llm" and last else stage
     payload = _friendly_llm_failure(
         message,
-        failed_stage=last.stage if stage == "llm" and last else stage,
+        failed_stage=failed_stage,
     )
+    public_message = str(payload.get("message") or message)
+    if failed_stage == "visualizing":
+        latest_phase_description = await _latest_failed_visualization_phase_description(
+            question_id,
+            solution_id=solution_id,
+        )
+        if latest_phase_description:
+            public_message = latest_phase_description
     _states[key] = JobState(
         question_id=str(question_id),
         solution_id=str(solution_id) if solution_id else None,
         stage=last.stage if last else stage,
         call_index=last.call_index if last else 0,
         label=last.label if last else stage,
-        message=str(payload.get("message") or message),
+        message=public_message,
         done=True,
-        error=str(payload.get("message") or message),
+        error=public_message,
     )
     await _set_question_status(question_id, "error")
     # Also update the solution status so /resume returns "error" for the
@@ -353,9 +602,9 @@ async def _append_error(
         payload={
             "stage": "error",
             "failed_stage": last.stage if last else stage,
-            "message": str(payload.get("message") or f"{stage} 失败: {message}"),
+            "message": public_message,
             "call_index": last.call_index if last else 0,
-            "total_calls": 4,
+            "total_calls": _TOTAL_CALLS,
             "label": last.label if last else stage,
             "kind": payload.get("kind"),
             "hint": payload.get("hint"),
@@ -425,7 +674,7 @@ async def _mark_stage_ready_for_review(
             "review_stage": stage,
             "message": message,
             "call_index": int(meta["call_index"]),
-            "total_calls": 4,
+            "total_calls": _TOTAL_CALLS,
             "label": str(meta["label"]),
             "description": str(meta["description"]),
             "needs_confirmation": True,
@@ -449,80 +698,133 @@ async def _run_answer_job(
             await _set_stage(
                 question_id,
                 stage="solving",
-                message="正在调用 Gemini 生成完整教学型答案，复杂题可能需要几十秒。",
+                message=f"正在调用 {settings.active_llm_provider_label} 生成完整教学型答案，复杂题可能需要几十秒。",
                 solution_id=solution_id,
             )
             summary: dict | None = None
-            async with session_scope() as session:
-                q = await repo.get_question(session, question_id)
-                if q is None:
-                    raise KeyError(f"question {question_id} not found")
-                solution = await get_solution_or_create(
-                    session,
-                    question_id=question_id,
-                    solution_id=solution_id,
-                )
-                await set_current_solution(session, question=q, solution=solution)
-                user_guidance = await build_solution_stage_user_guidance(
-                    session,
-                    question_id=question_id,
-                    solution=solution,
-                    target_stage="solving",
-                )
-                async for ev in generate_answer(
-                    session,
-                    question_id=question_id,
-                    llm=llm,
-                    solution_id=solution_id,
-                    user_guidance=user_guidance,
-                ):
-                    # Persist each streamed section in its own transaction
-                    # so the polling /resume endpoint sees progress while
-                    # Gemini is still generating later sections. The
-                    # solver's final _persist rewrites these rows
-                    # transactionally with the validated payload.
+            solver_progress_seen = asyncio.Event()
+            solver_stop_heartbeat = asyncio.Event()
+
+            async def _solver_heartbeat() -> None:
+                elapsed_s = 0
+                while True:
                     try:
-                        await _append_section(
-                            question_id,
-                            section=ev.name,
-                            payload=ev.data,
-                        )
-                    except Exception:  # noqa: BLE001
-                        # Streaming-progress writes are best-effort; the
-                        # canonical write still happens in solver._persist.
-                        log.exception(
-                            "incremental section persist failed for %s/%s",
-                            question_id, ev.name,
-                        )
-                q = await repo.get_question(session, question_id)
-                if q is None or q.answer_package_json is None:
-                    raise KeyError(f"question {question_id} missing answer package")
-                await update_solution_answer(
-                    session,
-                    solution=solution,
-                    answer_package_json=deepcopy(q.answer_package_json),
-                )
-                solution.status = review_question_status("solving")
-                summary = summarize_answer(q.answer_package_json)
+                        await asyncio.wait_for(solver_stop_heartbeat.wait(), timeout=15)
+                        return
+                    except TimeoutError:
+                        pass
+                    if solver_progress_seen.is_set():
+                        return
+                    elapsed_s += 15
+                    key = _job_key(question_id, solution_id)
+                    state = _states.get(key)
+                    if state is None or state.stage != "solving" or state.done:
+                        return
+                    state.message = _solver_heartbeat_message(elapsed_s)
+                    await _append_section(
+                        question_id,
+                        section="status",
+                        payload={
+                            "stage": "solving",
+                            "message": state.message,
+                            "call_index": state.call_index,
+                            "total_calls": _TOTAL_CALLS,
+                            "label": state.label,
+                            "description": _STAGE_META["solving"]["description"],
+                            "heartbeat": True,
+                            "wait_elapsed_s": elapsed_s,
+                            "solution_id": str(solution_id),
+                        },
+                        clear_prior_status=True,
+                    )
+
+            heartbeat_task = asyncio.create_task(_solver_heartbeat())
+            async with session_scope() as session:
+                try:
+                    q = await repo.get_question(session, question_id)
+                    if q is None:
+                        raise KeyError(f"question {question_id} not found")
+                    solution = await get_solution_or_create(
+                        session,
+                        question_id=question_id,
+                        solution_id=solution_id,
+                    )
+                    await set_current_solution(session, question=q, solution=solution)
+                    user_guidance = await build_solution_stage_user_guidance(
+                        session,
+                        question_id=question_id,
+                        solution=solution,
+                        target_stage="solving",
+                    )
+                    async for ev in generate_answer(
+                        session,
+                        question_id=question_id,
+                        llm=llm,
+                        solution_id=solution_id,
+                        user_guidance=user_guidance,
+                    ):
+                        solver_progress_seen.set()
+                        # Persist each streamed section in its own transaction
+                        # so the polling /resume endpoint sees progress while
+                        # The LLM is still generating later sections. The
+                        # solver's final _persist rewrites these rows
+                        # transactionally with the validated payload.
+                        try:
+                            await _append_section(
+                                question_id,
+                                section=ev.name,
+                                payload=ev.data,
+                            )
+                        except Exception:  # noqa: BLE001
+                            # Streaming-progress writes are best-effort; the
+                            # canonical write still happens in solver._persist.
+                            log.exception(
+                                "incremental section persist failed for %s/%s",
+                                question_id, ev.name,
+                            )
+                        try:
+                            await _update_solver_progress_status(
+                                question_id,
+                                solution_id=solution_id,
+                                section=ev.name,
+                                payload=ev.data if isinstance(ev.data, dict) else None,
+                            )
+                        except Exception:  # noqa: BLE001
+                            log.exception(
+                                "solver progress status update failed for %s/%s",
+                                question_id, ev.name,
+                            )
+                    q = await repo.get_question(session, question_id)
+                    if q is None or q.answer_package_json is None:
+                        raise KeyError(f"question {question_id} missing answer package")
+                    await update_solution_answer(
+                        session,
+                        solution=solution,
+                        answer_package_json=deepcopy(q.answer_package_json),
+                    )
+                    solution.status = review_question_status("solving")
+                    summary = summarize_answer(q.answer_package_json)
+                finally:
+                    solver_stop_heartbeat.set()
+                    await heartbeat_task
             assert summary is not None
             await _mark_stage_ready_for_review(
                 question_id,
                 stage="solving",
                 summary=summary,
                 refs={"question_id": str(question_id), "solution_id": str(solution_id)},
-                message="Gemini Solver 已完成。请先人工确认解答，再进入下一阶段。",
+                message=f"{settings.active_llm_provider_label} Solver 已完成。请先人工确认解答，再进入下一阶段。",
                 solution_id=solution_id,
             )
         elif stage == "visualizing":
             await _set_stage(
                 question_id,
                 stage="visualizing",
-                message="答案已生成，正在先规划 storyboard，再逐张补充可视化。",
+                message="可视化阶段 Stage 1/2：正在规划候选可视化规格…",
                 solution_id=solution_id,
             )
             rows: list[VisualizationRow] = []
-            storyboard = None
-            fallback_storyboard = None
+            review_summary: dict | None = None
             async with session_scope() as session:
                 q = await repo.get_question(session, question_id)
                 if q is None:
@@ -535,42 +837,92 @@ async def _run_answer_job(
                 await set_current_solution(session, question=q, solution=solution)
                 q.answer_package_json = deepcopy(solution.answer_package_json)
                 await session.flush()
-                fallback_storyboard = (
-                    ((solution.stage_reviews_json or {}).get("visualizing") or {}).get("refs") or {}
-                ).get("storyboard")
                 user_guidance = await build_solution_stage_user_guidance(
                     session,
                     question_id=question_id,
                     solution=solution,
                     target_stage="visualizing",
                 )
-                try:
-                    storyboard = await plan_visualization_storyboard(
-                        session,
-                        question_id=question_id,
-                        llm=llm,
-                        solution_id=solution_id,
-                        user_guidance=user_guidance,
-                    )
-                except LLMError as e:
-                    if fallback_storyboard is None:
-                        raise
-                    storyboard = VisualizationStoryboard.model_validate(fallback_storyboard)
-                    log.warning(
-                        "visualizing planner unavailable for %s; reusing existing storyboard: %s",
-                        question_id,
-                        e,
-                    )
-                async for ev in generate_visualizations_from_storyboard(
+                bundle = await generate_visualization_spec_bundle(
                     session,
                     question_id=question_id,
                     llm=llm,
                     solution_id=solution_id,
-                    storyboard=storyboard,
-                    user_guidance=user_guidance,
-                ):
-                    if ev.name == "error":
-                        await _append_section(question_id, section="error", payload=ev.data)
+                    teaching_preference=user_guidance,
+                )
+                selected_spec = select_recommended_visualization(bundle)
+                await persist_visualization_spec_bundle(
+                    session,
+                    solution=solution,
+                    bundle=bundle,
+                    selected_spec=selected_spec,
+                )
+                await _set_stage(
+                    question_id,
+                    stage="visualizing",
+                    message="可视化阶段 Stage 2/2：正在分别生成并校验 3 个 GeoGebra 可视化…",
+                    solution_id=solution_id,
+                )
+                primary_spec = selected_spec
+                target_specs = sorted(
+                    bundle.visualizations,
+                    key=lambda spec: (
+                        spec.priority,
+                        -spec.renderability_assessment.implementation_stability_score,
+                    ),
+                )[:3]
+                attempt_errors: dict[str, str] = {}
+                persisted_viz_refs: list[str] = []
+                for index, candidate_spec in enumerate(target_specs, start=1):
+                    await _set_stage(
+                        question_id,
+                        stage="visualizing",
+                        message=(
+                            "可视化阶段 Stage 2/2：正在生成并校验 "
+                            f"{index}/{len(target_specs)} 个 GeoGebra 可视化…"
+                        ),
+                        solution_id=solution_id,
+                    )
+                    geogebra = await generate_geogebra_visualization_or_fallback(
+                        llm=llm,
+                        spec=candidate_spec,
+                        question_id=str(question_id),
+                        solution_id=str(solution_id),
+                    )
+                    if geogebra.execution_payload is None:
+                        attempt_errors[candidate_spec.id] = (
+                            geogebra.error_summary or "GeoGebra codegen failed"
+                        )
+                    generated_payload = geogebra.execution_payload
+                    viz_row = _build_visualization_row(
+                        question_id=question_id,
+                        spec=candidate_spec,
+                        generated=generated_payload,
+                    )
+                    session.add(viz_row)
+                    await session.flush()
+                    persisted_viz_refs.append(candidate_spec.id)
+                    await log_visual_action(
+                        source="backend",
+                        phase="persist",
+                        action="visualization.row_persisted",
+                        status="ok",
+                        question_id=str(question_id),
+                        solution_id=str(solution_id),
+                        visualization_id=candidate_spec.id,
+                        engine=viz_row.engine,
+                        component="answer_job_service",
+                        details={
+                            "row_id": str(viz_row.id),
+                            "execution_mode": (
+                                (viz_row.execution_payload_json or {}).get("execution_mode")
+                                if viz_row.execution_payload_json else None
+                            ),
+                            "command_count": len((viz_row.execution_payload_json or {}).get("commands") or []),
+                            "spec_only": bool(viz_row.degraded),
+                            "generation_mode": "per_visualization",
+                        },
+                    )
                 rows = list((await session.execute(
                     select(VisualizationRow)
                     .where(VisualizationRow.question_id == question_id)
@@ -581,27 +933,34 @@ async def _run_answer_job(
                 await update_solution_visualizations(
                     session,
                     solution=solution,
-                    visualizations=[_serialize_viz_row(row) for row in rows],
+                    visualizations=[
+                        payload
+                        for row in rows
+                        if (payload := _serialize_viz_row(row)) is not None
+                    ],
                 )
                 solution.status = review_question_status("visualizing")
-            assert storyboard is not None
-            storyboard_payload = storyboard.model_dump(mode="json")
+                review_summary = {
+                    **summarize_visualization_plan(solution.visualization_plan_json),
+                    **summarize_visualizations(rows),
+                    "primary_visualization_id": primary_spec.id,
+                    "rendered_visualization_id": persisted_viz_refs[0] if persisted_viz_refs else None,
+                    "rendered_visualization_ids": persisted_viz_refs,
+                    "attempted_visualization_ids": [item.id for item in target_specs],
+                    "visualization_fallback_used": any(row.degraded for row in rows),
+                    "attempt_errors": attempt_errors,
+                }
+            assert review_summary is not None
             await _mark_stage_ready_for_review(
                 question_id,
                 stage="visualizing",
-                summary={
-                    **summarize_visualizations(rows),
-                    "storyboard_theme_cn": storyboard_payload.get("theme_cn"),
-                    "storyboard_item_count": len(storyboard_payload.get("items") or []),
-                    "storyboard_sequence": list(storyboard_payload.get("sequence") or []),
-                },
+                summary=review_summary,
                 refs={
                     "question_id": str(question_id),
                     "solution_id": str(solution_id),
                     "visualization_ids": [str(row.id) for row in rows],
-                    "storyboard": storyboard_payload,
                 },
-                message="可视化 storyboard 与逐图生成已完成。请确认这些可视化是否可用。",
+                message="可视化规格与代码已生成。请确认这一阶段产物后再进入索引。",
                 solution_id=solution_id,
             )
         elif stage == "indexing":
@@ -643,7 +1002,6 @@ async def _run_answer_job(
                         solution_id=solution_id,
                         package=pkg,
                         embedding=build_dense_embedder(
-                            llm,
                             prompt_context=PromptLogContext(
                                 phase_description="建立索引",
                                 question_id=str(question_id),
@@ -727,6 +1085,7 @@ async def start_answer_job(
     *,
     from_stage: str | None = None,
     solution_id: uuid.UUID | None = None,
+    force: bool = False,
 ) -> dict:
     resolved_solution_id: uuid.UUID | None = solution_id
     async with session_scope() as session:
@@ -749,6 +1108,13 @@ async def start_answer_job(
     key = _job_key(question_id, resolved_solution_id)
     qid = str(question_id)
     existing = _tasks.get(key)
+    if existing is not None and not existing.done() and force:
+        await clear_answer_job_state(
+            question_id,
+            solution_id=resolved_solution_id,
+            wait=True,
+        )
+        existing = None
     if existing is not None and not existing.done():
         state = _states.get(key)
         return {
@@ -820,16 +1186,16 @@ async def start_answer_job(
         stage="queued",
         call_index=int(meta["call_index"]),
         label="等待开始",
-        message=f"等待开始 Gemini {int(meta['call_index'])}/4 · {str(meta['label'])}",
+        message=f"等待开始 {settings.active_llm_provider_label} {int(meta['call_index'])}/{_TOTAL_CALLS} · {str(meta['label'])}",
     )
     await _append_section(
         question_id,
         section="status",
         payload={
             "stage": stage,
-            "message": f"等待开始 Gemini {int(meta['call_index'])}/4 · {str(meta['label'])}",
+            "message": f"等待开始 {settings.active_llm_provider_label} {int(meta['call_index'])}/{_TOTAL_CALLS} · {str(meta['label'])}",
             "call_index": int(meta["call_index"]),
-            "total_calls": 4,
+            "total_calls": _TOTAL_CALLS,
             "label": "等待开始",
             "description": str(meta["description"]),
             "solution_id": str(resolved_solution_id),
@@ -905,8 +1271,8 @@ async def confirm_stage(
                 payload={
                     "stage": "done",
                     "message": "解答完成。",
-                    "call_index": 4,
-                    "total_calls": 4,
+                    "call_index": _TOTAL_CALLS,
+                    "total_calls": _TOTAL_CALLS,
                     "label": "全部完成",
                     "solution_id": str(resolved_solution_id) if resolved_solution_id else None,
                 },
@@ -917,7 +1283,7 @@ async def confirm_stage(
                 question_id=qid,
                 solution_id=str(resolved_solution_id) if resolved_solution_id else None,
                 stage="done",
-                call_index=4,
+                call_index=_TOTAL_CALLS,
                 label="全部完成",
                 message="解答完成。",
                 done=True,
@@ -1035,7 +1401,7 @@ def _state_from_status_payload(
         solution_id=str(solution_id) if solution_id else None,
         stage=stage,
         call_index=int(payload.get("call_index") or 0),
-        total_calls=int(payload.get("total_calls") or 4),
+        total_calls=int(payload.get("total_calls") or _TOTAL_CALLS),
         label=str(payload.get("label") or ""),
         message=str(payload.get("message") or ""),
         done=done,
@@ -1151,15 +1517,16 @@ async def get_answer_job_state(
             question_id=question_id,
             solution_id=solution_id,
         )
+    running = bool(task and not task.done() and not (state.done if state else False))
     return {
         "question_id": qid,
         "solution_id": str(solution_id) if solution_id else None,
-        "running": bool(task and not task.done()),
+        "running": running,
         "stage": state.stage if state else None,
         "done": state.done if state else False,
         "error": state.error if state else None,
         "call_index": state.call_index if state else 0,
-        "total_calls": state.total_calls if state else 4,
+        "total_calls": state.total_calls if state else _TOTAL_CALLS,
         "label": state.label if state else "",
         "message": state.message if state else "",
     }
@@ -1170,6 +1537,7 @@ def build_pipeline_snapshot(
     question_status: str,
     has_parsed: bool,
     has_answer: bool,
+    has_visualization_plan: bool,
     visualizations_generated: bool,
     job_state: dict | None,
     stage_reviews: list[dict] | None = None,
@@ -1202,6 +1570,8 @@ def build_pipeline_snapshot(
             state = "review"
         elif key == "parsed" and has_parsed:
             state = "review"
+        elif key == "visualizing" and has_visualization_plan:
+            state = "review"
 
         if question_status == "error" and current_call == call_index:
             state = "error"
@@ -1217,7 +1587,7 @@ def build_pipeline_snapshot(
     return {
         "current_stage": current_stage,
         "current_call": current_call,
-        "total_calls": 4,
+        "total_calls": _TOTAL_CALLS,
         "completed_calls": completed_calls,
         "visualizations_generated": visualizations_generated,
         "error": error,

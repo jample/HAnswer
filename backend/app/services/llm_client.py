@@ -1,4 +1,4 @@
-"""Gemini client gateway (§5.3 llm_client, §4 reliability).
+"""Provider-neutral LLM client gateway (§5.3 llm_client, §4 reliability).
 
 Responsibilities:
   - Single entry point for all LLM calls (text, multimodal, embedding).
@@ -94,6 +94,31 @@ class PromptLogRecord:
     task_type: str | None = None
     response_schema: dict[str, Any] | None = None
     response_preview: str | None = None
+    response_content: str | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    latency_ms: int | None = None
+    status: str = "ok"
+    error: str | None = None
+
+
+@dataclass
+class ResponseLogRecord:
+    timestamp: str
+    call_id: str
+    attempt: int
+    request_kind: str
+    task: str
+    prompt_version: str
+    model: str
+    phase_description: str
+    question_id: str | None
+    solution_id: str | None
+    conversation_id: str | None
+    image_names: list[str]
+    related: dict[str, Any]
+    response_content: str
+    response_preview: str | None = None
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     latency_ms: int | None = None
@@ -137,20 +162,69 @@ class NoopPromptLogger:
 
 
 class JsonlPromptLogger:
-    def __init__(self, path: str | None = None) -> None:
+    def __init__(self, path: str | None = None, response_path: str | None = None) -> None:
         self.path = Path(path or settings.storage.llm_prompt_log_file)
+        self.response_path = Path(
+            response_path
+            or (
+                str(self.path.with_name("llm_responses.jsonl"))
+                if path is not None and response_path is None
+                else settings.storage.llm_response_log_file
+            )
+        )
 
     async def record_prompt(self, rec: PromptLogRecord) -> None:
         try:
-            payload = json.dumps(rec.__dict__, ensure_ascii=False) + "\n"
-            await asyncio.to_thread(self._append_line, payload)
+            prompt_payload = self._prompt_payload(rec)
+            response_payload = self._response_payload(rec)
+            await asyncio.to_thread(self._append_records, prompt_payload, response_payload)
         except Exception as e:  # noqa: BLE001
             log.warning("prompt log write failed: %s", e)
 
-    def _append_line(self, payload: str) -> None:
+    def _append_records(self, prompt_payload: str, response_payload: str | None) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a", encoding="utf-8") as f:
-            f.write(payload)
+            f.write(prompt_payload)
+        if response_payload is not None:
+            self.response_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.response_path.open("a", encoding="utf-8") as f:
+                f.write(response_payload)
+
+    @staticmethod
+    def _prompt_payload(rec: PromptLogRecord) -> str:
+        payload = {
+            **rec.__dict__,
+            "response_content": None,
+        }
+        return json.dumps(payload, ensure_ascii=False) + "\n"
+
+    @staticmethod
+    def _response_payload(rec: PromptLogRecord) -> str | None:
+        if rec.response_content is None:
+            return None
+        payload = ResponseLogRecord(
+            timestamp=rec.timestamp,
+            call_id=rec.call_id,
+            attempt=rec.attempt,
+            request_kind=rec.request_kind,
+            task=rec.task,
+            prompt_version=rec.prompt_version,
+            model=rec.model,
+            phase_description=rec.phase_description,
+            question_id=rec.question_id,
+            solution_id=rec.solution_id,
+            conversation_id=rec.conversation_id,
+            image_names=rec.image_names,
+            related=rec.related,
+            response_content=rec.response_content,
+            response_preview=rec.response_preview,
+            prompt_tokens=rec.prompt_tokens,
+            completion_tokens=rec.completion_tokens,
+            latency_ms=rec.latency_ms,
+            status=rec.status,
+            error=rec.error,
+        )
+        return json.dumps(payload.__dict__, ensure_ascii=False) + "\n"
 
 
 def _truncate_text(value: str, limit: int = 8000) -> str:
@@ -196,8 +270,8 @@ def _sanitize_messages(
 
 # ── Low-level transport adapter ────────────────────────────────────
 
-class GeminiTransport(Protocol):
-    """Minimal interface; concrete impl uses google-genai SDK."""
+class LLMTransport(Protocol):
+    """Minimal interface; concrete impls use provider SDKs."""
 
     async def generate_json(
         self,
@@ -208,6 +282,16 @@ class GeminiTransport(Protocol):
         timeout_s: int,
     ) -> tuple[str, int, int]:
         """Return (raw_text, prompt_tokens, completion_tokens)."""
+        ...
+
+    async def generate_text(
+        self,
+        *,
+        model: str,
+        messages: list[dict],
+        timeout_s: int,
+    ) -> tuple[str, int, int]:
+        """Return raw text plus token counts for non-JSON prompts."""
         ...
 
     async def generate_json_stream(
@@ -249,22 +333,43 @@ class GeminiTransport(Protocol):
 class FakeTransport:
     """Test double — returns canned JSON for schema round-trips."""
 
-    def __init__(self, json_by_model: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        json_by_model: dict[str, str] | None = None,
+        text_by_model: dict[str, str] | None = None,
+    ) -> None:
         self.json_by_model = json_by_model or {}
+        self.text_by_model = text_by_model or {}
         self.calls: list[dict] = []
 
     async def generate_json(
         self, *, model, messages, response_schema, timeout_s,
     ) -> tuple[str, int, int]:
         self.calls.append({"model": model, "messages": messages})
-        raw = self.json_by_model.get(model, "{}")
+        raw = self.json_by_model.get(model)
+        if raw is None and len(self.json_by_model) == 1:
+            raw = next(iter(self.json_by_model.values()))
+        raw = raw if raw is not None else "{}"
+        return raw, 0, 0
+
+    async def generate_text(
+        self, *, model, messages, timeout_s,
+    ) -> tuple[str, int, int]:
+        self.calls.append({"model": model, "messages": messages, "text": True})
+        raw = self.text_by_model.get(model)
+        if raw is None and len(self.text_by_model) == 1:
+            raw = next(iter(self.text_by_model.values()))
+        raw = raw if raw is not None else ""
         return raw, 0, 0
 
     async def generate_json_stream(
         self, *, model, messages, response_schema, timeout_s,
     ) -> tuple[str, int, int]:
         self.calls.append({"model": model, "messages": messages, "stream": True})
-        raw = self.json_by_model.get(model, "{}")
+        raw = self.json_by_model.get(model)
+        if raw is None and len(self.json_by_model) == 1:
+            raw = next(iter(self.json_by_model.values()))
+        raw = raw if raw is not None else "{}"
         return raw, 0, 0
 
     async def generate_json_stream_iter(
@@ -275,13 +380,16 @@ class FakeTransport:
         self.calls.append(
             {"model": model, "messages": messages, "stream": True, "iter": True}
         )
-        raw = self.json_by_model.get(model, "{}")
+        raw = self.json_by_model.get(model)
+        if raw is None and len(self.json_by_model) == 1:
+            raw = next(iter(self.json_by_model.values()))
+        raw = raw if raw is not None else "{}"
         mid = max(1, len(raw) // 2)
         yield StreamChunk(text=raw[:mid], prompt_tokens=0, completion_tokens=0)
         yield StreamChunk(text=raw[mid:], prompt_tokens=0, completion_tokens=0)
 
     async def embed(self, *, model, texts, task_type=None) -> list[list[float]]:
-        return [[0.0] * settings.gemini.embed_dim for _ in texts]
+        return [[0.0] * settings.retrieval_dense_dim for _ in texts]
 
 
 # ── Cost estimation ────────────────────────────────────────────────
@@ -315,13 +423,113 @@ def _log_before_retry(retry_state: RetryCallState) -> None:
     )
 
 
+def _resolve_literal_at(model_cls: type[BaseModel], loc: tuple) -> list | None:
+    """Walk a Pydantic model along `loc` and return Literal values if any.
+
+    `loc` follows ``ValidationError.errors()[i]["loc"]`` conventions:
+    field names interleaved with list indices. Returns ``None`` when the
+    target is not a Literal field.
+    """
+    from typing import Literal as _Literal
+    from typing import Union as _Union
+    from typing import get_args as _get_args
+    from typing import get_origin as _get_origin
+
+    def _unwrap(tp):
+        origin = _get_origin(tp)
+        if origin is _Union:
+            non_none = [a for a in _get_args(tp) if a is not type(None)]
+            if len(non_none) == 1:
+                return _unwrap(non_none[0])
+            return tp
+        if origin in (list, set, tuple):
+            args = _get_args(tp)
+            if args:
+                return _unwrap(args[0])
+        if origin is dict:
+            args = _get_args(tp)
+            if len(args) == 2:
+                return _unwrap(args[1])
+        return tp
+
+    current: Any = model_cls
+    for part in loc:
+        if isinstance(part, int):
+            continue
+        if not (isinstance(current, type) and issubclass(current, BaseModel)):
+            return None
+        field = current.model_fields.get(str(part))
+        if field is None:
+            return None
+        current = _unwrap(field.annotation)
+
+    if _get_origin(current) is _Literal:
+        return list(_get_args(current))
+    return None
+
+
+def _format_repair_instructions(
+    model_cls: type[BaseModel] | None,
+    err: ValidationError,
+    *,
+    max_items: int = 30,
+) -> str:
+    """Convert a ValidationError into a focused fix-list for the LLM.
+
+    Generic ``str(err)`` dumps are noisy and the model often re-emits the
+    same drift on the second attempt. A structured per-error recipe keeps
+    the repair turn small and actionable.
+    """
+    lines: list[str] = []
+    seen: set[tuple] = set()
+    for entry in err.errors():
+        loc = tuple(entry.get("loc") or ())
+        kind = entry.get("type", "")
+        msg = entry.get("msg", "")
+        key = (loc, kind, msg)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        path = ".".join(str(p) for p in loc) if loc else "(root)"
+        if kind == "literal_error" and model_cls is not None:
+            allowed = _resolve_literal_at(model_cls, loc)
+            input_value = entry.get("input")
+            if allowed:
+                lines.append(
+                    f"- `{path}` must be exactly one of: "
+                    f"{' | '.join(str(v) for v in allowed)}"
+                    + (f" (you wrote: {input_value!r})" if input_value is not None else "")
+                )
+                continue
+        if kind == "missing":
+            lines.append(f"- `{path}` is required and must be provided.")
+            continue
+        if kind.startswith("value_error"):
+            lines.append(f"- `{path}`: {msg}")
+            continue
+        if kind in {"int_parsing", "float_parsing", "bool_parsing", "string_type"}:
+            lines.append(f"- `{path}`: {msg}")
+            continue
+        # Fallback: include the path + Pydantic message verbatim.
+        lines.append(f"- `{path}` ({kind}): {msg}")
+
+        if len(lines) >= max_items:
+            lines.append("- ...and more; fix every error in the list above.")
+            break
+
+    if not lines:
+        lines.append(f"- {err}")
+    return "\n".join(lines)
+
+
 # ── Gateway ────────────────────────────────────────────────────────
 
 
-class GeminiClient:
+class LLMClient:
     def __init__(
         self,
-        transport: GeminiTransport,
+        transport: LLMTransport,
         ledger: CostLedger | None = None,
         prompt_logger: PromptLogger | None = None,
     ) -> None:
@@ -370,6 +578,7 @@ class GeminiClient:
                 task_type=task_type,
                 response_schema=response_schema,
                 response_preview=_truncate_text(response_preview or "", limit=4000) if response_preview else None,
+                response_content=response_preview or None,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 latency_ms=latency_ms,
@@ -411,6 +620,29 @@ class GeminiClient:
         except TimeoutError as e:
             raise TransientLLMError(f"timeout after {timeout_s}s: {e}") from e
 
+    @retry(
+        stop=stop_after_attempt(settings.llm.max_retries + 1),
+        wait=wait_exponential(multiplier=2, min=2, max=30),
+        retry=retry_if_exception_type(TransientLLMError),
+        before_sleep=_log_before_retry,
+        reraise=True,
+    )
+    async def _raw_text_call(
+        self,
+        *,
+        model: str,
+        messages: list[dict],
+        timeout_s: int,
+    ) -> tuple[str, int, int]:
+        try:
+            return await self.transport.generate_text(
+                model=model,
+                messages=messages,
+                timeout_s=timeout_s,
+            )
+        except TimeoutError as e:
+            raise TransientLLMError(f"timeout after {timeout_s}s: {e}") from e
+
     async def call_structured(
         self,
         *,
@@ -422,6 +654,9 @@ class GeminiClient:
         prompt_context: PromptLogContext | None = None,
         timeout_s: int | None = None,
         stream: bool = False,
+        stream_recovery_timeout_s: int | None = None,
+        min_repair_attempts: int = 0,
+        disable_repair: bool = False,
     ) -> T:
         """Call the LLM and validate output against a pydantic model.
 
@@ -433,6 +668,9 @@ class GeminiClient:
         trace = template.trace_tag()
         resolved_timeout_s = timeout_s or settings.llm.request_timeout_s
         call_id = str(uuid4())
+        max_repair_attempts = (
+            0 if disable_repair else max(settings.llm.max_repair_attempts, min_repair_attempts)
+        )
 
         attempt = 0
         last_err: str | None = None
@@ -441,7 +679,7 @@ class GeminiClient:
         ptok = ctok = 0
         use_stream = stream
 
-        while attempt <= settings.llm.max_repair_attempts:
+        while attempt <= max_repair_attempts:
             try:
                 raw_json, ptok, ctok = await self._raw_call(
                     model=model,
@@ -451,7 +689,7 @@ class GeminiClient:
                     stream=use_stream,
                 )
             except TransientLLMError:
-                if not use_stream or settings.llm.max_retries <= 0:
+                if not use_stream:
                     latency = int((time.perf_counter() - t0) * 1000)
                     await self._record_prompt(
                         call_id=call_id,
@@ -464,12 +702,15 @@ class GeminiClient:
                         response_schema=template.schema,
                         latency_ms=latency,
                         status="error",
-                        error="transient_stream_failed",
+                        error=(
+                            "transient_stream_failed"
+                            if use_stream else "transient_call_failed"
+                        ),
                     )
                     raise
                 recovery_timeout_s = max(
                     resolved_timeout_s,
-                    settings.llm.stream_recovery_timeout_s,
+                    stream_recovery_timeout_s or settings.llm.stream_recovery_timeout_s,
                 )
                 log.warning(
                     "streaming structured call failed; retrying once via non-stream "
@@ -536,9 +777,25 @@ class GeminiClient:
                     error=last_err,
                 )
                 log.warning(
-                    "LLM output validation failed (attempt %d): %s",
-                    attempt, last_err,
+                    "LLM output validation failed for prompt '%s' (attempt %d/%d): %s",
+                    trace.get("prompt_name", "unknown"),
+                    attempt,
+                    max_repair_attempts,
+                    last_err,
                 )
+                extra_repair_hint = ""
+                if (
+                    trace.get("prompt_name") == "vizplanner"
+                    and "unknown shared symbols" in last_err
+                ):
+                    extra_repair_hint = (
+                        "\n\nAdditional repair requirements:\n"
+                        "- Each symbol_map entry may declare only one symbol.\n"
+                        "- Do not combine symbols such as `P, Q` or `P'/Q'` in one entry.\n"
+                        "- Every symbol used in item.shared_symbols must be declared individually in symbol_map.\n"
+                        "- If an item uses symbols such as `r`, `r'`, `P'`, or `Q'`, add each one separately to symbol_map."
+                    )
+                fix_list = _format_repair_instructions(model_cls, e)
                 # Build repair message: append validator error + bad JSON.
                 messages = [
                     *messages,
@@ -546,10 +803,14 @@ class GeminiClient:
                     {
                         "role": "user",
                         "content": (
-                            "上一次输出不符合 JSON Schema, 请仅修正以下问题并重新输出"
-                            "完整 JSON (不要省略任何字段):\n"
-                            f"{last_err}\n\n"
-                            "仍须严格遵循 Schema, 不要添加解释文字。"
+                            "The previous output did not satisfy the schema. Apply EXACTLY the fixes below and re-emit the FULL JSON (every required field, no omissions, no markdown).\n\n"
+                            "Fixes required:\n"
+                            f"{fix_list}\n\n"
+                            "Notes:\n"
+                            "- For literal fields, use the exact token shown; never paraphrase, translate, or invent variants.\n"
+                            "- Re-check every cross-field rule listed in the system message before responding.\n"
+                            "- Do not add explanatory prose outside the JSON."
+                            f"{extra_repair_hint}"
                         ),
                     },
                 ]
@@ -588,8 +849,78 @@ class GeminiClient:
         )
         raise LLMError(
             f"LLM output failed validation after "
-            f"{settings.llm.max_repair_attempts} repair attempts: {last_err}"
+            f"{max_repair_attempts} repair attempts: {last_err}"
         )
+
+    async def call_text(
+        self,
+        *,
+        template: PromptTemplate,
+        model: str,
+        template_kwargs: dict[str, Any] | None = None,
+        messages_override: list[dict] | None = None,
+        prompt_context: PromptLogContext | None = None,
+        timeout_s: int | None = None,
+    ) -> str:
+        tk = template_kwargs or {}
+        messages = messages_override or template.build(**tk)
+        trace = template.trace_tag()
+        resolved_timeout_s = timeout_s or settings.llm.request_timeout_s
+        call_id = str(uuid4())
+        t0 = time.perf_counter()
+
+        try:
+            raw_text, ptok, ctok = await self._raw_text_call(
+                model=model,
+                messages=messages,
+                timeout_s=resolved_timeout_s,
+            )
+        except Exception as e:
+            latency = int((time.perf_counter() - t0) * 1000)
+            await self._record_prompt(
+                call_id=call_id,
+                attempt=0,
+                request_kind="text",
+                trace=trace,
+                model=model,
+                context=prompt_context,
+                messages=messages,
+                latency_ms=latency,
+                status="error",
+                error=str(e),
+            )
+            if isinstance(e, LLMError):
+                raise
+            raise LLMError(str(e)) from e
+
+        latency = int((time.perf_counter() - t0) * 1000)
+        await self._record_prompt(
+            call_id=call_id,
+            attempt=0,
+            request_kind="text",
+            trace=trace,
+            model=model,
+            context=prompt_context,
+            messages=messages,
+            response_preview=raw_text,
+            prompt_tokens=ptok,
+            completion_tokens=ctok,
+            latency_ms=latency,
+            status="ok",
+        )
+        await self.ledger.record(
+            LLMCallRecord(
+                task=trace["prompt_name"],
+                prompt_version=trace["prompt_version"],
+                model=model,
+                prompt_tokens=ptok,
+                completion_tokens=ctok,
+                cost_usd=_estimate_cost_usd(model, ptok, ctok),
+                latency_ms=latency,
+                status="ok",
+            )
+        )
+        return raw_text
 
     async def call_structured_streaming(
         self,
@@ -601,6 +932,7 @@ class GeminiClient:
         messages_override: list[dict] | None = None,
         prompt_context: PromptLogContext | None = None,
         timeout_s: int | None = None,
+        stream_recovery_timeout_s: int | None = None,
     ) -> AsyncIterator[tuple[str, object] | T]:
         """Stream-parse the LLM JSON, yielding ``(key, value)`` tuples
         as each top-level field completes, then a final validated
@@ -629,6 +961,7 @@ class GeminiClient:
                 messages_override=messages_override,
                 prompt_context=prompt_context,
                 timeout_s=timeout_s,
+                stream_recovery_timeout_s=stream_recovery_timeout_s,
                 stream=True,
             )
             yield parsed
@@ -639,6 +972,8 @@ class GeminiClient:
         t0 = time.perf_counter()
         full_text_parts: list[str] = []
         stream_error: Exception | None = None
+        first_chunk_ms: int | None = None
+        chunk_count = 0
 
         try:
             async for chunk in iter_fn(
@@ -648,6 +983,17 @@ class GeminiClient:
                 timeout_s=resolved_timeout_s,
             ):
                 if chunk.text:
+                    chunk_count += 1
+                    if first_chunk_ms is None:
+                        first_chunk_ms = int((time.perf_counter() - t0) * 1000)
+                        log.info(
+                            "structured stream first chunk task=%s question_id=%s solution_id=%s model=%s first_chunk_ms=%s",
+                            trace.get("prompt_name", "unknown"),
+                            prompt_context.question_id if prompt_context else None,
+                            prompt_context.solution_id if prompt_context else None,
+                            model,
+                            first_chunk_ms,
+                        )
                     full_text_parts.append(chunk.text)
                     for pair in parser.feed(chunk.text):
                         yield pair
@@ -659,28 +1005,9 @@ class GeminiClient:
             stream_error = e
 
         if stream_error is not None:
-            if settings.llm.max_retries <= 0:
-                latency = int((time.perf_counter() - t0) * 1000)
-                await self._record_prompt(
-                    call_id=call_id,
-                    attempt=0,
-                    request_kind="structured_stream",
-                    trace=trace,
-                    model=model,
-                    context=prompt_context,
-                    messages=messages,
-                    response_schema=template.schema,
-                    response_preview="".join(full_text_parts),
-                    prompt_tokens=ptok,
-                    completion_tokens=ctok,
-                    latency_ms=latency,
-                    status="error",
-                    error=str(stream_error),
-                )
-                raise stream_error
             recovery_timeout_s = max(
                 resolved_timeout_s,
-                settings.llm.stream_recovery_timeout_s,
+                stream_recovery_timeout_s or settings.llm.stream_recovery_timeout_s,
             )
             log.warning(
                 "streaming transport failed; falling back to bulk structured call "
@@ -697,6 +1024,7 @@ class GeminiClient:
                 messages_override=messages_override,
                 prompt_context=prompt_context,
                 timeout_s=recovery_timeout_s,
+                stream_recovery_timeout_s=stream_recovery_timeout_s,
                 stream=False,
             )
             yield parsed
@@ -706,6 +1034,16 @@ class GeminiClient:
         try:
             parsed = model_cls.model_validate_json(raw_json)
             latency = int((time.perf_counter() - t0) * 1000)
+            log.info(
+                "structured stream completed task=%s question_id=%s solution_id=%s model=%s chunk_count=%s first_chunk_ms=%s total_elapsed_ms=%s",
+                trace.get("prompt_name", "unknown"),
+                prompt_context.question_id if prompt_context else None,
+                prompt_context.solution_id if prompt_context else None,
+                model,
+                chunk_count,
+                first_chunk_ms,
+                latency,
+            )
             await self._record_prompt(
                 call_id=call_id,
                 attempt=0,
@@ -766,6 +1104,7 @@ class GeminiClient:
                 messages_override=repair_messages,
                 prompt_context=prompt_context,
                 timeout_s=timeout_s,
+                stream_recovery_timeout_s=stream_recovery_timeout_s,
                 stream=False,
             )
             yield parsed
@@ -778,7 +1117,11 @@ class GeminiClient:
         task_type: str | None = None,
         prompt_context: PromptLogContext | None = None,
     ) -> list[list[float]]:
-        m = model or settings.gemini.model_embed
+        m = model or (
+            settings.embedding.model
+            if settings.embedding.provider in {"openai", "gemini"}
+            else settings.retrieval.bge_m3_model
+        )
         t0 = time.perf_counter()
         try:
             vectors = await self.transport.embed(model=m, texts=texts, task_type=task_type)
@@ -797,7 +1140,9 @@ class GeminiClient:
                 status="error",
                 error=str(e),
             )
-            raise
+            if isinstance(e, LLMError):
+                raise
+            raise LLMError(str(e)) from e
         latency = int((time.perf_counter() - t0) * 1000)
         await self._record_prompt(
             call_id=str(uuid4()),
@@ -812,3 +1157,7 @@ class GeminiClient:
             status="ok",
         )
         return vectors
+
+
+GeminiTransport = LLMTransport
+GeminiClient = LLMClient

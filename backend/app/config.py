@@ -37,6 +37,36 @@ class GeminiSettings(BaseModel):
     embed_dim: int = 1536
 
 
+class OpenAISettings(BaseModel):
+    # `model_*` field names collide with pydantic's protected namespace.
+    model_config = ConfigDict(protected_namespaces=())
+
+    api_key: str = ""
+    base_url: str = ""
+    model_default: str = "gpt-5.4-pro"
+    model_parser: str = "gpt-5.4-pro"
+    model_solver: str = "gpt-5.4-pro"
+    model_vizcoder: str = "gpt-5.4-pro"
+    model_chat: str = "gpt-5.4-pro"
+    model_embed: str = "text-embedding-3-large"
+    embed_dim: int = 1536
+
+
+class EmbeddingSettings(BaseModel):
+    """Dedicated dense-embedding provider configuration.
+
+    Embeddings are intentionally configured separately from the main LLM
+    provider so retrieval/indexing can use a different gateway, key, model,
+    and vector dimension than parser/solver/vizcoder calls.
+    """
+
+    provider: Literal["openai", "gemini", "bge-m3"] = "openai"
+    endpoint: str = ""
+    api_key: str = ""
+    model: str = "text-embedding-3-large"
+    dimensions: int = 1536
+
+
 class PostgresSettings(BaseModel):
     dsn: str = "postgresql+asyncpg://jianbo@localhost:5432/jianbo"
 
@@ -58,6 +88,12 @@ class MilvusSettings(BaseModel):
     # When bootstrap creates or recreates Milvus collections, repopulate
     # retrieval data from PostgreSQL automatically.
     auto_reindex_on_bootstrap_change: bool = True
+    # Milvus makes inserted/deleted rows queryable without forcing an explicit
+    # flush on every write. Leaving this off avoids local standalone rate
+    # limiter failures such as `flush rate limit exceeded[rate=0.1]` during
+    # indexing/reindexing. Enable only for deployments that explicitly require
+    # synchronous segment persistence after each vector write.
+    flush_on_write: bool = False
 
 
 class ServerSettings(BaseModel):
@@ -69,16 +105,20 @@ class ServerSettings(BaseModel):
 class StorageSettings(BaseModel):
     image_dir: str = "./data/images"
     llm_prompt_log_file: str = "./data/logs/llm_prompts.jsonl"
+    llm_response_log_file: str = "./data/logs/llm_responses.jsonl"
+    visual_action_log_file: str = "./data/logs/visualActions.jsonl"
 
 
 class LLMSettings(BaseModel):
+    provider: Literal["openai", "gemini"] = "openai"
     max_retries: int = 0
     max_repair_attempts: int = 0
     max_parallel_gemini_calls: int = Field(default=1, ge=1)
     request_timeout_s: int = 90
-    stream_parser_json: bool = True
-    parser_timeout_s: int = 120
+    stream_parser_json: bool = False
+    parser_timeout_s: int = 90
     solver_timeout_s: int = 300
+    solver_stream_recovery_timeout_s: int = 180
     vizcoder_timeout_s: int = 240
     dialog_timeout_s: int = 90
     embed_timeout_s: int = 60
@@ -90,12 +130,9 @@ class LLMSettings(BaseModel):
 class RetrievalSettings(BaseModel):
     """M5 hybrid retrieval knobs (§3.4).
 
-    `embedder`  — dense-vector provider. "gemini" (default) uses the
-                  configured Gemini embedding model (`gemini-embedding-2-preview`,
-                  `gemini-embedding-001`, or legacy `text-embedding-004`).
-                  "bge-m3" loads a local
-                  BAAI/bge-m3 model via FlagEmbedding (optional
-                  dependency, lazy-imported).
+    Dense-vector provider/model/dimensions are configured under `[embedding]`.
+    Remote embedding endpoint/key come from `EMB_URL` and `EMB_API_KEY`.
+    `sparse_encoder` still controls the lexical signal.
     `multi_route` — when True, similar-question retrieval runs three
                   routes in parallel (dense, sparse, structural) and
                   fuses their ranks with Reciprocal-Rank Fusion.
@@ -105,7 +142,6 @@ class RetrievalSettings(BaseModel):
                   reuses the loaded bge-m3 model's lexical head.
     """
 
-    embedder: str = "gemini"               # "gemini" | "bge-m3"
     sparse_encoder: str = "bm25"           # "bm25" | "bge-m3"
     multi_route: bool = True
     rrf_k: int = 60                        # RRF damping constant
@@ -143,7 +179,9 @@ class VizSettings(BaseModel):
 
 
 class Settings(BaseModel):
+    openai: OpenAISettings = Field(default_factory=OpenAISettings)
     gemini: GeminiSettings = Field(default_factory=GeminiSettings)
+    embedding: EmbeddingSettings = Field(default_factory=EmbeddingSettings)
     postgres: PostgresSettings = Field(default_factory=PostgresSettings)
     milvus: MilvusSettings = Field(default_factory=MilvusSettings)
     server: ServerSettings = Field(default_factory=ServerSettings)
@@ -155,9 +193,22 @@ class Settings(BaseModel):
 
     @property
     def retrieval_dense_dim(self) -> int:
-        if self.retrieval.embedder == "bge-m3":
+        if self.embedding.provider == "bge-m3":
             return self.retrieval.bge_m3_dense_dim
-        return self.gemini.embed_dim
+        return self.embedding.dimensions
+
+    def llm_model(self, task: Literal["parser", "solver", "vizcoder", "dialog"]) -> str:
+        if self.llm.provider == "openai":
+            if task == "dialog":
+                return self.openai.model_chat or self.openai.model_default
+            return getattr(self.openai, f"model_{task}") or self.openai.model_default
+        if task == "dialog":
+            return self.dialog.model_chat
+        return getattr(self.gemini, f"model_{task}")
+
+    @property
+    def active_llm_provider_label(self) -> str:
+        return "OpenAI" if self.llm.provider == "openai" else "Gemini"
 
 
 def _candidate_paths() -> list[Path]:
@@ -178,10 +229,15 @@ def get_settings() -> Settings:
             with path.open("rb") as f:
                 raw = tomllib.load(f)
             break
-    # API key is sourced exclusively from $GEMINI_API_KEY env var.
-    # Any api_key value in config.toml is intentionally ignored.
-    env_key = os.environ.get("GEMINI_API_KEY", "")
-    raw.setdefault("gemini", {})["api_key"] = env_key
+    # API keys / remote gateway URLs are sourced exclusively from environment
+    # variables. Any api_key / endpoint value in config.toml is intentionally
+    # ignored because both may contain deploy-specific secrets.
+    raw.setdefault("gemini", {})["api_key"] = os.environ.get("GEMINI_API_KEY", "")
+    raw.setdefault("openai", {})["api_key"] = os.environ.get("OAI_API_KEY", "")
+    raw.setdefault("openai", {})["base_url"] = os.environ.get("OAI_BASE_URL", "")
+    embedding = raw.setdefault("embedding", {})
+    embedding["api_key"] = os.environ.get("EMB_API_KEY", "")
+    embedding["endpoint"] = os.environ.get("EMB_URL", "")
     return Settings(**raw)
 
 

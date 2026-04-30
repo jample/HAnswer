@@ -56,8 +56,6 @@ def _stage_review_payload(
         "reviewed_at": reviewed_at.isoformat() if reviewed_at else None,
         "updated_at": (updated_at or _utcnow()).isoformat(),
     }
-
-
 def _parse_dt(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -80,10 +78,23 @@ def serialize_solution(row: QuestionSolution) -> dict:
         "is_current": row.is_current,
         "status": row.status,
         "has_answer": row.answer_package_json is not None,
+        "has_visualization_plan": row.visualization_plan_json is not None,
         "visualization_count": len(row.visualizations_json or []),
         "stage_reviews": reviews,
         "created_at": row.created_at.isoformat() if row.created_at else None,
         "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+
+
+def _derive_visualization_plan_from_rows(viz_rows) -> dict | None:
+    specs = [dict(row.spec_json) for row in viz_rows if isinstance(getattr(row, "spec_json", None), dict)]
+    if not specs:
+        return None
+    selected = next((spec for spec in specs if spec.get("recommended")), specs[0])
+    return {
+        "visualizations": specs,
+        "selected_visualization_id": selected.get("id"),
+        "selected_visualization": selected,
     }
 
 
@@ -358,12 +369,14 @@ async def clear_solution_stage_outputs(
     reviews = dict(solution.stage_reviews_json or {})
     if stage == "solving":
         solution.answer_package_json = None
+        solution.visualization_plan_json = None
         solution.visualizations_json = []
         solution.sediment_json = None
         for name in ("visualizing", "indexing"):
             reviews.pop(name, None)
         solution.status = review_question_status("parsed")
     elif stage == "visualizing":
+        solution.visualization_plan_json = None
         solution.visualizations_json = []
         solution.sediment_json = None
         reviews.pop("indexing", None)
@@ -412,6 +425,19 @@ async def update_solution_answer(
     answer_package_json: dict,
 ) -> None:
     solution.answer_package_json = answer_package_json
+    solution.updated_at = _utcnow()
+    await session.flush()
+
+
+async def update_solution_visualization_plan(
+    session: AsyncSession,
+    *,
+    solution: QuestionSolution,
+    visualization_plan_json: dict | None,
+) -> None:
+    solution.visualization_plan_json = (
+        dict(visualization_plan_json) if visualization_plan_json is not None else None
+    )
     solution.updated_at = _utcnow()
     await session.flush()
 
@@ -494,15 +520,16 @@ async def bootstrap_solution_from_question(
             "caption_cn": row.caption,
             "learning_goal": row.learning_goal,
             "helpers_used": list(row.helpers_used_json or []),
-            "engine": getattr(row, "engine", None) or "jsxgraph",
-            "jsx_code": row.jsx_code,
-            "ggb_commands": list(getattr(row, "ggb_commands_json", None) or []),
-            "ggb_settings": getattr(row, "ggb_settings_json", None),
-            "params": list(row.params_json or []),
-            "animation": row.animation_json,
+            "interactive_hints": list(getattr(row, "interactive_hints_json", None) or []),
+            "engine": "geogebra",
+            "spec_json": getattr(row, "spec_json", None),
+            "execution_payload": getattr(row, "execution_payload_json", None),
+            "degraded": bool(getattr(row, "degraded", False)),
         }
         for row in viz_rows
+        if str(getattr(row, "engine", "") or "").lower() == "geogebra"
     ]
+    visualization_plan_json = _derive_visualization_plan_from_rows(viz_rows)
 
     sediment_json = None
     sediment_section = (await session.execute(
@@ -518,6 +545,7 @@ async def bootstrap_solution_from_question(
     row = await create_solution(session, question_id=question.id, make_current=True)
     row.status = question.status
     row.answer_package_json = question.answer_package_json
+    row.visualization_plan_json = visualization_plan_json
     row.visualizations_json = visualizations
     row.sediment_json = sediment_json
     row.stage_reviews_json = stage_reviews

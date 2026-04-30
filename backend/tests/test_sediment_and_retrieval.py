@@ -55,7 +55,7 @@ class _CannedEmbedTransport(FakeTransport):
 
     async def embed(self, *, model, texts, task_type=None):
         out = []
-        dim = settings.gemini.embed_dim
+        dim = settings.retrieval_dense_dim
         for t in texts:
             found = self._lookup(t)
             if found is not None:
@@ -75,7 +75,7 @@ def _unit(values: list[float]) -> list[float]:
 
 
 def _pad(v: list[float]) -> list[float]:
-    dim = settings.gemini.embed_dim
+    dim = settings.retrieval_dense_dim
     return _unit(v + [0.0] * (dim - len(v)))
 
 

@@ -1,6 +1,20 @@
 # HAnswer backend configuration — copy to config.toml and fill in.
 # config.toml is gitignored; this example is safe to commit.
 
+[openai]
+# API key/base URL are read from environment variables:
+#   OAI_API_KEY
+#   OAI_BASE_URL
+# Do NOT put secrets here — set them in your shell or CI secrets instead.
+model_default  = "gpt-5.4-pro"
+model_parser   = "gpt-5.4-pro"
+model_solver   = "gpt-5.4-pro"
+model_vizcoder = "gpt-5.4-pro"
+model_chat     = "gpt-5.4-pro"
+# Legacy embedding defaults; active embeddings are configured in [embedding].
+model_embed    = "text-embedding-3-large"
+embed_dim      = 1536
+
 [gemini]
 # API key is read from the $GEMINI_API_KEY environment variable.
 # Do NOT put the key here — set it in your shell or CI secrets instead.
@@ -8,13 +22,26 @@
 model_parser   = "gemini-3.1-pro-preview" # multimodal, image -> ParsedQuestion
 model_solver   = "gemini-3.1-pro-preview" # text, ParsedQuestion -> AnswerPackage
 model_vizcoder = "gemini-3.1-pro-preview" # text, AnswerPackage -> visualizations[]
-# Gemini dense-embedding model.
+# Legacy Gemini dense-embedding defaults; active embeddings are configured in [embedding].
 # Supported in this repo:
 #   - "gemini-embedding-2-preview" via google-genai path (recommended, multimodal)
 #   - "gemini-embedding-001"       via google-genai path
 #   - "text-embedding-004"         via legacy google-generativeai path
 model_embed    = "gemini-embedding-2-preview"
 embed_dim      = 1536  # MRL prefix; 1536 ≈ 50% storage of 3072, negligible recall delta
+
+[embedding]
+# Dedicated dense-embedding service used by indexing and retrieval.
+# API key and endpoint are read from environment variables only:
+#   EMB_API_KEY
+#   EMB_URL
+# For Azure OpenAI-compatible v1, use the base URL form:
+#   EMB_URL=https://<resource>.openai.azure.com/openai/v1/
+# and keep the deployment name in `model`.
+# Do NOT put either secret in this file.
+provider   = "openai"                  # "openai" | "gemini" | "bge-m3"
+model      = "text-embedding-3-large"
+dimensions = 1536
 
 [postgres]
 dsn = "postgresql+asyncpg://jianbo@localhost:5432/jianbo"
@@ -31,6 +58,9 @@ auto_bootstrap = true
 # Milvus from PostgreSQL automatically.
 recreate_dense_on_dim_mismatch = true
 auto_reindex_on_bootstrap_change = true
+# Keep false for local Milvus: explicit flush is heavily rate-limited and
+# inserts/deletes are still queryable without forcing a flush per write.
+flush_on_write = false
 
 [server]
 host = "127.0.0.1"
@@ -40,6 +70,8 @@ cors_origins = ["http://localhost:3333"]
 
 [storage]
 image_dir = "./data/images"
+llm_prompt_log_file = "./data/logs/llm_prompts.jsonl"
+llm_response_log_file = "./data/logs/llm_responses.jsonl"
 
 [viz]
 # Which engine VizCoder should prefer for newly generated visualizations.
@@ -48,6 +80,7 @@ image_dir = "./data/images"
 default_engine = "geogebra"  # "jsxgraph" | "geogebra"
 
 [llm]
+provider = "openai"  # "openai" | "gemini"
 # Retry & repair loop knobs (§4 non-functional requirements).
 # Number of retry attempts *after* the initial call for transient LLM failures
 # such as 429 / 503 / timeout. 0 disables automatic paid re-attempts and lets
@@ -58,9 +91,10 @@ max_repair_attempts = 0
 # tolerate strictly sequential Gemini calls; raise it later for stronger quota.
 max_parallel_gemini_calls = 1
 request_timeout_s = 60
-stream_parser_json = true
-parser_timeout_s = 120
+stream_parser_json = false
+parser_timeout_s = 90
 solver_timeout_s = 300
+solver_stream_recovery_timeout_s = 180
 vizcoder_timeout_s = 240
 dialog_timeout_s = 90
 embed_timeout_s = 60
@@ -71,11 +105,12 @@ stream_vizcoder_json = true
 [retrieval]
 # M5 multi-route retrieval with RRF fusion (§3.4).
 # Fast remote mode:
-#   embedder="gemini" + model_embed="gemini-embedding-2-preview" + sparse_encoder="bm25"
+#   [embedding] provider="openai" + model="text-embedding-3-large" + sparse_encoder="bm25"
+# Legacy Gemini remote mode:
+#   [embedding] provider="gemini" + model="gemini-embedding-2-preview" + sparse_encoder="bm25"
 # Strongest local mixed-language recall:
-#   embedder="bge-m3" + sparse_encoder="bge-m3"
+#   [embedding] provider="bge-m3" + sparse_encoder="bge-m3"
 # and install the optional extra: `pip install -e .[retrieval]`.
-embedder                  = "gemini"        # "gemini" | "bge-m3"
 sparse_encoder            = "bm25"          # "bm25" | "bge-m3"
 multi_route               = true
 rrf_k                     = 60

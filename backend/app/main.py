@@ -66,13 +66,11 @@ def _should_rebuild_retrieval(bootstrap: BootstrapReport | None) -> bool:
 async def _rebuild_retrieval_from_pg() -> None:
     from app.db.session import session_scope
     from app.services.embedding import build_dense_embedder
-    from app.services.llm_deps import get_llm_client
     from app.services.reindex_service import rebuild_retrieval_indexes
     from app.services.sparse_encoder import get_sparse_encoder
     from app.services.vector_store import get_vector_store
 
-    llm = get_llm_client()
-    embedder = build_dense_embedder(llm)
+    embedder = build_dense_embedder()
     sparse = get_sparse_encoder()
     vector_store = get_vector_store()
 

@@ -9,20 +9,30 @@
  *   {"ok": true, "node_count": 42}                -- valid
  *   {"ok": false, "violations": [{kind, message}]} -- rejected
  *
- * The LLM code is expected to be a FUNCTION BODY; we wrap it in
- * `function(board, JXG, H, params){ ... }` before parsing so `return`
+ * The LLM code is expected to be either a FUNCTION BODY (legacy path)
+ * or the full Stage 2 wrapper `function renderVisualization(containerId, spec){ ... }`.
+ * We normalize both into a wrapper function before parsing so `return`
  * statements are legal.
  */
 
 import * as acorn from 'acorn';
 import * as walk from 'acorn-walk';
 
-const ALLOWED_GLOBALS = new Set([
-  'board', 'JXG', 'H', 'params',
+const COMMON_ALLOWED_GLOBALS = new Set([
   'Math', 'Number', 'Array', 'Object', 'Boolean', 'String', 'JSON',
   'console', 'requestAnimationFrame', 'cancelAnimationFrame',
   // locals legitimately created inside the function body
   'undefined', 'NaN', 'Infinity', 'arguments',
+]);
+
+const LEGACY_ALLOWED_GLOBALS = new Set([
+  'board', 'JXG', 'H', 'params',
+  ...COMMON_ALLOWED_GLOBALS,
+]);
+
+const STAGE2_ALLOWED_GLOBALS = new Set([
+  'JXG', 'H',
+  ...COMMON_ALLOWED_GLOBALS,
 ]);
 
 const FORBIDDEN_NEW = new Set(['Function', 'WebSocket', 'Worker', 'XMLHttpRequest']);
@@ -30,6 +40,7 @@ const FORBIDDEN_COMPUTED_PROPS = new Set(['eval', 'Function', 'constructor']);
 
 const MAX_NODES  = 2000;
 const MAX_BYTES  = 32 * 1024;
+const RENDER_VISUALIZATION_RE = /^\s*function\s+renderVisualization\s*\(\s*containerId\s*,\s*spec\s*\)\s*\{([\s\S]*)\}\s*;?\s*$/;
 
 function readStdin() {
   return new Promise((resolve) => {
@@ -73,7 +84,13 @@ function main() {
       return finish([{ kind: 'size', message: `source ${code.length}B > ${MAX_BYTES}B` }]);
     }
 
-    const wrapped = `(function(board, JXG, H, params){\n${code}\n});`;
+    const match = String(code || '').match(RENDER_VISUALIZATION_RE);
+    const isStage2 = !!match;
+    const allowedGlobals = isStage2 ? STAGE2_ALLOWED_GLOBALS : LEGACY_ALLOWED_GLOBALS;
+    const body = isStage2 ? match[1] : code;
+    const wrapped = isStage2
+      ? `(function renderVisualization(containerId, spec){\n${body}\n});`
+      : `(function(board, JXG, H, params){\n${body}\n});`;
     let ast;
     try {
       ast = acorn.parse(wrapped, { ecmaVersion: 2022, sourceType: 'script' });
@@ -89,6 +106,14 @@ function main() {
     }
 
     const locals = collectLocalBindings(ast);
+    if (!isStage2) {
+      locals.add('board');
+      locals.add('H');
+      locals.add('params');
+    } else {
+      locals.add('containerId');
+      locals.add('spec');
+    }
 
     walk.ancestor(ast, {
       Identifier(node, _state, ancestors) {
@@ -111,7 +136,7 @@ function main() {
         if (parent.type === 'LabeledStatement' && parent.label === node) return;
 
         if (locals.has(name)) return;
-        if (!ALLOWED_GLOBALS.has(name)) {
+        if (!allowedGlobals.has(name)) {
           push('forbidden-global', `identifier '${name}' is not on the allow-list`);
         }
       },

@@ -109,6 +109,29 @@ def test_normalize_jsx_code_unwraps_full_function():
     assert 'board.create("point", [0, 0]);' in normalized
 
 
+def test_normalize_jsx_code_unwraps_render_visualization_wrapper():
+    wrapped = """
+    function renderVisualization(containerId, spec) {
+        var board = JXG.JSXGraph.initBoard(containerId, { axis: true });
+        return { board: board, spec: spec };
+    }
+    """
+    normalized = normalize_jsx_code(wrapped)
+    assert "function renderVisualization" not in normalized
+    assert 'JXG.JSXGraph.initBoard(containerId, { axis: true });' in normalized
+
+
+def test_normalize_jsx_code_can_preserve_render_visualization_wrapper_for_stage2_validation():
+    wrapped = """
+    function renderVisualization(containerId, spec) {
+        var board = JXG.JSXGraph.initBoard(containerId, { axis: true });
+        return { board: board, spec: spec };
+    }
+    """
+    normalized = normalize_jsx_code(wrapped, preserve_render_wrapper=True)
+    assert normalized.strip().startswith("function renderVisualization")
+
+
 @pytest.mark.asyncio
 async def test_validator_accepts_full_function_wrapper():
     wrapped = """
@@ -119,3 +142,31 @@ async def test_validator_accepts_full_function_wrapper():
     """
     report = await validate_jsx_code(wrapped)
     assert report.ok
+
+
+@pytest.mark.asyncio
+async def test_validator_accepts_render_visualization_wrapper():
+        wrapped = """
+        function renderVisualization(containerId, spec) {
+            var board = JXG.JSXGraph.initBoard(containerId, {
+                boundingbox: [-5, 5, 5, -5],
+                axis: true,
+                showNavigation: false,
+                showCopyright: false,
+            });
+            return { board: board, spec: spec };
+        }
+        """
+        report = await validate_jsx_code(wrapped)
+        assert report.ok
+
+
+@pytest.mark.asyncio
+async def test_validator_rejects_legacy_board_global_inside_render_visualization_contract():
+    wrapped = """
+    function renderVisualization(containerId, spec) {
+        return board;
+    }
+    """
+    with pytest.raises(VizValidationError):
+        await validate_jsx_code(wrapped)

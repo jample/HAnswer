@@ -28,7 +28,9 @@ from app.services.llm_client import FakeTransport, GeminiClient, LLMError
 
 def test_registry_has_core_prompts():
     names = PromptRegistry.names()
-    assert {"dialog", "parser", "solver", "vizplanner", "vizitem", "vizcoder"}.issubset(set(names))
+    assert {
+        "dialog", "parser", "solver", "vizplanner", "vizitem", "vizcoder", "vizspec", "jsxgraph_codegen"
+    }.issubset(set(names))
 
 
 @pytest.mark.parametrize("name", ["dialog", "parser", "solver", "vizcoder", "vizitem"])
@@ -72,7 +74,7 @@ SAMPLE_KWARGS: dict[str, dict] = {
     "solver": {
         "parsed_question": {
             "subject": "math",
-            "grade_band": "high",
+            "grade_band": "junior",
             "stem_text": "已知 a=3, b=4, 求斜边长。",
             "givens": [{"symbol": "a", "value": "3"}, {"symbol": "b", "value": "4"}],
             "unknowns": ["c"],
@@ -83,7 +85,7 @@ SAMPLE_KWARGS: dict[str, dict] = {
         "existing_kps": [],
     },
     "vizcoder": {
-        "parsed_question": {"stem_text": "直角三角形斜边长。"},
+        "parsed_question": {"subject": "math", "grade_band": "junior", "stem_text": "直角三角形斜边长。"},
         "answer_package": {
             "question_understanding": {"restated_goal": "求 c"},
             "solution_steps": [],
@@ -92,6 +94,8 @@ SAMPLE_KWARGS: dict[str, dict] = {
     },
     "vizplanner": {
         "parsed_question": {
+            "subject": "math",
+            "grade_band": "junior",
             "question_text": "已知二次函数图像与 x 轴交点, 求最值。",
             "given": ["顶点在第一象限", "与 x 轴交于 A,B"],
             "find": ["最小值"],
@@ -124,6 +128,8 @@ SAMPLE_KWARGS: dict[str, dict] = {
     },
     "vizitem": {
         "parsed_question": {
+            "subject": "math",
+            "grade_band": "junior",
             "question_text": "已知二次函数图像与 x 轴交点, 求最值。",
             "given": ["顶点在第一象限", "与 x 轴交于 A,B"],
             "find": ["最小值"],
@@ -164,11 +170,11 @@ SAMPLE_KWARGS: dict[str, dict] = {
         },
         "storyboard": {
             "theme_cn": "从图像关系到最值结论",
-            "selection_rationale_cn": "选择三个关键跳跃",
+            "selection_rationale_cn": "选择两个关键跳跃",
             "symbol_map": [{"symbol": "A", "meaning_cn": "交点 A"}],
             "shared_params": [{"name": "t", "label_cn": "参数 t", "kind": "slider", "default": 0, "min": -2, "max": 2, "step": 0.1}],
             "coverage_summary": [{"item_id": "viz-1", "summary_cn": "画出交点", "anchor_refs": [{"kind": "question_given", "ref": "given:0"}]}],
-            "sequence": ["viz-1", "viz-2", "viz-3"],
+            "sequence": ["viz-1", "viz-2"],
             "items": [
                 {
                     "id": "viz-1",
@@ -202,22 +208,6 @@ SAMPLE_KWARGS: dict[str, dict] = {
                     "caption_outline_cn": "对应极值比较。",
                     "geo_target_cn": "显示顶点",
                 },
-                {
-                    "id": "viz-3",
-                    "title_cn": "结论回扣",
-                    "anchor_refs": [{"kind": "final_answer", "ref": "final_answer"}],
-                    "difficulty_reason_cn": "学生只记答案。",
-                    "student_confusion_risk": "medium",
-                    "conceptual_jump_cn": "从观察到结论",
-                    "why_visualization_needed_cn": "帮助回扣结论",
-                    "learning_goal_cn": "理解最终结论",
-                    "engine": "geogebra",
-                    "shared_symbols": ["A"],
-                    "shared_params": ["t"],
-                    "depends_on": ["viz-2"],
-                    "caption_outline_cn": "对应最终答案。",
-                    "geo_target_cn": "标出证据",
-                },
             ],
         },
         "storyboard_item": {
@@ -237,6 +227,107 @@ SAMPLE_KWARGS: dict[str, dict] = {
             "geo_target_cn": "显示抛物线和 x 轴交点"
         },
         "previous_items": [],
+    },
+    "vizspec": {
+        "original_problem": {
+            "subject": "math",
+            "grade_band": "junior",
+            "question_text": "点 P 到圆的距离如何理解？",
+            "diagram_description": "圆心 O，半径 r，点 P 在圆外移动。",
+        },
+        "answer_package": {
+            "question_understanding": {
+                "restated_question": "理解点到圆的距离",
+                "givens": ["圆心 O", "半径 r"],
+                "unknowns": ["距离定义"],
+                "implicit_conditions": [],
+            },
+            "key_points_of_question": ["边界与区域的区分"],
+            "solution_steps": [
+                {
+                    "step_index": 1,
+                    "statement": "先明确圆指的是边界还是区域。",
+                    "rationale": "避免距离定义歧义。",
+                    "formula": "",
+                    "why_this_step": "只有先澄清定义，后续图示才不会误导。",
+                    "viz_ref": "viz_1",
+                }
+            ],
+            "key_points_of_answer": ["距离默认是到边界的最短距离"],
+            "method_pattern": {
+                "pattern_id_suggested": "p-circle-distance",
+                "name_cn": "定义澄清 + 图示法",
+                "when_to_use": "对象定义容易混淆时",
+                "general_procedure": ["先澄清定义", "再用图形表达最短距离"],
+                "pitfalls": ["把圆误认为填充区域"],
+            },
+            "similar_questions": [
+                {"statement": "s1", "answer_outline": "a1"},
+                {"statement": "s2", "answer_outline": "a2"},
+                {"statement": "s3", "answer_outline": "a3"},
+            ],
+            "knowledge_points": [{"node_ref": "kp:circle", "weight": 1.0}],
+            "self_check": ["是否区分边界与区域"],
+        },
+        "teaching_preference": "Focus on conceptual clarity. Avoid decorative animation.",
+    },
+    "jsxgraph_codegen": {
+        "spec": {
+            "id": "viz_1",
+            "title": "Point to circle boundary distance",
+            "priority": 1,
+            "recommended": True,
+            "visualization_type": "locus_trace",
+            "pedagogical_purpose": "Clarify distance to the circle boundary",
+            "mathematical_claim_being_shown": "Distance is measured to the circle boundary",
+            "math_definition": {
+                "objects": [
+                    {"name": "O", "type": "point", "definition": "Center", "role": "reference", "must_exist_before_animation": True},
+                    {"name": "c", "type": "circle_boundary", "definition": "Boundary", "role": "distance target", "must_exist_before_animation": True},
+                ]
+            },
+            "visual_design": {
+                "coordinate_system": {
+                    "needed": True,
+                    "type": "cartesian_2d",
+                    "suggested_viewport": {"xmin": -5, "xmax": 5, "ymin": -5, "ymax": 5},
+                    "reason": "Show the circle and moving point clearly",
+                },
+                "visible_objects": ["O", "c"],
+                "highlighted_objects": ["c"],
+                "optional_hidden_helper_objects": [],
+                "labels_to_show": ["O"],
+                "measurements_to_show": ["d(P,c)"],
+                "region_or_trace_display": {
+                    "needed": True,
+                    "type": "trace",
+                    "description": "Show a trace of the moving point",
+                },
+            },
+            "interaction_and_animation": {
+                "has_animation": True,
+                "animation_driver": "slider",
+                "animation_description": "Move point P using a slider",
+                "animation_duration_ms": 2500,
+                "parameters": [{"name": "t", "type": "number", "range": {"min": -4, "max": 4, "step": 0.5}, "default_value": 0, "meaning": "point position"}],
+                "user_interactions": [{"interaction_type": "move_slider", "target": "t", "purpose": "Explore distance change"}],
+                "animation_sequence": ["Create boundary", "Move point", "Update distance segment"],
+                "stopping_condition_or_final_state": "Slider at either endpoint",
+            },
+            "expected_result": {
+                "final_visual_outcome": "Circle boundary with measured shortest segment",
+                "mathematical_conclusion_visible_to_student": "Distance goes to the boundary",
+                "common_misinterpretations_to_avoid": ["Do not fill the disk"],
+            },
+            "implementation_guidance": {
+                "preferred_rendering_strategy": "Use a slider and dynamic segment",
+                "simplifications_allowed": ["Use one guide line"],
+                "things_that_must_not_be_omitted": ["Boundary visibility"],
+                "things_that_must_not_be_invented": ["Filled disk"],
+                "fallback_if_animation_is_too_complex": "Use three static point positions",
+            },
+            "ambiguities": [],
+        },
     },
 }
 
@@ -301,10 +392,17 @@ def test_diff_preview_shows_changes():
     assert "-" in diff and "+" in diff
 
 
+def test_solver_prompt_includes_curriculum_boundary_for_junior_students():
+    t = PromptRegistry.get("solver")
+    preview = t.preview(**SAMPLE_KWARGS["solver"])
+    assert "Teaching audience: Junior High School students" in preview
+    assert "Do not use Senior High School methods" in preview
+
+
 def test_vizcoder_prompt_uses_geogebra_by_default():
     t = PromptRegistry.get("vizcoder")
     preview = t.preview(**SAMPLE_KWARGS["vizcoder"])
-    assert '当前服务端配置的默认引擎, 优先使用。' in preview
+    assert "this is the current server-side default and should be preferred" in preview
     assert 'engine="geogebra"' in preview
 
 
@@ -317,24 +415,136 @@ def test_vizcoder_prompt_switches_with_config(monkeypatch):
     finally:
         monkeypatch.setattr(settings.viz, "default_engine", old)
     assert 'engine="jsxgraph"' in preview
-    assert '当前默认引擎: JSXGraph。优先输出 engine="jsxgraph"' in preview
+    assert 'engine="jsxgraph" — this is the current server-side default and should be preferred.' in preview
 
 
 def test_vizplanner_prompt_prefers_bottlenecks_over_fixed_steps():
     t = PromptRegistry.get("vizplanner")
     preview = t.preview(**SAMPLE_KWARGS["vizplanner"])
-    assert "先识别学生最可能卡住的 conceptual bottlenecks" in preview
-    assert "不要机械地按 step 1/2/3/4 平铺" in preview
-    assert "不输出 ggb_commands / jsx_code" in preview
-    assert "不输出任何 GeoGebra 命令或 JSXGraph 代码" in preview
+    assert "identify the conceptual bottlenecks where students are most likely to get stuck" in preview
+    assert "Do not mechanically flatten the answer into step 1 / 2 / 3 / 4" in preview
+    assert "If grade_band is junior, do not use Senior High School knowledge" in preview
+    assert "Do not output ggb_commands or jsx_code" in preview
+    assert "Do not output any GeoGebra commands or JSXGraph code" in preview
+    assert "Each symbol_map entry must declare exactly one atomic symbol" in preview
+    assert "do not combine symbols into one entry such as `P, Q`" in preview
 
 
 def test_vizitem_prompt_locks_to_single_storyboard_item():
     t = PromptRegistry.get("vizitem")
     preview = t.preview(**SAMPLE_KWARGS["vizitem"])
-    assert "只输出一个 Visualization JSON 对象" in preview
-    assert "`id` 必须与 storyboard_item.id 完全一致" in preview
-    assert '当前这一项默认应输出 engine="geogebra"' in preview
+    assert "Output exactly one Visualization JSON object" in preview
+    assert "`id` must match storyboard_item.id exactly" in preview
+    assert "the figure and explanations must stay within Junior High School knowledge" in preview
+    assert 'This item should default to engine="geogebra"' in preview
+    assert "The overall rendering preference is GeoGebra-first." in preview
+
+
+def test_vizspec_prompt_bans_code_and_targets_schema_bundle():
+    t = PromptRegistry.get("vizspec")
+    preview = t.preview(**SAMPLE_KWARGS["vizspec"])
+    assert "Do NOT output JSXGraph code" in preview
+    assert "Do NOT output JavaScript code" in preview
+    assert "If the source is for junior students" in preview
+    assert "Teaching audience: Junior High School students" in preview
+    assert "Generate the JSON specification only" in preview
+
+    # Auto-derived schema contract block must appear with section header,
+    # all literal-bearing fields, all numeric bounds, and all cross-field rules.
+    assert "## Schema contract (auto-derived from Pydantic" in preview
+    assert "All values listed below are exact tokens" in preview
+    # Sample of literal fields covering EACH Literal alias defined in
+    # app.schemas.visualization_spec — proves the auto-derivation reaches
+    # them all, not just the 6 that used to be hand-listed.
+    assert "teaching_value`: high | medium" in preview
+    assert "visualization_type`: static_diagram | construction_steps" in preview
+    assert "math_definition.objects.type`: point | line | segment" in preview
+    assert "math_definition.relations.relation_type`: distance | intersection" in preview
+    assert "visual_design.coordinate_system.type`: cartesian_2d | geometry_plane" in preview
+    assert "region_or_trace_display.type`: none | trace | shaded_region" in preview
+    assert "animation_driver`: none | slider | moving_point" in preview
+    assert "parameters.type`: number | angle | integer_step | boolean" in preview
+    assert "user_interactions.interaction_type`: drag | play_pause" in preview
+    assert "ambiguities.impact`: low | medium | high" in preview
+    assert "renderability_assessment.overall_readiness`: ready | mostly_ready | needs_revision" in preview
+    assert "if parameters.type is 'number', 'angle', or 'integer_step' then range MUST be provided" in preview
+    # Numeric bounds (not just enums) are also injected.
+    assert "renderability_assessment.clarity_score` (integer): >= 0, <= 100" in preview
+    assert "visualizations` (array): min length 3, max length 3" in preview
+    # All four cross-field validator rule groups appear.
+    assert "Cross-field rules" in preview
+    assert "if has_animation=true then animation_driver must NOT be 'none'" in preview
+    assert "suggested_viewport requires xmin < xmax" in preview
+    assert "unless every visualization is needs_revision" in preview
+    assert "if visualization_type='region_shading'" in preview
+    assert "visualization_type selection guide" in preview
+    assert "priority and recommendation calibration" in preview
+    assert "renderability_assessment calibration" in preview
+    assert "For numeric parameters, use `range.min`, `range.max`, and `range.step` directly." in preview
+
+
+def test_vizspec_prompt_covers_every_literal_token_from_schema():
+    """Drift guard: every Literal value in visualization_spec.py must
+    appear in the rendered vizspec system prompt at least once."""
+    from typing import Literal as _Literal
+    from typing import get_args as _get_args
+    from typing import get_origin as _get_origin
+
+    from app.schemas import visualization_spec as vs_mod
+
+    t = PromptRegistry.get("vizspec")
+    preview = t.preview(**SAMPLE_KWARGS["vizspec"])
+    for attr_name in dir(vs_mod):
+        attr = getattr(vs_mod, attr_name)
+        if _get_origin(attr) is _Literal:
+            for token in _get_args(attr):
+                assert (
+                    str(token) in preview
+                ), f"vizspec prompt missing literal token {attr_name}={token!r}"
+
+
+def test_vizcoder_prompt_includes_junior_high_school_boundary():
+    t = PromptRegistry.get("vizcoder")
+    preview = t.preview(**SAMPLE_KWARGS["vizcoder"])
+    assert "学段约束 (重要)" in preview
+    assert "只使用初中阶段的知识" in preview
+
+
+def test_jsxgraph_codegen_prompt_requires_code_only_function_contract():
+    t = PromptRegistry.get("jsxgraph_codegen")
+    preview = t.preview(**SAMPLE_KWARGS["jsxgraph_codegen"])
+    assert "Output JavaScript code only" in preview
+    assert "function renderVisualization(containerId, spec)" in preview
+    assert "raw JavaScript only" in preview
+    # Sandbox hard-constraint section must spell out the validator's
+    # allow-list and forbid-list so the LLM stops emitting Date.now()
+    # / new XMLHttpRequest / computed ['constructor'] patterns.
+    assert "Sandbox Hard Constraints" in preview
+    assert "ALLOWED globals" in preview
+    assert "FORBIDDEN globals" in preview
+    assert "Date" in preview and "performance" in preview
+    assert "XMLHttpRequest" in preview and "WebSocket" in preview
+    assert "setTimeout(\"string\", ms)" in preview
+    assert '"constructor"' in preview
+    assert "requestAnimationFrame" in preview
+    assert "H helper reference" in preview
+    assert "H.anim.loop" in preview
+    assert "Critical spec fields to read first" in preview
+    assert "Parameter reading pattern" in preview
+    assert "Do NOT call JXG.JSXGraph.freeBoard(containerId)" in preview
+    assert "Do NOT wrap the entire function body in a catch that suppresses failures" in preview
+    assert "Never return an inert fallback" in preview
+    assert "Success Contract" in preview
+    assert "{ board, update, destroy }" in preview
+
+
+@pytest.mark.parametrize("name", ["vizcoder", "vizplanner", "vizitem", "vizspec", "jsxgraph_codegen"])
+def test_visualization_prompts_include_fewshot_examples(name: str):
+    prompt = PromptRegistry.get(name)
+    messages = prompt.fewshot_examples(**SAMPLE_KWARGS.get(name, {}))
+    assert len(messages) >= 2
+    assert messages[0]["role"] == "user"
+    assert messages[1]["role"] == "assistant"
 
 
 # ---- GeminiClient round-trip via FakeTransport -----------------------
@@ -391,6 +601,22 @@ def test_call_structured_happy_path_streaming():
     assert transport.calls[0]["stream"] is True
 
 
+def test_call_text_happy_path():
+    transport = FakeTransport(text_by_model={"gemini-2.0-flash": "function renderVisualization(containerId, spec) {}"})
+    client = GeminiClient(transport)
+    prompt = PromptRegistry.get("jsxgraph_codegen")
+    result = asyncio.run(
+        client.call_text(
+            template=prompt,
+            model="gemini-2.0-flash",
+            template_kwargs=SAMPLE_KWARGS["jsxgraph_codegen"],
+        )
+    )
+    assert result.startswith("function renderVisualization")
+    assert len(transport.calls) == 1
+    assert transport.calls[0]["text"] is True
+
+
 class _RepairTransport(FakeTransport):
     """First call returns bad JSON, second returns valid."""
 
@@ -414,6 +640,7 @@ def test_call_structured_repair_loop_recovers():
             model="gemini-2.0-flash",
             model_cls=ParsedQuestion,
             template_kwargs={"raw_ocr": "q"},
+            min_repair_attempts=1,
         )
     )
     assert isinstance(result, ParsedQuestion)

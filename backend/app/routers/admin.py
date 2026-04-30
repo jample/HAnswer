@@ -41,6 +41,19 @@ async def read_config() -> dict:
     `backend/config.toml` and restart `uvicorn` (documented in README).
     """
     return {
+        "openai": {
+            "api_key_masked": _mask(settings.openai.api_key),
+            "api_key_configured": bool(settings.openai.api_key),
+            "base_url_configured": bool(settings.openai.base_url),
+            "base_url": settings.openai.base_url,
+            "model_default": settings.openai.model_default,
+            "model_parser": settings.openai.model_parser,
+            "model_solver": settings.openai.model_solver,
+            "model_vizcoder": settings.openai.model_vizcoder,
+            "model_chat": settings.openai.model_chat,
+            "model_embed": settings.openai.model_embed,
+            "embed_dim": settings.openai.embed_dim,
+        },
         "gemini": {
             "api_key_masked": _mask(settings.gemini.api_key),
             "api_key_configured": bool(settings.gemini.api_key),
@@ -49,6 +62,14 @@ async def read_config() -> dict:
             "model_vizcoder": settings.gemini.model_vizcoder,
             "model_embed": settings.gemini.model_embed,
             "embed_dim": settings.gemini.embed_dim,
+        },
+        "embedding": {
+            "provider": settings.embedding.provider,
+            "api_key_masked": _mask(settings.embedding.api_key),
+            "api_key_configured": bool(settings.embedding.api_key),
+            "endpoint_configured": bool(settings.embedding.endpoint),
+            "model": settings.embedding.model,
+            "dimensions": settings.embedding.dimensions,
         },
         "postgres": {
             # Strip the password component from the DSN if present.
@@ -61,13 +82,23 @@ async def read_config() -> dict:
             "auto_bootstrap": settings.milvus.auto_bootstrap,
             "recreate_dense_on_dim_mismatch": settings.milvus.recreate_dense_on_dim_mismatch,
             "auto_reindex_on_bootstrap_change": settings.milvus.auto_reindex_on_bootstrap_change,
+            "flush_on_write": settings.milvus.flush_on_write,
         },
         "retrieval": {
             **settings.retrieval.model_dump(),
             "active_dense_dim": settings.retrieval_dense_dim,
         },
         "viz": settings.viz.model_dump(),
-        "llm": settings.llm.model_dump(),
+        "llm": {
+            **settings.llm.model_dump(),
+            "active_provider_label": settings.active_llm_provider_label,
+            "active_models": {
+                "parser": settings.llm_model("parser"),
+                "solver": settings.llm_model("solver"),
+                "vizcoder": settings.llm_model("vizcoder"),
+                "dialog": settings.llm_model("dialog"),
+            },
+        },
         "dialog": settings.dialog.model_dump(),
         "server": {
             "host": settings.server.host,

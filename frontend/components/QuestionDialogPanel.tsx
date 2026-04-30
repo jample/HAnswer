@@ -77,12 +77,16 @@ export default function QuestionDialogPanel({
   questionId,
   solutionId,
   canOpen,
+  llmBusy,
+  onLlmBusyChange,
   collapsed,
   onToggleCollapse,
 }: {
   questionId: string;
   solutionId: string | null;
   canOpen: boolean;
+  llmBusy: boolean;
+  onLlmBusyChange: (busy: boolean) => void;
   collapsed: boolean;
   onToggleCollapse: () => void;
 }) {
@@ -98,12 +102,22 @@ export default function QuestionDialogPanel({
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  useEffect(() => {
+    onLlmBusyChange(sending);
+    return () => onLlmBusyChange(false);
+  }, [onLlmBusyChange, sending]);
+
   const anchoredSessions = useMemo(
     () => sessions.filter((session) => (
       session.question_id === questionId && session.solution_id === solutionId
     )),
     [questionId, sessions, solutionId],
   );
+  const anchoredSessionIdsKey = useMemo(
+    () => anchoredSessions.map((session) => session.id).join('|'),
+    [anchoredSessions],
+  );
+  const detailSessionId = detail?.session.id ?? null;
 
   useEffect(() => {
     autoCreatedRef.current = null;
@@ -146,7 +160,7 @@ export default function QuestionDialogPanel({
   }
 
   async function createSession() {
-    if (!solutionId) return;
+    if (!solutionId || llmBusy) return;
     setError(null);
     try {
       const res = await fetch(apiUrl('/api/dialog/sessions'), {
@@ -168,7 +182,7 @@ export default function QuestionDialogPanel({
   }
 
   async function sendMessage() {
-    if (!selectedId || !draft.trim() || sending) return;
+    if (!selectedId || !draft.trim() || sending || llmBusy) return;
     setSending(true);
     setError(null);
     try {
@@ -203,7 +217,7 @@ export default function QuestionDialogPanel({
   }, [anchorKey, canOpen]);
 
   useEffect(() => {
-    if (!canOpen || loadingSessions) return;
+    if (!canOpen || loadingSessions || llmBusy) return;
 
     if (anchoredSessions.length === 0) {
       if (autoCreatedRef.current !== anchorKey) {
@@ -215,12 +229,12 @@ export default function QuestionDialogPanel({
 
     const next = anchoredSessions.find((session) => session.id === selectedId) ?? anchoredSessions[0];
     if (!next) return;
-    if (detail?.session.id === next.id) {
+    if (detailSessionId === next.id) {
       if (selectedId !== next.id) setSelectedId(next.id);
       return;
     }
     loadSession(next.id).catch(() => {});
-  }, [anchorKey, anchoredSessions, canOpen, detail?.session.id, loadingSessions, selectedId]);
+  }, [anchorKey, anchoredSessionIdsKey, canOpen, detailSessionId, llmBusy, loadingSessions, selectedId]);
 
   const lastAssistant = [...(detail?.messages || [])]
     .reverse()
@@ -266,7 +280,7 @@ export default function QuestionDialogPanel({
           </p>
         </div>
         <div className="question-dialog-actions">
-          <button className="btn btn-secondary" onClick={() => createSession()} disabled={!solutionId}>
+          <button className="btn btn-secondary" onClick={() => createSession()} disabled={!solutionId || llmBusy}>
             新会话
           </button>
           <button className="btn btn-secondary question-dialog-collapse-btn" onClick={onToggleCollapse}>
@@ -373,12 +387,15 @@ export default function QuestionDialogPanel({
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             placeholder="继续追问：为什么这一步成立？还能换一种方法吗？这类题怎么识别？"
+            disabled={llmBusy}
           />
           <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center' }}>
             <div className="dialog-inline-hint" style={{ margin: 0 }}>
-              这里的上下文始终绑定当前解法，不会脱离右侧答案和可视化。
+              {llmBusy
+                ? '当前已有 LLM 调用在执行，新的追问会在该调用结束前被锁定。'
+                : '这里的上下文始终绑定当前解法，不会脱离右侧答案和可视化。'}
             </div>
-            <button className="btn btn-primary" onClick={sendMessage} disabled={!draft.trim() || sending || !detail}>
+            <button className="btn btn-primary" onClick={sendMessage} disabled={!draft.trim() || sending || !detail || llmBusy}>
               {sending ? '发送中…' : '发送'}
             </button>
           </div>

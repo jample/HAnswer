@@ -1,16 +1,10 @@
 """Visualization generation service (M4, §7.2.3 + §3.3).
 
-After the Solver finishes, this service now follows a planner-first flow:
-  1. Loads the stored AnswerPackage + ParsedQuestion.
-  2. Calls VizPlannerPrompt → `VisualizationStoryboard`.
-  3. Walks `storyboard.sequence` and calls VizItemPrompt once per item.
-  4. Validates each generated visualization.
-  5. Persists passing viz to `visualizations` and emits SSE
-      `visualization` events; failures emit an `error` event but do not
-      abort later storyboard items (§3.3.3 fallback UI).
-
-The older batch-style VizCoderPrompt remains in the codebase, but it is no
-longer the active backend orchestration path.
+Primary path: a batch VizCoder call returns the two candidate visuals.
+Each candidate is then sanitized locally, validated against the strict
+schema, and executed in a local GeoGebra runtime validator before
+persistence. If the batch path yields no usable results, the service
+falls back to planner + per-item generation.
 """
 
 from __future__ import annotations
@@ -20,14 +14,25 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.db import repo
 from app.db.models import VisualizationRow
 from app.prompts import PromptRegistry
-from app.schemas import Visualization, VisualizationStoryboard, VisualizationStoryboardItem
+from app.schemas import (
+    Visualization,
+    VisualizationDraft,
+    VisualizationListDraft,
+    VisualizationStoryboard,
+    VisualizationStoryboardItem,
+)
+from app.services.geogebra_validator import (
+    GeoGebraValidationError,
+    sanitize_geogebra_visualization,
+    validate_geogebra_visualization,
+)
 from app.services.llm_client import GeminiClient, LLMError, PromptLogContext
 from app.services.solver_service import SSEEvent
 from app.services.viz_validator import VizValidationError, normalize_jsx_code, validate_jsx_code
@@ -36,7 +41,11 @@ log = logging.getLogger(__name__)
 
 
 async def _persist_viz(
-    session: AsyncSession, question_id: uuid.UUID, viz: Visualization,
+    session: AsyncSession,
+    question_id: uuid.UUID,
+    viz: Visualization,
+    *,
+    spec_json: dict[str, Any] | None = None,
 ) -> None:
     session.add(VisualizationRow(
         question_id=question_id,
@@ -44,9 +53,11 @@ async def _persist_viz(
         title=viz.title_cn,
         caption=viz.caption_cn,
         learning_goal=viz.learning_goal,
+        interactive_hints_json=list(viz.interactive_hints),
         helpers_used_json=list(viz.helpers_used),
         engine=viz.engine,
         jsx_code=viz.jsx_code,
+        spec_json=dict(spec_json) if spec_json is not None else None,
         ggb_commands_json=list(viz.ggb_commands),
         ggb_settings_json=(
             viz.ggb_settings.model_dump(mode="json") if viz.ggb_settings else None
@@ -66,12 +77,34 @@ async def generate_visualizations(
     user_guidance: str | None = None,
     fallback_storyboard: VisualizationStoryboard | dict[str, Any] | None = None,
 ) -> AsyncIterator[SSEEvent]:
-    """Generate + validate + persist storyboard-driven visualizations.
+    """Generate + validate + persist visualizations.
 
-    The active path is now `plan first, then per-viz codegen`. Planning is
-    done once, then each storyboard item is generated independently so a
-    single failing item does not abort the whole visualization stage.
+    Primary path: single-call batch (VizCoderPrompt → VisualizationList).
+    Fallback: if batch produces zero results, attempt the planner+per-item
+    path (uses `fallback_storyboard` when provided and planner LLM fails).
     """
+    async for ev in generate_visualizations_batch(
+        session,
+        question_id=question_id,
+        llm=llm,
+        solution_id=solution_id,
+        user_guidance=user_guidance,
+    ):
+        yield ev
+
+    rows = list((await session.execute(
+        select(VisualizationRow.id)
+        .where(VisualizationRow.question_id == question_id)
+        .limit(1)
+    )).scalars().all())
+    if rows:
+        return
+
+    log.warning("batch vizcoder produced no usable visuals for %s; trying planner+item fallback", question_id)
+    yield SSEEvent("error", {
+        "stage": "visualizing",
+        "message": "批量生成未产出可用结果，尝试 planner+逐图回退路径。",
+    })
     try:
         storyboard = await plan_visualization_storyboard(
             session,
@@ -83,13 +116,12 @@ async def generate_visualizations(
     except LLMError as e:
         storyboard = _coerce_storyboard(fallback_storyboard)
         if storyboard is None:
-            log.exception("viz planner LLM failed")
+            log.warning("planner+item fallback also failed for %s: %s", question_id, e)
             yield SSEEvent("error", {"stage": "vizplanner", "message": str(e)})
             return
         log.warning(
-            "viz planner unavailable for question %s; reusing existing storyboard: %s",
-            question_id,
-            e,
+            "viz planner unavailable for %s; reusing existing storyboard: %s",
+            question_id, e,
         )
 
     async for ev in generate_visualizations_from_storyboard(
@@ -141,11 +173,11 @@ def _ordered_storyboard_items(
 
 
 def _merge_storyboard_item_defaults(
-    viz: Visualization,
+    viz: VisualizationDraft,
     *,
     storyboard: VisualizationStoryboard,
     item: VisualizationStoryboardItem,
-) -> Visualization:
+) -> VisualizationDraft:
     params_by_name = {param.name: param for param in viz.params}
     merged_params = list(viz.params)
     for shared_param in storyboard.shared_params:
@@ -167,7 +199,7 @@ async def _generate_visualization_for_storyboard_item(
     item: VisualizationStoryboardItem,
     previous_items: list[VisualizationStoryboardItem],
     user_guidance: str | None = None,
-) -> Visualization:
+) -> VisualizationDraft:
     q = await repo.get_question(session, question_id)
     if q is None or q.answer_package_json is None:
         raise KeyError(f"question {question_id} missing AnswerPackage")
@@ -183,8 +215,8 @@ async def _generate_visualization_for_storyboard_item(
     }
     viz = await llm.call_structured(
         template=template,
-        model=settings.gemini.model_vizcoder,
-        model_cls=Visualization,
+        model=settings.llm_model("vizcoder"),
+        model_cls=VisualizationDraft,
         template_kwargs=kwargs,
         messages_override=_with_user_guidance(
             template,
@@ -203,8 +235,144 @@ async def _generate_visualization_for_storyboard_item(
         ),
         timeout_s=settings.llm.vizcoder_timeout_s,
         stream=settings.llm.stream_vizcoder_json,
+        disable_repair=True,
     )
     return _merge_storyboard_item_defaults(viz, storyboard=storyboard, item=item)
+
+
+async def _generate_visualization_batch_payload(
+    session: AsyncSession,
+    *,
+    question_id: uuid.UUID,
+    llm: GeminiClient,
+    solution_id: uuid.UUID | None = None,
+    user_guidance: str | None = None,
+) -> VisualizationListDraft:
+    q = await repo.get_question(session, question_id)
+    if q is None or q.answer_package_json is None:
+        raise KeyError(f"question {question_id} missing AnswerPackage")
+
+    template = PromptRegistry.get("vizcoder")
+    kwargs: dict = {
+        "parsed_question": q.parsed_json,
+        "answer_package": q.answer_package_json,
+        "preferred_engine": settings.viz.default_engine,
+    }
+    return await llm.call_structured(
+        template=template,
+        model=settings.llm_model("vizcoder"),
+        model_cls=VisualizationListDraft,
+        template_kwargs=kwargs,
+        messages_override=_with_user_guidance(
+            template,
+            kwargs=kwargs,
+            user_guidance=user_guidance,
+        ),
+        prompt_context=PromptLogContext(
+            phase_description="生成整组可视化（批量回退）",
+            question_id=str(question_id),
+            solution_id=str(solution_id) if solution_id else None,
+            related={"user_guidance": user_guidance or "", "mode": "batch_fallback"},
+        ),
+        timeout_s=settings.llm.vizcoder_timeout_s,
+        stream=settings.llm.stream_vizcoder_json,
+        disable_repair=True,
+    )
+
+
+def _strict_visualization(viz: VisualizationDraft | Visualization) -> Visualization:
+    if isinstance(viz, Visualization):
+        payload = viz.model_dump(mode="json")
+    else:
+        payload = viz.model_dump(mode="json")
+
+    if str(payload.get("engine") or "jsxgraph") == "geogebra":
+        return sanitize_geogebra_visualization(payload)
+    try:
+        return Visualization.model_validate(payload)
+    except Exception as err:
+        violations = [{"kind": "schema", "message": str(err)}]
+        raise GeoGebraValidationError(violations) from err
+
+
+async def _prepare_visualization_for_persist(
+    viz: VisualizationDraft | Visualization,
+) -> tuple[Visualization, int]:
+    viz = _strict_visualization(viz)
+    ast_node_count = 0
+    if viz.engine == "jsxgraph":
+        normalized_code = normalize_jsx_code(viz.jsx_code)
+        if normalized_code != viz.jsx_code:
+            viz = viz.model_copy(update={"jsx_code": normalized_code})
+        report = await validate_jsx_code(viz.jsx_code)
+        ast_node_count = report.node_count
+    elif viz.engine == "geogebra":
+        await validate_geogebra_visualization(viz)
+    return viz, ast_node_count
+
+
+async def generate_visualizations_batch(
+    session: AsyncSession,
+    *,
+    question_id: uuid.UUID,
+    llm: GeminiClient,
+    solution_id: uuid.UUID | None = None,
+    user_guidance: str | None = None,
+) -> AsyncIterator[SSEEvent]:
+    await session.execute(
+        delete(VisualizationRow).where(VisualizationRow.question_id == question_id)
+    )
+
+    try:
+        payload = await _generate_visualization_batch_payload(
+            session,
+            question_id=question_id,
+            llm=llm,
+            solution_id=solution_id,
+            user_guidance=user_guidance,
+        )
+    except LLMError as e:
+        log.warning("batch vizcoder generation failed: %s", e)
+        yield SSEEvent("error", {
+            "stage": "vizcoder",
+            "message": str(e),
+        })
+        return
+
+    successful = 0
+    for viz in payload.visualizations:
+        try:
+            viz, ast_node_count = await _prepare_visualization_for_persist(viz)
+        except (GeoGebraValidationError, VizValidationError) as e:
+            log.warning("batch viz %s rejected: %s", viz.id, e.violations)
+            yield SSEEvent("error", {
+                "stage": "viz_validator",
+                "viz_id": viz.id,
+                "violations": e.violations,
+            })
+            continue
+        except RuntimeError as e:
+            log.error("viz validator unavailable: %s", e)
+            yield SSEEvent("error", {
+                "stage": "viz_validator",
+                "viz_id": viz.id,
+                "message": str(e),
+            })
+            continue
+
+        await _persist_viz(session, question_id, viz)
+        successful += 1
+        yield SSEEvent("visualization", {
+            **viz.model_dump(mode="json"),
+            "ast_node_count": ast_node_count,
+            "generation_mode": "batch_fallback",
+        })
+
+    if successful == 0:
+        yield SSEEvent("error", {
+            "stage": "visualizing",
+            "message": "旧版批量可视化生成同样没有产出可用结果。",
+        })
 
 
 async def generate_visualizations_from_storyboard(
@@ -257,32 +425,26 @@ async def generate_visualizations_from_storyboard(
             previous_items.append(item)
             continue
 
-        ast_node_count = 0
-        if viz.engine == "jsxgraph":
-            normalized_code = normalize_jsx_code(viz.jsx_code)
-            if normalized_code != viz.jsx_code:
-                viz = viz.model_copy(update={"jsx_code": normalized_code})
-            try:
-                report = await validate_jsx_code(viz.jsx_code)
-                ast_node_count = report.node_count
-            except VizValidationError as e:
-                log.warning("viz %s rejected: %s", viz.id, e.violations)
-                yield SSEEvent("error", {
-                    "stage": "viz_validator",
-                    "viz_id": viz.id,
-                    "violations": e.violations,
-                })
-                previous_items.append(item)
-                continue
-            except RuntimeError as e:
-                log.error("viz validator unavailable: %s", e)
-                yield SSEEvent("error", {
-                    "stage": "viz_validator",
-                    "viz_id": viz.id,
-                    "message": str(e),
-                })
-                previous_items.append(item)
-                continue
+        try:
+            viz, ast_node_count = await _prepare_visualization_for_persist(viz)
+        except (GeoGebraValidationError, VizValidationError) as e:
+            log.warning("viz %s rejected: %s", viz.id, e.violations)
+            yield SSEEvent("error", {
+                "stage": "viz_validator",
+                "viz_id": viz.id,
+                "violations": e.violations,
+            })
+            previous_items.append(item)
+            continue
+        except RuntimeError as e:
+            log.error("viz validator unavailable: %s", e)
+            yield SSEEvent("error", {
+                "stage": "viz_validator",
+                "viz_id": viz.id,
+                "message": str(e),
+            })
+            previous_items.append(item)
+            continue
 
         await _persist_viz(session, question_id, viz)
         successful += 1
@@ -323,7 +485,7 @@ async def plan_visualization_storyboard(
     }
     return await llm.call_structured(
         template=template,
-        model=settings.gemini.model_vizcoder,
+        model=settings.llm_model("vizcoder"),
         model_cls=VisualizationStoryboard,
         template_kwargs=kwargs,
         messages_override=_with_user_guidance(
@@ -339,4 +501,5 @@ async def plan_visualization_storyboard(
         ),
         timeout_s=settings.llm.vizcoder_timeout_s,
         stream=settings.llm.stream_vizcoder_json,
+        disable_repair=True,
     )

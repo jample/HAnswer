@@ -15,7 +15,6 @@ from app.db import models
 from app.db.session import session_scope
 from app.services.embedding import build_dense_embedder
 from app.services.llm_client import PromptLogContext
-from app.services.llm_deps import get_llm_client
 from app.services.retrieval_service import (
     SimilarQuery,
     similar_questions,
@@ -60,7 +59,6 @@ def _vs() -> VectorStore:
 async def similar(
     req: SimilarRequest,
     session: AsyncSession = Depends(_session),
-    llm=Depends(get_llm_client),
     vs: VectorStore = Depends(_vs),
 ) -> dict:
     q = SimilarQuery(
@@ -78,7 +76,6 @@ async def similar(
         k=req.k,
     )
     dense = build_dense_embedder(
-        llm,
         prompt_context=PromptLogContext(
             phase_description="相似题检索",
             question_id=str(req.question_id) if req.question_id else None,

@@ -2,7 +2,7 @@
   "name": "hanswer-viz-validator",
   "version": "0.1.0",
   "private": true,
-  "description": "AST validator for LLM-emitted JSXGraph code (HAnswerR.md §3.3.3).",
+  "description": "Local validators for LLM-emitted JSXGraph and GeoGebra visualizations.",
   "dependencies": {
     "acorn": "^8.11.3",
     "acorn-walk": "^8.3.2"

@@ -52,26 +52,29 @@ class _FakeMilvusClient:
 
 @pytest.mark.asyncio
 async def test_admin_config_exposes_active_dense_dim():
-    assert settings.retrieval_dense_dim in {settings.gemini.embed_dim, settings.retrieval.bge_m3_dense_dim}
+    assert settings.retrieval_dense_dim in {
+        settings.embedding.dimensions,
+        settings.retrieval.bge_m3_dense_dim,
+    }
 
 
 def test_milvus_setup_raises_on_dense_dim_mismatch(monkeypatch):
-    old_embedder = settings.retrieval.embedder
+    old_provider = settings.embedding.provider
     try:
-        settings.retrieval.embedder = "bge-m3"
+        settings.embedding.provider = "bge-m3"
         fake = _FakeMilvusClient(existing={name: 768 for name in milvus_setup.COLLECTIONS})
         fake.existing.update({name: 0 for name in milvus_setup.SPARSE_COLLECTIONS})
         monkeypatch.setattr(milvus_setup, "get_client", lambda: fake)
         with pytest.raises(RuntimeError, match="dense dim 768"):
             milvus_setup.ensure_collections(recreate_dense_on_dim_mismatch=False)
     finally:
-        settings.retrieval.embedder = old_embedder
+        settings.embedding.provider = old_provider
 
 
 def test_milvus_setup_recreates_dense_mismatch(monkeypatch):
-    old_embedder = settings.retrieval.embedder
+    old_provider = settings.embedding.provider
     try:
-        settings.retrieval.embedder = "bge-m3"
+        settings.embedding.provider = "bge-m3"
         fake = _FakeMilvusClient(existing={name: 768 for name in milvus_setup.COLLECTIONS})
         fake.existing.update({name: 0 for name in milvus_setup.SPARSE_COLLECTIONS})
         monkeypatch.setattr(milvus_setup, "get_client", lambda: fake)
@@ -80,7 +83,7 @@ def test_milvus_setup_recreates_dense_mismatch(monkeypatch):
         assert set(fake.created) == set(milvus_setup.COLLECTIONS)
         assert set(bootstrap.recreated_dense) == set(milvus_setup.COLLECTIONS)
     finally:
-        settings.retrieval.embedder = old_embedder
+        settings.embedding.provider = old_provider
 
 
 def test_milvus_setup_force_recreates_dense(monkeypatch):
@@ -93,9 +96,9 @@ def test_milvus_setup_force_recreates_dense(monkeypatch):
 
 
 def test_milvus_doctor_reports_dense_dim_mismatch(monkeypatch):
-    old_embedder = settings.retrieval.embedder
+    old_provider = settings.embedding.provider
     try:
-        settings.retrieval.embedder = "bge-m3"
+        settings.embedding.provider = "bge-m3"
         fake = _FakeMilvusClient(existing={name: 768 for name in milvus_setup.COLLECTIONS})
         fake.existing.update({name: 0 for name in milvus_setup.SPARSE_COLLECTIONS})
         monkeypatch.setattr(milvus_setup, "get_client", lambda: fake)
@@ -103,7 +106,7 @@ def test_milvus_doctor_reports_dense_dim_mismatch(monkeypatch):
         assert report["expected_dense_dim"] == settings.retrieval.bge_m3_dense_dim
         assert report["dense_dim_mismatches"]["question_full_emb"]["actual"] == 768
     finally:
-        settings.retrieval.embedder = old_embedder
+        settings.embedding.provider = old_provider
 
 
 def test_milvus_setup_recreates_sparse_when_requested(monkeypatch):
