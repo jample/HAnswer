@@ -1832,7 +1832,13 @@ function VizPanel({
       </div>
     );
   }
-  const active = vizEvents[Math.min(activeIdx, vizEvents.length - 1)];
+  const orderedVizEvents = [...vizEvents].sort((a, b) => {
+    const aDegraded = Boolean(a?.data?.degraded);
+    const bDegraded = Boolean(b?.data?.degraded);
+    if (aDegraded === bDegraded) return 0;
+    return aDegraded ? 1 : -1;
+  });
+  const active = orderedVizEvents[Math.min(activeIdx, orderedVizEvents.length - 1)];
   const resolvedParams = active ? deriveVizParams(active.data.execution_payload, active.data.spec_json) : [];
   return (
     <div style={{
@@ -1845,7 +1851,7 @@ function VizPanel({
       {visualizationPlan && <VisualizationPlanCard plan={visualizationPlan} />}
       {vizEvents.length > 0 && (
       <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 12 }}>
-        {vizEvents.map((ev, i) => (
+        {orderedVizEvents.map((ev, i) => (
           <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
             <button
               type="button"
@@ -1858,7 +1864,7 @@ function VizPanel({
               }}
               title={ev.data.title_cn}
             >
-              {i + 1}. {(ev.data.title_cn || '').slice(0, 12)}
+              {i + 1}. {ev.data.degraded ? '说明' : (ev.data.title_cn || '').slice(0, 12)}
             </button>
             {onDeleteViz && (
               <button

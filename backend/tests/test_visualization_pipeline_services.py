@@ -434,6 +434,110 @@ async def test_geogebra_execution_payload_static_validator_accepts_small_payload
     assert report.validation_mode == "static"
 
 
+@pytest.mark.asyncio
+async def test_geogebra_execution_payload_rejects_geometry_contract_motion_drift():
+    spec_payload = _spec_bundle_payload()["visualizations"][0]
+    spec_payload["math_definition"]["objects"].extend([
+        {
+            "name": "t",
+            "type": "slider_parameter",
+            "definition": "motion driver",
+            "role": "driver",
+            "must_exist_before_animation": True,
+        },
+        {
+            "name": "P",
+            "type": "moving_point",
+            "definition": "moving point",
+            "role": "observed point",
+            "must_exist_before_animation": False,
+        },
+    ])
+    spec_payload["geogebra_plan"]["requires_slider"] = True
+    spec_payload["interaction_and_animation"] = {
+        "has_animation": True,
+        "animation_driver": "slider",
+        "animation_description": "Move P with slider t",
+        "animation_duration_ms": 3000,
+        "parameters": [
+            {
+                "name": "t",
+                "type": "number",
+                "range": {"min": -2, "max": 2, "step": 0.5},
+                "default_value": 0,
+                "meaning": "horizontal position",
+            }
+        ],
+        "user_interactions": [
+            {"interaction_type": "move_slider", "target": "t", "purpose": "move P"}
+        ],
+        "animation_sequence": ["Move P"],
+        "stopping_condition_or_final_state": "P stops at slider value",
+    }
+    spec_payload["geometry_contract"] = {
+        "core_objects": [
+            {"name": "P", "type": "moving_point", "role": "observed point", "must_be_visible": True},
+            {"name": "c", "type": "circle_boundary", "role": "target boundary", "must_be_visible": True},
+        ],
+        "motion": {
+            "driver": "t",
+            "moving_object": "P",
+            "path_type": "line",
+            "path_definition": "P moves horizontally",
+            "sample_values": [-2, 0, 2],
+            "expected_positions_description": "P changes x-coordinate when t changes",
+        },
+        "invariants": [
+            {"type": "boundary_of", "objects": ["c"], "description": "c remains the target boundary"}
+        ],
+        "student_checkpoints": [
+            {"state": "start", "observation": "P starts left"},
+            {"state": "middle", "observation": "P reaches the middle"},
+            {"state": "end", "observation": "P ends right"},
+        ],
+        "must_not_change_meaning": ["Do not make P static"],
+    }
+    spec = schemas.VisualizationSpec.model_validate(spec_payload)
+    payload = schemas.GeoGebraExecutionPayload.model_validate({
+        "title": "漂移测试",
+        "preferred_geogebra_app": "geometry",
+        "execution_mode": "command_only",
+        "math_meaning_summary": "Payload creates P but does not bind it to t.",
+        "object_naming_convention": "Use short English labels.",
+        "commands": [
+            {"step": 1, "purpose": "[core] Create slider", "command": "t=Slider(-2,2,0.5)"},
+            {"step": 2, "purpose": "[core] Create center", "command": "O=(0,0)"},
+            {"step": 3, "purpose": "[core] Create boundary point", "command": "A=(1,0)"},
+            {"step": 4, "purpose": "[core] Create circle", "command": "c=Circle(O,A)"},
+            {"step": 5, "purpose": "[core] Create static point", "command": "P=(1,1)"},
+        ],
+        "property_commands": [],
+        "interaction_objects": [{"name": "t", "type": "slider", "purpose": "drive P"}],
+        "optional_script": {
+            "needed": False,
+            "script_type": "none",
+            "reason": "",
+            "target_object": "",
+            "trigger": "none",
+            "script_body": "",
+        },
+        "expected_created_objects": [
+            {"name": "t", "type": "slider_parameter", "role": "core driver"},
+            {"name": "c", "type": "circle_boundary", "role": "core boundary"},
+            {"name": "P", "type": "point", "role": "core moving point"},
+        ],
+        "consistency_checks": [],
+        "fallback_used": False,
+        "fallback_reason": "",
+        "implementation_notes": [],
+    })
+
+    with pytest.raises(GeoGebraValidationError) as exc:
+        await validate_geogebra_execution_payload(payload, spec=spec.model_dump(mode="json"))
+
+    assert any(item["kind"] == "geometry_motion_not_driver_bound" for item in exc.value.violations)
+
+
 def test_geogebra_execution_payload_schema_accepts_harmless_llm_enum_mistakes():
     payload = schemas.GeoGebraExecutionPayload.model_validate({
         "title": "容错测试",
@@ -987,7 +1091,7 @@ async def test_generate_geogebra_visualization_or_fallback_degrades_on_missing_e
 
 
 @pytest.mark.asyncio
-async def test_generate_geogebra_visualization_does_not_retry_static_failure(monkeypatch):
+async def test_generate_geogebra_visualization_repairs_static_failure(monkeypatch):
     initial_payload = {
         "title": "边界距离",
         "preferred_geogebra_app": "geometry",
@@ -1015,7 +1119,17 @@ async def test_generate_geogebra_visualization_does_not_retry_static_failure(mon
         "fallback_reason": "",
         "implementation_notes": []
     }
-    transport = _SequencedJsonTransport([initial_payload])
+    repaired_payload = {
+        **initial_payload,
+        "commands": [
+            {"step": 1, "purpose": "Create center", "command": "O=(0,0)"},
+            {"step": 2, "purpose": "Create repaired point", "command": "P=(1,0)"},
+        ],
+        "expected_created_objects": [
+            {"name": "P", "type": "point", "role": "repaired core point"}
+        ],
+    }
+    transport = _SequencedJsonTransport([initial_payload, repaired_payload])
     client = GeminiClient(transport)
     spec = schemas.VisualizationSpec.model_validate(_spec_bundle_payload()["visualizations"][0])
 
@@ -1029,9 +1143,9 @@ async def test_generate_geogebra_visualization_does_not_retry_static_failure(mon
 
     result = await generate_geogebra_visualization_or_fallback(llm=client, spec=spec)
 
-    assert result.execution_payload is None
-    assert result.repair_attempted is False
-    assert result.repaired is False
-    assert result.error_summary is not None
-    assert "expected created object" in result.error_summary
-    assert len(transport.calls) == 1
+    assert result.execution_payload is not None
+    assert result.repair_attempted is True
+    assert result.repaired is True
+    assert result.error_summary is None
+    assert [row.command for row in result.execution_payload.commands] == ["O=(0,0)", "P=(1,0)"]
+    assert len(transport.calls) == 2

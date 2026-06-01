@@ -422,6 +422,61 @@ def _repair_messages(
     return messages
 
 
+async def _repair_payload_once(
+    *,
+    llm: GeminiClient,
+    prompt,
+    spec: VisualizationSpec,
+    failed_payload: GeoGebraExecutionPayload,
+    violations: list[dict],
+    prompt_context: PromptLogContext,
+    question_id: str | None,
+    solution_id: str | None,
+) -> GeoGebraExecutionPayload:
+    await log_visual_action(
+        source="backend",
+        phase="stage2",
+        action="geogebra.repair.requested",
+        status="info",
+        question_id=question_id,
+        solution_id=solution_id,
+        visualization_id=spec.id,
+        engine="geogebra",
+        component="geogebra_codegen_service",
+        details={"violations": violations},
+    )
+    repaired_draft = await llm.call_structured(
+        template=prompt,
+        model=settings.llm_model("vizcoder"),
+        model_cls=GeoGebraExecutionPayloadDraft,
+        template_kwargs={"spec": spec.model_dump(mode="json")},
+        messages_override=_repair_messages(
+            prompt=prompt,
+            spec=spec,
+            failed_payload=failed_payload,
+            violations=violations,
+        ),
+        prompt_context=prompt_context,
+        timeout_s=settings.llm.vizcoder_timeout_s,
+        stream=settings.llm.stream_vizcoder_json,
+        disable_repair=True,
+    )
+    repaired_payload = normalize_geogebra_execution_payload_draft(repaired_draft, spec=spec)
+    await log_visual_action(
+        source="backend",
+        phase="stage2",
+        action="geogebra.repair.received",
+        status="info",
+        question_id=question_id,
+        solution_id=solution_id,
+        visualization_id=spec.id,
+        engine="geogebra",
+        component="geogebra_codegen_service",
+        details=_payload_summary(repaired_payload),
+    )
+    return repaired_payload
+
+
 async def _validate_payload(
     *,
     payload: GeoGebraExecutionPayload,
@@ -558,7 +613,7 @@ async def generate_geogebra_visualization_or_fallback(
             await log_visual_action(
                 source="backend",
                 phase="stage2",
-                action="geogebra.static_validation.failed_no_retry",
+                action="geogebra.static_validation.failed_retrying",
                 status="degraded",
                 question_id=question_id,
                 solution_id=solution_id,
@@ -567,16 +622,73 @@ async def generate_geogebra_visualization_or_fallback(
                 component="geogebra_codegen_service",
                 details={
                     "violations": first_exc.violations,
-                    "llm_retry_count": 0,
-                    "fallback_strategy": "spec_only_or_deterministic_static",
+                    "llm_retry_count": 1,
+                    "fallback_strategy": "one_repair_then_spec_only",
                 },
                 error=first_summary,
             )
-            return GeoGebraCodegenResult(
-                execution_payload=None,
-                error_summary=first_summary,
-                repair_attempted=False,
-            )
+            try:
+                repaired_payload = await _repair_payload_once(
+                    llm=llm,
+                    prompt=prompt,
+                    spec=spec,
+                    failed_payload=payload,
+                    violations=first_exc.violations,
+                    prompt_context=prompt_context,
+                    question_id=question_id,
+                    solution_id=solution_id,
+                )
+                validated = await _validate_payload(
+                    payload=repaired_payload,
+                    spec=spec,
+                    question_id=question_id,
+                    solution_id=solution_id,
+                    repaired=True,
+                )
+                await log_visual_action(
+                    source="backend",
+                    phase="stage2",
+                    action="geogebra.repair.succeeded",
+                    status="ok",
+                    question_id=question_id,
+                    solution_id=solution_id,
+                    visualization_id=spec.id,
+                    engine="geogebra",
+                    component="geogebra_codegen_service",
+                    details=_payload_summary(validated),
+                )
+                return GeoGebraCodegenResult(
+                    execution_payload=validated,
+                    repaired=True,
+                    repair_attempted=True,
+                )
+            except (GeoGebraValidationError, ValidationError, LLMError) as repair_exc:
+                repair_summary = (
+                    _summarize_violations(repair_exc.violations)
+                    if isinstance(repair_exc, GeoGebraValidationError)
+                    else str(repair_exc)
+                )
+                await log_visual_action(
+                    source="backend",
+                    phase="stage2",
+                    action="geogebra.repair.failed",
+                    status="degraded",
+                    question_id=question_id,
+                    solution_id=solution_id,
+                    visualization_id=spec.id,
+                    engine="geogebra",
+                    component="geogebra_codegen_service",
+                    details={
+                        "initial_violations": first_exc.violations,
+                        "initial_error": first_summary,
+                    },
+                    error=repair_summary,
+                )
+                return GeoGebraCodegenResult(
+                    execution_payload=None,
+                    error_summary=repair_summary,
+                    repair_attempted=True,
+                )
     except GeoGebraValidationError as exc:
         summary = _summarize_violations(exc.violations)
         log.warning("GeoGebra Stage 2 degraded for viz %s: %s", spec.id, summary)

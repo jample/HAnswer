@@ -22,6 +22,7 @@ the visualization engine.
 - Docker Desktop or another Docker Compose-compatible runtime
 - PostgreSQL 13+ reachable from the backend
 - API access for whichever LLM/embedding provider you configure
+- docker compose up -d : for milvus in milvus directory
 
 ## Configuration File Loading
 

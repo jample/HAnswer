@@ -963,6 +963,216 @@ def _validate_execution_payload_static(payload: GeoGebraExecutionPayload) -> Geo
     return GeoGebraValidationReport(ok=True, render_ms=None, violations=[])
 
 
+def _spec_field(spec: dict[str, Any] | None, *path: str) -> Any:
+    value: Any = spec or {}
+    for key in path:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    return value
+
+
+def _spec_list(spec: dict[str, Any] | None, *path: str) -> list[Any]:
+    value = _spec_field(spec, *path)
+    return value if isinstance(value, list) else []
+
+
+def _command_for_name(commands: list[dict[str, Any]], name: str) -> str:
+    for row in commands:
+        command = str(row.get("command") or "").strip()
+        if _assigned_name(command) == name:
+            return command
+    return ""
+
+
+def _command_mentions_identifier(command: str, name: str) -> bool:
+    if not name:
+        return False
+    return re.search(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])", command) is not None
+
+
+def _has_slider_command(commands: list[dict[str, Any]], name: str | None = None) -> bool:
+    for row in commands:
+        command = str(row.get("command") or "").strip()
+        if name and _assigned_name(command) != name:
+            continue
+        rhs = command.split("=", 1)[1].strip() if "=" in command else command
+        if "Slider(" in command or _command_head(rhs) == "Slider":
+            return True
+    return False
+
+
+def _has_trace_or_locus(payload: GeoGebraExecutionPayload) -> bool:
+    commands = [row.command for row in payload.commands]
+    properties = [row.command for row in payload.property_commands]
+    if any("Locus(" in command or _assigned_name(command).lower().startswith("trace") for command in commands):
+        return True
+    return any(command.strip().startswith("SetTrace(") for command in properties)
+
+
+def _has_region_signal(payload: GeoGebraExecutionPayload) -> bool:
+    commands = [row.command for row in payload.commands]
+    properties = [row.command for row in payload.property_commands]
+    region_heads = {"Polygon", "Integral", "Inequality", "IntersectPath"}
+    for command in commands:
+        rhs = command.split("=", 1)[1].strip() if "=" in command else command
+        if _command_head(rhs) in region_heads or "Inequality(" in rhs:
+            return True
+    return any(command.strip().startswith(("SetFilling(", "SetColor(")) for command in properties)
+
+
+def validate_payload_against_spec(
+    payload: GeoGebraExecutionPayload,
+    *,
+    spec: dict[str, Any] | None,
+) -> GeoGebraValidationReport:
+    """Validate that a runnable payload still matches the selected visualization spec.
+
+    This is not a theorem prover. It catches semantic drift that is cheap to
+    detect deterministically: missing core objects, missing motion drivers,
+    missing trace/region signals, and moving objects that do not depend on
+    their declared driver.
+    """
+    if not spec:
+        return GeoGebraValidationReport(ok=True, render_ms=None, violations=[])
+
+    command_rows = [row.model_dump(mode="json") for row in payload.commands]
+    defined_names = _extract_step_defined_names(command_rows)
+    expected_names = {row.name for row in payload.expected_created_objects}
+    interaction_names = {row.name for row in payload.interaction_objects}
+    violations: list[dict[str, str]] = []
+
+    preferred_app = str(spec.get("preferred_geogebra_app") or "").strip()
+    if preferred_app and payload.preferred_geogebra_app != preferred_app:
+        violations.append({
+            "kind": "spec_app_mismatch",
+            "message": (
+                f"payload preferred_geogebra_app='{payload.preferred_geogebra_app}' "
+                f"does not match spec preferred_geogebra_app='{preferred_app}'"
+            ),
+        })
+
+    visible_or_highlighted = {
+        str(name) for name in [
+            *_spec_list(spec, "visual_design", "visible_objects"),
+            *_spec_list(spec, "visual_design", "highlighted_objects"),
+        ]
+        if str(name or "").strip()
+    }
+    concrete_visible = {
+        name for name in visible_or_highlighted
+        if name in defined_names or name in expected_names
+    }
+    if visible_or_highlighted and not concrete_visible:
+        violations.append({
+            "kind": "spec_visible_objects_missing",
+            "message": (
+                "payload does not create or expect any spec visible/highlighted object: "
+                + ", ".join(sorted(visible_or_highlighted))
+            ),
+        })
+
+    if bool(_spec_field(spec, "geogebra_plan", "requires_slider")):
+        if not payload.interaction_objects and not _has_slider_command(command_rows):
+            violations.append({
+                "kind": "spec_slider_missing",
+                "message": "spec requires a slider, but payload has no slider command or interaction object",
+            })
+
+    if bool(_spec_field(spec, "geogebra_plan", "requires_trace")) and not _has_trace_or_locus(payload):
+        fallback_used = bool(payload.fallback_used or str(payload.fallback_reason or "").strip())
+        if not fallback_used:
+            violations.append({
+                "kind": "spec_trace_missing",
+                "message": "spec requires trace/locus behavior, but payload has no trace/locus signal",
+            })
+
+    if bool(_spec_field(spec, "geogebra_plan", "requires_region_shading")) and not _has_region_signal(payload):
+        fallback_used = bool(payload.fallback_used or str(payload.fallback_reason or "").strip())
+        if not fallback_used:
+            violations.append({
+                "kind": "spec_region_missing",
+                "message": "spec requires region shading, but payload has no region/filling signal",
+            })
+
+    contract = _spec_field(spec, "geometry_contract")
+    if isinstance(contract, dict):
+        core_objects = [
+            item for item in list(contract.get("core_objects") or [])
+            if isinstance(item, dict) and str(item.get("name") or "").strip()
+        ]
+        for item in core_objects:
+            name = str(item.get("name") or "").strip()
+            must_be_visible = bool(item.get("must_be_visible", True))
+            if must_be_visible and name not in defined_names and name not in expected_names:
+                violations.append({
+                    "kind": "geometry_core_object_missing",
+                    "message": f"geometry core object '{name}' is not created or expected by payload",
+                })
+
+        motion = contract.get("motion") if isinstance(contract.get("motion"), dict) else {}
+        driver = str((motion or {}).get("driver") or "").strip()
+        moving_object = str((motion or {}).get("moving_object") or "").strip()
+        path_type = str((motion or {}).get("path_type") or "none").strip()
+        if path_type and path_type != "none":
+            if driver and driver not in defined_names and driver not in interaction_names:
+                violations.append({
+                    "kind": "geometry_motion_driver_missing",
+                    "message": f"geometry motion driver '{driver}' is not created or exposed by payload",
+                })
+            elif driver and driver in defined_names and not _has_slider_command(command_rows, driver):
+                driver_command = _command_for_name(command_rows, driver)
+                if "Slider(" not in driver_command:
+                    violations.append({
+                        "kind": "geometry_motion_driver_not_slider",
+                        "message": f"geometry motion driver '{driver}' should be a stable slider parameter",
+                    })
+            if moving_object and moving_object not in defined_names and moving_object not in expected_names:
+                violations.append({
+                    "kind": "geometry_moving_object_missing",
+                    "message": f"geometry moving object '{moving_object}' is not created or expected by payload",
+                })
+            if driver and moving_object and moving_object in defined_names:
+                moving_command = _command_for_name(command_rows, moving_object)
+                if moving_command and not _command_mentions_identifier(moving_command, driver):
+                    fallback_used = bool(payload.fallback_used or str(payload.fallback_reason or "").strip())
+                    if not fallback_used:
+                        violations.append({
+                            "kind": "geometry_motion_not_driver_bound",
+                            "message": (
+                                f"geometry moving object '{moving_object}' command does not reference "
+                                f"declared driver '{driver}'"
+                            ),
+                        })
+
+        invariant_names: set[str] = set()
+        for invariant in list(contract.get("invariants") or []):
+            if not isinstance(invariant, dict):
+                continue
+            invariant_names.update(
+                str(name).strip()
+                for name in list(invariant.get("objects") or [])
+                if str(name or "").strip()
+            )
+        missing_invariant = sorted(
+            name for name in invariant_names
+            if name not in defined_names and name not in expected_names and name not in interaction_names
+        )
+        if missing_invariant:
+            violations.append({
+                "kind": "geometry_invariant_object_missing",
+                "message": (
+                    "geometry invariant references objects missing from payload: "
+                    + ", ".join(missing_invariant)
+                ),
+            })
+
+    if violations:
+        raise GeoGebraValidationError(violations)
+
+    return GeoGebraValidationReport(ok=True, render_ms=None, violations=[])
+
+
 async def validate_geogebra_visualization(
     viz: Visualization,
     *,
@@ -982,4 +1192,6 @@ async def validate_geogebra_execution_payload(
     spec: dict[str, Any] | None = None,
     timeout_s: float = 20.0,
 ) -> GeoGebraValidationReport:
-    return _validate_execution_payload_static(payload)
+    _validate_execution_payload_static(payload)
+    validate_payload_against_spec(payload, spec=spec)
+    return GeoGebraValidationReport(ok=True, render_ms=None, violations=[])

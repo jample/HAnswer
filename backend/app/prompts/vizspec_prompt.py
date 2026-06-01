@@ -222,6 +222,9 @@ The specification must make the mathematical meaning, objects, parameters, const
 13. Respect the subject and grade band in the source problem as a hard curriculum boundary.
     If the source is for junior students, the visualization must explain the answer using Junior High School knowledge and language only.
     Do not rely on Senior High School concepts to explain a Junior High School problem.
+14. For geometry visualizations involving motion, traces, loci, regions, or construction steps, fill `geometry_contract`.
+    The contract must name the core objects, motion driver, moving object, intended path, sample values, invariants, and start/middle/end observations.
+    This contract is binding for Stage 2; do not use vague motion such as "point moves around" without specifying the path and invariant.
 
 ## What to Analyze
 From the provided math solution or explanation, determine:
@@ -267,6 +270,17 @@ The three specs should cover distinct teaching bottlenecks or stages of the solu
 - `recommended_command_families` may use only geometry, transformation, list, logic, locus, scripting, conic, or function.
 - Prefer slider-driven or step-driven interaction over fragile autoplay logic.
 - Use `preferred_geogebra_object_naming_style` to reinforce short, stable ASCII object names.
+
+## geometry_contract rules
+- Include `geometry_contract` for `locus_trace`, `parametric_animation`, `region_shading`, `construction_steps`, `measurement_demo`, and any geometry visualization where a point or shape changes.
+- `core_objects` should include only mathematically essential objects such as the moving point, target curve/shape, trace/locus, important segment, or measurement object.
+- `motion.driver` must match a parameter or object name from the spec.
+- `motion.moving_object` must match a `core_objects[].name`.
+- `motion.path_type` must be one of none, line, segment, circle, circle_boundary, function_graph, locus, region_boundary, or free_parameter.
+- If `motion.path_type` is not none, provide at least two numeric `sample_values`; prefer three values representing start/middle/end.
+- Use `invariants` for observable facts that must remain true, such as on_curve, collinear, parallel, perpendicular, equal_distance, fixed_distance, ratio, midpoint, angle_equal, angle_measure, area_equal, tangent, symmetric_about, or transformed_from.
+- `student_checkpoints` must say what a student should observe at start, middle, and end when motion exists.
+- `must_not_change_meaning` should state common semantic mistakes, such as replacing a circle boundary with a filled disk or replacing a locus with an unrelated static point.
 
 ## priority and recommendation calibration
 - `priority=1` means the most pedagogically valuable candidate in the bundle.

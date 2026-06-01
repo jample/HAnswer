@@ -91,6 +91,52 @@ GeoGebraCommandFamily = Literal[
     "conic",
     "function",
 ]
+GeometryContractObjectType = Literal[
+    "point",
+    "moving_point",
+    "line",
+    "segment",
+    "ray",
+    "circle",
+    "circle_boundary",
+    "polygon",
+    "region",
+    "angle",
+    "measurement",
+    "trace",
+    "locus",
+    "auxiliary_object",
+]
+GeometryContractPathType = Literal[
+    "none",
+    "line",
+    "segment",
+    "circle",
+    "circle_boundary",
+    "function_graph",
+    "locus",
+    "region_boundary",
+    "free_parameter",
+]
+GeometryInvariantType = Literal[
+    "on_curve",
+    "inside_region",
+    "boundary_of",
+    "collinear",
+    "parallel",
+    "perpendicular",
+    "equal_distance",
+    "fixed_distance",
+    "ratio",
+    "midpoint",
+    "angle_equal",
+    "angle_measure",
+    "area_equal",
+    "tangent",
+    "symmetric_about",
+    "transformed_from",
+]
+GeometryCheckpointState = Literal["start", "middle", "end", "sample"]
 
 
 class VisualizationTaskSummary(BaseModel):
@@ -234,6 +280,79 @@ class VisualizationGeoGebraPlan(BaseModel):
             raise ValueError("requires_minimal_script=true requires script_reason_if_needed")
         if self.object_creation_strategy == "command_only" and self.requires_minimal_script:
             raise ValueError("command_only strategy cannot require minimal script")
+        return self
+
+
+class GeometryContractObject(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    type: GeometryContractObjectType
+    role: str
+    must_be_visible: bool = True
+
+
+class GeometryMotionContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    driver: str = ""
+    moving_object: str = ""
+    path_type: GeometryContractPathType = "none"
+    path_definition: str = ""
+    sample_values: list[float] = Field(default_factory=list)
+    expected_positions_description: str = ""
+
+    @model_validator(mode="after")
+    def _check_motion_contract(self) -> GeometryMotionContract:
+        if self.path_type == "none":
+            return self
+        if not self.driver.strip():
+            raise ValueError("geometry motion with path_type!='none' requires driver")
+        if not self.moving_object.strip():
+            raise ValueError("geometry motion with path_type!='none' requires moving_object")
+        if not self.path_definition.strip():
+            raise ValueError("geometry motion with path_type!='none' requires path_definition")
+        if len(self.sample_values) < 2:
+            raise ValueError("geometry motion requires at least two sample_values")
+        return self
+
+
+class GeometryInvariant(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: GeometryInvariantType
+    objects: list[str] = Field(min_length=1)
+    description: str
+
+
+class GeometryStudentCheckpoint(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    state: GeometryCheckpointState
+    observation: str
+
+
+class GeometryVisualizationContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    core_objects: list[GeometryContractObject] = Field(default_factory=list)
+    motion: GeometryMotionContract = Field(default_factory=GeometryMotionContract)
+    invariants: list[GeometryInvariant] = Field(default_factory=list)
+    student_checkpoints: list[GeometryStudentCheckpoint] = Field(default_factory=list)
+    must_not_change_meaning: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _check_geometry_contract(self) -> GeometryVisualizationContract:
+        moving_names = {
+            item.name for item in self.core_objects
+            if item.type in {"moving_point", "trace", "locus"}
+        }
+        if moving_names and self.motion.path_type == "none":
+            raise ValueError("moving geometry core objects require a non-'none' motion.path_type")
+        if self.motion.moving_object and self.motion.moving_object not in {
+            item.name for item in self.core_objects
+        }:
+            raise ValueError("motion.moving_object must reference one geometry_contract.core_objects name")
         return self
 
 
@@ -507,6 +626,7 @@ class VisualizationSpec(BaseModel):
     geogebra_plan: VisualizationGeoGebraPlan
     visual_design: VisualizationDesign
     interaction_and_animation: VisualizationInteraction
+    geometry_contract: GeometryVisualizationContract | None = None
     expected_result: VisualizationExpectedResult
     implementation_guidance: VisualizationImplementationGuidance
     consistency_checks: list[str] = Field(default_factory=list)
@@ -596,6 +716,19 @@ class VisualizationSpec(BaseModel):
             )
             if not has_slider_param:
                 raise ValueError("requires_slider=True but no slider-like parameter/object is defined")
+        if self.geometry_contract is not None:
+            spec_object_names = {obj.name for obj in self.math_definition.objects}
+            spec_param_names = {param.name for param in self.interaction_and_animation.parameters}
+            contract_names = {obj.name for obj in self.geometry_contract.core_objects}
+            missing_core = sorted(contract_names - spec_object_names - spec_param_names)
+            if missing_core:
+                raise ValueError(
+                    "geometry_contract.core_objects must reference math_definition objects or parameters: "
+                    + ", ".join(missing_core)
+                )
+            motion = self.geometry_contract.motion
+            if motion.driver and motion.driver not in spec_param_names and motion.driver not in spec_object_names:
+                raise ValueError("geometry_contract.motion.driver must reference a parameter or math object")
         return self
 
 

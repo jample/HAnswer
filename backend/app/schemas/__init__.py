@@ -35,6 +35,11 @@ from app.schemas.llm import (
     VizParam,
 )
 from app.schemas.visualization_spec import (
+    GeometryContractObject,
+    GeometryInvariant,
+    GeometryMotionContract,
+    GeometryStudentCheckpoint,
+    GeometryVisualizationContract,
     VisualizationAmbiguity,
     VisualizationConstraint,
     VisualizationCoordinateSystem,
@@ -67,6 +72,11 @@ __all__ = [
     "GeoGebraExecutionPayloadDraft",
     "GeoGebraExecutionPayload",
     "GeoGebraPropertyCommandStep",
+    "GeometryContractObject",
+    "GeometryInvariant",
+    "GeometryMotionContract",
+    "GeometryStudentCheckpoint",
+    "GeometryVisualizationContract",
     "GgbSettings",
     "InteractionObjectSpec",
     "KnowledgePointRef",

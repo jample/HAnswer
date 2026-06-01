@@ -285,9 +285,23 @@ function VisualizationFallbackCard({
 }) {
   const implementationGuidance = asRecord(specJson?.implementation_guidance);
   const expectedResult = asRecord(specJson?.expected_result);
+  const geometryContract = asRecord(specJson?.geometry_contract);
+  const motion = asRecord(geometryContract?.motion);
   const fallback = asString(implementationGuidance?.fallback_if_animation_is_too_complex);
   const purpose = asString(specJson?.pedagogical_purpose);
   const conclusion = asString(expectedResult?.mathematical_conclusion_visible_to_student);
+  const coreObjects = asArray(geometryContract?.core_objects)
+    .map((item) => asRecord(item))
+    .filter((item): item is Record<string, unknown> => Boolean(item))
+    .slice(0, 5);
+  const invariants = asArray(geometryContract?.invariants)
+    .map((item) => asRecord(item))
+    .filter((item): item is Record<string, unknown> => Boolean(item))
+    .slice(0, 3);
+  const checkpoints = asArray(geometryContract?.student_checkpoints)
+    .map((item) => asRecord(item))
+    .filter((item): item is Record<string, unknown> => Boolean(item))
+    .slice(0, 3);
 
   return (
     <div
@@ -316,6 +330,35 @@ function VisualizationFallbackCard({
           <strong>应展示的结论:</strong> {conclusion}
         </div>
       )}
+      {coreObjects.length > 0 && (
+        <div style={{ fontSize: 13, lineHeight: 1.6 }}>
+          <strong>关键对象:</strong>{' '}
+          {coreObjects.map((item) => {
+            const name = asString(item.name);
+            const role = asString(item.role);
+            return role ? `${name}（${role}）` : name;
+          }).filter(Boolean).join('、')}
+        </div>
+      )}
+      {(asString(motion?.moving_object) || asString(motion?.path_definition)) && (
+        <div style={{ fontSize: 13, lineHeight: 1.6 }}>
+          <strong>预期轨迹:</strong>{' '}
+          {asString(motion?.moving_object) && `${asString(motion?.moving_object)} `}
+          {asString(motion?.path_definition) || asString(motion?.expected_positions_description)}
+        </div>
+      )}
+      {invariants.length > 0 && (
+        <div style={{ fontSize: 13, lineHeight: 1.6 }}>
+          <strong>保持不变:</strong>{' '}
+          {invariants.map((item) => asString(item.description)).filter(Boolean).join('；')}
+        </div>
+      )}
+      {checkpoints.length > 0 && (
+        <div style={{ fontSize: 13, lineHeight: 1.6 }}>
+          <strong>观察顺序:</strong>{' '}
+          {checkpoints.map((item) => asString(item.observation)).filter(Boolean).join(' -> ')}
+        </div>
+      )}
       {fallback && (
         <div style={{ fontSize: 13, lineHeight: 1.6 }}>
           <strong>规格中的回退方案:</strong> {fallback}
@@ -334,4 +377,8 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 
 function asString(value: unknown): string {
   return typeof value === 'string' ? value : '';
+}
+
+function asArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
 }

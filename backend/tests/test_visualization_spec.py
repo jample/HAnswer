@@ -140,6 +140,45 @@ def _base_bundle() -> dict:
                     ],
                     "stopping_condition_or_final_state": "Stop when the slider reaches either endpoint",
                 },
+                "geometry_contract": {
+                    "core_objects": [
+                        {
+                            "name": "P",
+                            "type": "moving_point",
+                            "role": "Observed moving point",
+                            "must_be_visible": True,
+                        },
+                        {
+                            "name": "c",
+                            "type": "circle_boundary",
+                            "role": "Distance target boundary",
+                            "must_be_visible": True,
+                        },
+                    ],
+                    "motion": {
+                        "driver": "t",
+                        "moving_object": "P",
+                        "path_type": "line",
+                        "path_definition": "P moves along the horizontal line y=2",
+                        "sample_values": [-5, 0, 5],
+                        "expected_positions_description": "P sweeps horizontally while the circle remains fixed",
+                    },
+                    "invariants": [
+                        {
+                            "type": "fixed_distance",
+                            "objects": ["O", "c"],
+                            "description": "The circle radius remains fixed",
+                        }
+                    ],
+                    "student_checkpoints": [
+                        {"state": "start", "observation": "P starts left of the circle"},
+                        {"state": "middle", "observation": "P is closest near the circle center line"},
+                        {"state": "end", "observation": "P ends right of the circle"},
+                    ],
+                    "must_not_change_meaning": [
+                        "Do not replace the circle boundary with a filled disk"
+                    ],
+                },
                 "expected_result": {
                     "final_visual_outcome": "A circle boundary, moving point, and shortest distance segment remain visible",
                     "mathematical_conclusion_visible_to_student": "The measured distance is to the boundary, not the filled disk",
@@ -188,6 +227,8 @@ def test_visualization_spec_bundle_accepts_valid_payload():
     bundle = VisualizationSpecBundle.model_validate(_base_bundle())
     assert bundle.visualizations[0].recommended is True
     assert bundle.visualizations[0].math_definition.objects[1].type == "circle_boundary"
+    assert bundle.visualizations[0].geometry_contract is not None
+    assert bundle.visualizations[0].geometry_contract.motion.driver == "t"
 
 
 def test_visualization_spec_bundle_normalizes_common_llm_stage1_drift():
@@ -242,6 +283,7 @@ def test_visualization_spec_accepts_locus_family_and_static_motion_metadata():
     payload = _base_bundle()
     viz = payload["visualizations"][0]
     viz["geogebra_plan"]["recommended_command_families"] = ["geometry", "locus"]
+    viz.pop("geometry_contract")
     viz["interaction_and_animation"] = {
         "has_animation": False,
         "animation_driver": "none",
@@ -259,6 +301,14 @@ def test_visualization_spec_accepts_locus_family_and_static_motion_metadata():
         "locus",
     ]
     assert bundle.visualizations[0].math_definition.objects[2].type == "point"
+
+
+def test_visualization_spec_rejects_geometry_contract_unknown_core_object():
+    payload = _base_bundle()
+    payload["visualizations"][0]["geometry_contract"]["core_objects"][0]["name"] = "UnknownPoint"
+
+    with pytest.raises(ValidationError, match="geometry_contract.core_objects"):
+        VisualizationSpecBundle.model_validate(payload)
 
 
 def test_visualization_spec_fills_missing_animation_sequence_from_description():

@@ -224,6 +224,16 @@ GeoGebra rules:
 - Do not use SetConditionToShowObject(...); keep important objects always visible and omit optional conditional visibility.
 - If a numeric value is only explanatory, prefer a Text(...) annotation with the plain formula rather than making it a hard expected numeric object.
 
+Geometry contract rules:
+- If spec.geometry_contract exists, treat it as binding. Do not silently change the moving object, path, invariant, target shape, or student observation.
+- Every geometry_contract.core_objects item with must_be_visible=true must be created by commands[] or included in expected_created_objects.
+- If geometry_contract.motion.path_type is not "none", create the declared motion.driver as a stable slider parameter whenever possible.
+- The declared geometry_contract.motion.moving_object must be created from the declared driver. For example, if driver is t and moving object is P, the command that creates P should reference t unless you explicitly use fallback_used=true with a faithful static fallback.
+- If the spec requires trace/locus behavior, include SetTrace(...), Locus(...), or a clearly declared static fallback with representative positions.
+- If the spec requires region shading, include a region/filling construction or a clearly declared boundary-only fallback if that preserves the mathematical claim.
+- Do not replace circle-boundary motion with disk/region motion, or a locus with an unrelated fixed sample point.
+- Put any semantic simplification in implementation_notes and set fallback_used/fallback_reason when it changes animation into static representative positions.
+
 Reference cheatsheet:
 {GGB_CHEATSHEET}
 """
